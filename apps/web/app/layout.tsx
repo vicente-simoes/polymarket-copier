@@ -4,7 +4,7 @@ import { AppShell } from '@/components/dashboard/app-shell'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'PolymarketSpy Dashboard',
+  title: 'PolymarketSpy',
   description: 'Control and observability dashboard for the PolymarketSpy copy portfolio system.'
 }
 
