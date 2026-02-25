@@ -25,6 +25,19 @@
 3. Start full stack with Docker Compose:
    - `pnpm compose:up`
 
+## GitHub Auth / Allowlist
+
+- The web dashboard is protected by GitHub OAuth.
+- Access is controlled by `AUTH_GITHUB_ALLOWED_USERS` (comma-separated GitHub usernames/handles).
+- To grant access to multiple people, add each GitHub username to the same env var separated by commas.
+- To add another user later, append their username to the list and restart the web app/container.
+- Example:
+  - `AUTH_GITHUB_ALLOWED_USERS=alice,bob,carol`
+- Spaces are okay (`alice, bob, carol`), and matching is case-insensitive.
+- Use GitHub usernames (the `login`/handle), not display names.
+- After changing the allowlist, restart the web app/container so the new env value is loaded.
+- Full setup instructions (GitHub OAuth App, callback URLs, local/prod examples): `authguide.md`
+
 ## Services (Docker Compose)
 
 Compose and Docker assets live under `docker/`:

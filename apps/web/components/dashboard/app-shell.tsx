@@ -84,6 +84,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname()
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
 
+  if (pathname === '/login') {
+    return <>{children}</>
+  }
+
   return (
     <div className="relative min-h-screen overflow-hidden bg-black text-white">
       <div className="pointer-events-none absolute inset-0">

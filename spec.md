@@ -393,7 +393,7 @@ This section turns the docs-driven order-type behavior into concrete rules so th
 
 1) **Web dashboard**
 - Next.js app
-- Authenticated UI for configuring copy profiles and monitoring status
+- GitHub-authenticated admin UI (OAuth login + username allowlist) for configuring copy profiles and monitoring status
 - The dashboard is the base of operations: configure leaders/ratios/guardrails, monitor health, and control kill switches.
 
 2) **API layer**
@@ -458,7 +458,7 @@ Pricing path:
 ### 6.1 Frontend
 - **Next.js** (TypeScript)
 - UI library: TBD (keep it simple initially)
-- Auth: minimal (single admin user) + strong passwords, or SSO later
+- Auth: **GitHub OAuth (Auth.js / NextAuth) + username allowlist** for admin access to the dashboard (v1)
 
 ### 6.2 Backend / Worker
 - **Node.js + TypeScript**
@@ -483,6 +483,7 @@ Pricing path:
 - **TLS** via Let’s Encrypt (certbot) or Caddy (alternative)
 - Process management: Docker restarts + healthchecks
 - All Docker-related assets live under the repo `docker/` directory.
+- Web auth deployment requirement: configure GitHub OAuth env vars (`AUTH_SECRET`, `AUTH_GITHUB_ID`, `AUTH_GITHUB_SECRET`, `AUTH_GITHUB_ALLOWED_USERS`) and a matching callback URL for the deployed dashboard origin.
 
 #### 6.4.1 Docker Compose expectations
 Docker Compose supports **two modes**:
@@ -539,6 +540,7 @@ Polymarket enforces geographic eligibility. Production deployment must:
 - 1–3 leader accounts
 - Ratio-based portfolio mirroring
 - Netting + reconcile loop
+- GitHub-authenticated dashboard access (single admin / small-team username allowlist)
 - Basic dashboard:
   - configure leaders + ratio
   - show current tracking error
@@ -549,6 +551,7 @@ Polymarket enforces geographic eligibility. Production deployment must:
 - Anything intended to bypass geographic restrictions or platform controls
 - High-frequency market-making
 - Multi-datacenter low-latency infrastructure
+- Multi-tenant auth, RBAC, or enterprise identity integrations beyond the GitHub username allowlist
 - “Guaranteed profit” claims/logic
 
 ---
@@ -559,6 +562,8 @@ The web dashboard is the **control + observability** UI for the bot. It should a
 - **Am I exposed?** (current risk / notional / tracking error)
 - **Am I making or losing money?** (total PnL + breakdowns)
 - **Is the system healthy?** (data freshness, loops running, errors)
+
+Access to dashboard pages and dashboard data APIs is restricted behind GitHub login (OAuth) with a server-side username allowlist. The web health endpoint may remain public for infra healthchecks.
 
 **Design notes**
 - Keep the UI “boring and obvious”. Every page should show **last-updated timestamps** and expose the **why** behind any automated action (especially skips).

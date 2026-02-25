@@ -66,6 +66,12 @@ services:
       NODE_ENV: development
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-polymarket_copier}
       REDIS_URL: redis://redis:6379
+      AUTH_SECRET: ${AUTH_SECRET:-replace-with-long-random-secret}
+      AUTH_GITHUB_ID: ${AUTH_GITHUB_ID:-replace-me}
+      AUTH_GITHUB_SECRET: ${AUTH_GITHUB_SECRET:-replace-me}
+      AUTH_GITHUB_ALLOWED_USERS: ${AUTH_GITHUB_ALLOWED_USERS:-}
+      AUTH_URL: ${AUTH_URL:-}
+      AUTH_TRUST_HOST: ${AUTH_TRUST_HOST:-true}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:3000/api/health || exit 1"]
       interval: 10s

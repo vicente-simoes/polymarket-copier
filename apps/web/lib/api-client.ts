@@ -28,6 +28,20 @@ export class ApiClientError extends Error {
   }
 }
 
+function redirectToLoginOnUnauthorized() {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const currentPath = `${window.location.pathname}${window.location.search}`
+  const nextPath = currentPath.startsWith('/') ? currentPath : '/'
+  const destination = `/login?next=${encodeURIComponent(nextPath)}`
+
+  if (window.location.pathname !== '/login') {
+    window.location.assign(destination)
+  }
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -65,6 +79,10 @@ export async function fetchApi<TData>(input: string, init?: RequestInit): Promis
   const payload = (await response.json()) as unknown
 
   if (!response.ok) {
+    if (response.status === 401) {
+      redirectToLoginOnUnauthorized()
+    }
+
     const errorPayload = isApiErrorEnvelope(payload) ? payload : null
     const message = errorPayload?.error?.message ?? `Request failed with status ${response.status}`
     const code = errorPayload?.error?.code ?? null
