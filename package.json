@@ -1,0 +1,32 @@
+{
+  "name": "polymarket-copier",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "dev": "pnpm dev:web",
+    "dev:web": "sh -ac 'set -a; . ./.env; set +a; pnpm --filter @copybot/web dev'",
+    "dev:worker": "sh -ac 'set -a; . ./.env; set +a; pnpm --filter @copybot/worker dev'",
+    "dev:infra:up": "docker compose -f docker/docker-compose.dev-infra.yml up -d",
+    "dev:infra:down": "docker compose -f docker/docker-compose.dev-infra.yml down",
+    "dev:infra:ps": "docker compose -f docker/docker-compose.dev-infra.yml ps",
+    "dev:infra:logs": "docker compose -f docker/docker-compose.dev-infra.yml logs -f --tail=200",
+    "db:migrate": "sh -ac 'set -a; . ./.env; set +a; pnpm --filter @copybot/db migrate:deploy'",
+    "polymarket:creds": "sh -ac 'set -a; [ -f ./.env ] && . ./.env; set +a; node ./scripts/get-polymarket-creds.mjs'",
+    "compose:up": "docker compose -f docker/docker-compose.yml up --build",
+    "compose:down": "docker compose -f docker/docker-compose.yml down",
+    "compose:ps": "docker compose -f docker/docker-compose.yml ps",
+    "compose:logs": "docker compose -f docker/docker-compose.yml logs -f --tail=200",
+    "build": "pnpm -r --if-present build",
+    "lint": "pnpm -r --if-present lint",
+    "format": "prettier --write .",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test"
+  },
+  "devDependencies": {
+    "@polymarket/clob-client": "^5.2.4",
+    "ethers": "5",
+    "prettier": "3.4.2",
+    "typescript": "5.7.2"
+  }
+}

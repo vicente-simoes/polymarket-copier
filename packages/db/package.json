@@ -1,0 +1,32 @@
+{
+  "name": "@copybot/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo \"no lint config yet\"",
+    "test": "pnpm test:integration",
+    "test:integration": "pnpm generate && node --import tsx --test src/integration.test.ts",
+    "generate": "prisma generate --schema prisma/schema.prisma",
+    "seed": "pnpm generate && node --import tsx prisma/seed.ts",
+    "migrate:deploy": "prisma migrate deploy --schema prisma/schema.prisma",
+    "migrate:status": "prisma migrate status --schema prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "6.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.0.0",
+    "prisma": "6.4.1",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2"
+  },
+  "prisma": {
+    "seed": "pnpm generate && node --import tsx prisma/seed.ts"
+  }
+}

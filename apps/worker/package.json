@@ -1,0 +1,24 @@
+{
+  "name": "@copybot/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --import tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo \"no lint config yet\"",
+    "test": "node --import tsx --test test/**/*.test.ts"
+  },
+  "dependencies": {
+    "@copybot/db": "workspace:*",
+    "@copybot/shared": "workspace:*",
+    "redis": "5.8.2",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.0.0",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2"
+  }
+}

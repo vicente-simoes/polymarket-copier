@@ -1,0 +1,571 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum LeaderStatus {
+  ACTIVE
+  PAUSED
+  DISABLED
+}
+
+enum WalletSource {
+  DATA_API
+  MANUAL
+  DISCOVERED
+}
+
+enum CopyProfileStatus {
+  ACTIVE
+  PAUSED
+  DISABLED
+}
+
+enum CopyProfileLeaderStatus {
+  ACTIVE
+  PAUSED
+  REMOVED
+}
+
+enum LeaderTradeSource {
+  CHAIN
+  DATA_API
+}
+
+enum TradeSide {
+  BUY
+  SELL
+}
+
+enum DeltaSide {
+  BUY
+  SELL
+}
+
+enum PendingDeltaStatus {
+  PENDING
+  ELIGIBLE
+  BLOCKED
+  EXPIRED
+  CONVERTED
+}
+
+enum AttemptStatus {
+  PENDING
+  EXECUTING
+  EXECUTED
+  SKIPPED
+  EXPIRED
+  FAILED
+  RETRYING
+}
+
+enum AttemptDecision {
+  PENDING
+  EXECUTED
+  SKIPPED
+}
+
+enum SkipReason {
+  MIN_NOTIONAL
+  MIN_ORDER_SIZE
+  SLIPPAGE
+  PRICE_GUARD
+  SPREAD
+  THIN_BOOK
+  STALE_PRICE
+  MARKET_WS_DISCONNECTED
+  RATE_LIMIT
+  KILL_SWITCH
+  LEADER_PAUSED
+  EXPIRED
+  BOOK_UNAVAILABLE
+  UNKNOWN
+}
+
+enum OrderType {
+  FAK
+  FOK
+  GTC
+  GTD
+}
+
+enum OrderStatus {
+  PLACED
+  PARTIALLY_FILLED
+  FILLED
+  FAILED
+  CANCELLED
+  RETRYING
+}
+
+enum SnapshotGranularity {
+  RAW_1M
+  ROLLUP_5M
+  ROLLUP_1H
+  ROLLUP_1D
+}
+
+enum HealthStatus {
+  OK
+  DOWN
+  DEGRADED
+}
+
+enum ComponentType {
+  WORKER
+  DATABASE
+  REDIS
+  ALCHEMY_WS
+  WEB
+  NGINX
+}
+
+enum ErrorSeverity {
+  INFO
+  WARN
+  ERROR
+  CRITICAL
+}
+
+enum ConfigScope {
+  GLOBAL
+  LEADER
+  COPY_PROFILE
+  SYSTEM
+}
+
+enum ConfigChangeType {
+  CREATED
+  UPDATED
+  DELETED
+}
+
+model Leader {
+  id             String                  @id @default(cuid())
+  name           String
+  profileAddress String
+  status         LeaderStatus            @default(ACTIVE)
+  metadata       Json?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  wallets           LeaderWallet[]
+  profileLinks      CopyProfileLeader[]
+  tradeEvents       LeaderTradeEvent[]
+  positionSnapshots LeaderPositionSnapshot[]
+  pendingDeltas     PendingDelta[]
+  copyAttempts      CopyAttempt[]
+  tokenLedgers      LeaderTokenLedger[]
+  pnlSummary        LeaderPnlSummary?
+  errorEvents       ErrorEvent[]
+  fillAllocations   CopyFillAllocation[]
+
+  @@unique([profileAddress])
+  @@index([status, createdAt])
+}
+
+model LeaderWallet {
+  id          String       @id @default(cuid())
+  leaderId    String
+  walletAddress String
+  source      WalletSource @default(DATA_API)
+  label       String?
+  isPrimary   Boolean      @default(false)
+  isActive    Boolean      @default(true)
+  firstSeenAt DateTime     @default(now())
+  lastSeenAt  DateTime     @default(now())
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@unique([leaderId, walletAddress])
+  @@index([walletAddress])
+  @@index([leaderId, isActive])
+}
+
+model CopyProfile {
+  id              String            @id @default(cuid())
+  name            String            @default("default")
+  followerAddress String
+  status          CopyProfileStatus @default(ACTIVE)
+  defaultRatio    Decimal           @db.Decimal(20, 8)
+  config          Json?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  leaders                 CopyProfileLeader[]
+  followerPositionSnapshots FollowerPositionSnapshot[]
+  pendingDeltas           PendingDelta[]
+  copyAttempts            CopyAttempt[]
+  copyOrders              CopyOrder[]
+  portfolioSnapshots      PortfolioSnapshot[]
+  configAuditLogs         ConfigAuditLog[]
+
+  @@unique([name, followerAddress])
+  @@index([status, createdAt])
+}
+
+model CopyProfileLeader {
+  id            String                 @id @default(cuid())
+  copyProfileId String
+  leaderId      String
+  ratio         Decimal                @db.Decimal(20, 8)
+  status        CopyProfileLeaderStatus @default(ACTIVE)
+  settings      Json?
+  createdAt     DateTime               @default(now())
+  updatedAt     DateTime               @updatedAt
+
+  copyProfile CopyProfile @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+  leader      Leader      @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@unique([copyProfileId, leaderId])
+  @@index([leaderId, status, createdAt])
+}
+
+model LeaderTradeEvent {
+  id              String           @id @default(cuid())
+  leaderId        String
+  source          LeaderTradeSource
+  triggerId       String?
+  transactionHash String?
+  logIndex        Int?
+  leaderFillAtMs  BigInt
+  wsReceivedAtMs  BigInt?
+  detectedAtMs    BigInt
+  marketId        String?
+  tokenId         String
+  outcome         String?
+  side            TradeSide
+  shares          Decimal          @db.Decimal(38, 18)
+  price           Decimal          @db.Decimal(20, 10)
+  notionalUsd     Decimal          @db.Decimal(20, 8)
+  payload         Json?
+  createdAt       DateTime         @default(now())
+
+  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@unique([triggerId])
+  @@unique([transactionHash, logIndex])
+  @@index([leaderId, leaderFillAtMs])
+  @@index([tokenId, leaderFillAtMs])
+  @@index([source, detectedAtMs])
+}
+
+model LeaderPositionSnapshot {
+  id              String    @id @default(cuid())
+  leaderId        String
+  snapshotAt      DateTime
+  snapshotAtMs    BigInt?
+  tokenId         String
+  marketId        String?
+  outcome         String?
+  shares          Decimal   @db.Decimal(38, 18)
+  avgPrice        Decimal?  @db.Decimal(20, 10)
+  currentPrice    Decimal?  @db.Decimal(20, 10)
+  initialValueUsd Decimal?  @db.Decimal(20, 8)
+  currentValueUsd Decimal?  @db.Decimal(20, 8)
+  cashPnlUsd      Decimal?  @db.Decimal(20, 8)
+  realizedPnlUsd  Decimal?  @db.Decimal(20, 8)
+  negativeRisk    Boolean   @default(false)
+  payload         Json?
+  createdAt       DateTime  @default(now())
+
+  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@index([leaderId, snapshotAt])
+  @@index([tokenId, snapshotAt])
+}
+
+model FollowerPositionSnapshot {
+  id               String   @id @default(cuid())
+  copyProfileId    String
+  snapshotAt       DateTime
+  snapshotAtMs     BigInt?
+  tokenId          String
+  marketId         String?
+  outcome          String?
+  shares           Decimal  @db.Decimal(38, 18)
+  avgCostUsd       Decimal? @db.Decimal(20, 8)
+  currentPrice     Decimal? @db.Decimal(20, 10)
+  costBasisUsd     Decimal? @db.Decimal(20, 8)
+  currentValueUsd  Decimal? @db.Decimal(20, 8)
+  unrealizedPnlUsd Decimal? @db.Decimal(20, 8)
+  payload          Json?
+  createdAt        DateTime @default(now())
+
+  copyProfile CopyProfile @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+
+  @@index([copyProfileId, snapshotAt])
+  @@index([tokenId, snapshotAt])
+}
+
+model PendingDelta {
+  id                     String             @id @default(cuid())
+  copyProfileId          String
+  leaderId               String?
+  tokenId                String
+  marketId               String?
+  side                   DeltaSide
+  pendingDeltaShares     Decimal            @db.Decimal(38, 18)
+  pendingDeltaNotionalUsd Decimal          @db.Decimal(20, 8)
+  minExecutableNotionalUsd Decimal         @default(1) @db.Decimal(20, 8)
+  status                 PendingDeltaStatus @default(PENDING)
+  blockReason            SkipReason?
+  expiresAt              DateTime?
+  metadata               Json?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  copyProfile  CopyProfile  @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+  leader       Leader?      @relation(fields: [leaderId], references: [id], onDelete: SetNull)
+  copyAttempts CopyAttempt[]
+
+  @@unique([copyProfileId, tokenId, side])
+  @@index([status, createdAt])
+  @@index([tokenId, createdAt])
+  @@index([leaderId, createdAt])
+}
+
+model CopyAttempt {
+  id                         String         @id @default(cuid())
+  copyProfileId              String
+  leaderId                   String?
+  pendingDeltaId             String?
+  tokenId                    String
+  marketId                   String?
+  side                       DeltaSide
+  status                     AttemptStatus  @default(PENDING)
+  decision                   AttemptDecision @default(PENDING)
+  accumulatedDeltaShares     Decimal?       @db.Decimal(38, 18)
+  accumulatedDeltaNotionalUsd Decimal?      @db.Decimal(20, 8)
+  reason                     SkipReason?
+  errorPayload               Json?
+  idempotencyKey             String
+  retries                    Int            @default(0)
+  maxRetries                 Int            @default(20)
+  expiresAt                  DateTime
+  attemptedAt                DateTime?
+  createdAt                  DateTime       @default(now())
+  updatedAt                  DateTime       @updatedAt
+
+  copyProfile  CopyProfile  @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+  leader       Leader?      @relation(fields: [leaderId], references: [id], onDelete: SetNull)
+  pendingDelta PendingDelta? @relation(fields: [pendingDeltaId], references: [id], onDelete: SetNull)
+  copyOrders   CopyOrder[]
+
+  @@unique([idempotencyKey])
+  @@index([status, createdAt])
+  @@index([tokenId, createdAt])
+  @@index([leaderId, createdAt])
+}
+
+model CopyOrder {
+  id                 String      @id @default(cuid())
+  copyProfileId      String
+  copyAttemptId      String?
+  tokenId            String
+  marketId           String?
+  side               DeltaSide
+  orderType          OrderType   @default(FAK)
+  intendedNotionalUsd Decimal?   @db.Decimal(20, 8)
+  intendedShares     Decimal?    @db.Decimal(38, 18)
+  priceLimit         Decimal?    @db.Decimal(20, 10)
+  leaderWeights      Json
+  unattributedWeight Decimal?    @db.Decimal(20, 8)
+  idempotencyKey     String
+  externalOrderId    String?
+  status             OrderStatus @default(PLACED)
+  feePaidUsd         Decimal     @default(0) @db.Decimal(20, 8)
+  errorMessage       String?
+  errorPayload       Json?
+  retryCount         Int         @default(0)
+  lastRetryAt        DateTime?
+  attemptedAt        DateTime    @default(now())
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  copyProfile CopyProfile @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+  copyAttempt CopyAttempt? @relation(fields: [copyAttemptId], references: [id], onDelete: SetNull)
+  fills       CopyFill[]
+  allocations CopyFillAllocation[]
+
+  @@unique([idempotencyKey])
+  @@unique([externalOrderId])
+  @@index([status, createdAt])
+  @@index([tokenId, createdAt])
+  @@index([copyAttemptId, createdAt])
+}
+
+model CopyFill {
+  id            String   @id @default(cuid())
+  copyOrderId   String
+  externalTradeId String
+  tokenId       String
+  marketId      String?
+  side          DeltaSide
+  filledShares  Decimal  @db.Decimal(38, 18)
+  filledUsdc    Decimal  @db.Decimal(20, 8)
+  feeUsdc       Decimal  @default(0) @db.Decimal(20, 8)
+  avgPrice      Decimal  @db.Decimal(20, 10)
+  filledAt      DateTime
+  payload       Json?
+  createdAt     DateTime @default(now())
+
+  copyOrder   CopyOrder            @relation(fields: [copyOrderId], references: [id], onDelete: Cascade)
+  allocations CopyFillAllocation[]
+
+  @@unique([externalTradeId])
+  @@index([tokenId, filledAt])
+  @@index([copyOrderId, filledAt])
+}
+
+model CopyFillAllocation {
+  id           String   @id @default(cuid())
+  copyFillId   String
+  copyOrderId  String
+  leaderId     String?
+  leaderBucket String?
+  tokenId      String
+  sharesDelta  Decimal  @db.Decimal(38, 18)
+  usdcDelta    Decimal  @db.Decimal(20, 8)
+  feeUsdcDelta Decimal  @db.Decimal(20, 8)
+  avgPrice     Decimal? @db.Decimal(20, 10)
+  allocatedAt  DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  copyFill  CopyFill   @relation(fields: [copyFillId], references: [id], onDelete: Cascade)
+  copyOrder CopyOrder  @relation(fields: [copyOrderId], references: [id], onDelete: Cascade)
+  leader    Leader?    @relation(fields: [leaderId], references: [id], onDelete: SetNull)
+
+  @@index([leaderId, allocatedAt])
+  @@index([tokenId, allocatedAt])
+  @@index([copyOrderId, allocatedAt])
+}
+
+model LeaderTokenLedger {
+  id        String   @id @default(cuid())
+  leaderId  String
+  tokenId   String
+  marketId  String?
+  shares    Decimal  @default(0) @db.Decimal(38, 18)
+  costUsd   Decimal  @default(0) @db.Decimal(20, 8)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@unique([leaderId, tokenId])
+  @@index([tokenId, updatedAt])
+}
+
+model LeaderPnlSummary {
+  id             String   @id @default(cuid())
+  leaderId       String   @unique
+  realizedPnlUsd Decimal  @default(0) @db.Decimal(20, 8)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@index([realizedPnlUsd])
+}
+
+model PortfolioSnapshot {
+  id               String            @id @default(cuid())
+  copyProfileId    String
+  snapshotAt       DateTime
+  snapshotAtMs     BigInt?
+  granularity      SnapshotGranularity @default(RAW_1M)
+  exposureUsd      Decimal           @db.Decimal(20, 8)
+  totalValueUsd    Decimal?          @db.Decimal(20, 8)
+  realizedPnlUsd   Decimal?          @db.Decimal(20, 8)
+  unrealizedPnlUsd Decimal?          @db.Decimal(20, 8)
+  totalPnlUsd      Decimal?          @db.Decimal(20, 8)
+  window1hPnlUsd   Decimal?          @db.Decimal(20, 8)
+  window24hPnlUsd  Decimal?          @db.Decimal(20, 8)
+  window7dPnlUsd   Decimal?          @db.Decimal(20, 8)
+  window30dPnlUsd  Decimal?          @db.Decimal(20, 8)
+  payload          Json?
+  createdAt        DateTime          @default(now())
+
+  copyProfile CopyProfile @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+
+  @@index([copyProfileId, snapshotAt])
+  @@index([granularity, snapshotAt])
+  @@index([copyProfileId, granularity, snapshotAt])
+}
+
+model SystemStatus {
+  id            String       @id @default(cuid())
+  component     ComponentType
+  status        HealthStatus @default(OK)
+  lastEventAt   DateTime?
+  details       Json?
+  createdAt     DateTime     @default(now())
+  lastUpdatedAt DateTime     @updatedAt
+
+  @@unique([component])
+  @@index([status, lastUpdatedAt])
+}
+
+model Heartbeat {
+  id         String       @id @default(cuid())
+  component  ComponentType
+  instanceId String?
+  status     HealthStatus @default(OK)
+  latencyMs  Int?
+  payload    Json?
+  observedAt DateTime     @default(now())
+  createdAt  DateTime     @default(now())
+
+  @@index([component, observedAt])
+  @@index([status, observedAt])
+}
+
+model ErrorEvent {
+  id              String        @id @default(cuid())
+  component       ComponentType
+  severity        ErrorSeverity @default(ERROR)
+  code            String?
+  message         String
+  stack           String?
+  context         Json?
+  relatedLeaderId String?
+  relatedTokenId  String?
+  relatedOrderId  String?
+  occurredAt      DateTime      @default(now())
+  resolvedAt      DateTime?
+  createdAt       DateTime      @default(now())
+
+  leader Leader? @relation(fields: [relatedLeaderId], references: [id], onDelete: SetNull)
+
+  @@index([component, occurredAt])
+  @@index([severity, occurredAt])
+  @@index([relatedLeaderId, occurredAt])
+  @@index([relatedTokenId, occurredAt])
+}
+
+model ConfigAuditLog {
+  id           String           @id @default(cuid())
+  scope        ConfigScope
+  scopeRefId   String?
+  copyProfileId String?
+  changedBy    String?
+  changeType   ConfigChangeType
+  previousValue Json?
+  nextValue    Json?
+  reason       String?
+  createdAt    DateTime         @default(now())
+
+  copyProfile CopyProfile? @relation(fields: [copyProfileId], references: [id], onDelete: SetNull)
+
+  @@index([scope, createdAt])
+  @@index([scopeRefId, createdAt])
+  @@index([copyProfileId, createdAt])
+}

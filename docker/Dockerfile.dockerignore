@@ -1,0 +1,10 @@
+.git
+.gitignore
+node_modules
+.pnpm-store
+apps/web/.next
+**/dist
+.env
+.env.*
+!.env.example
+template

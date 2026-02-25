@@ -1,0 +1,264 @@
+import { Prisma, PrismaClient } from "@copybot/db";
+import type {
+  LeaderIngestionStore,
+  LeaderPollerStatus,
+  LeaderRecord,
+  NormalizedTradeEvent
+} from "./types.js";
+import type { DataApiPosition } from "@copybot/shared";
+
+const DATA_API_SOURCE = "DATA_API";
+
+export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
+  private readonly prisma: PrismaClient;
+
+  constructor(prisma: PrismaClient) {
+    this.prisma = prisma;
+  }
+
+  async listActiveLeaders(): Promise<LeaderRecord[]> {
+    const leaders = await this.prisma.leader.findMany({
+      where: {
+        status: "ACTIVE"
+      },
+      select: {
+        id: true,
+        name: true,
+        profileAddress: true
+      },
+      orderBy: {
+        createdAt: "asc"
+      }
+    });
+
+    return leaders;
+  }
+
+  async getLatestDataApiTradeCursorMs(leaderId: string): Promise<number | null> {
+    const aggregate = await this.prisma.leaderTradeEvent.aggregate({
+      where: {
+        leaderId,
+        source: DATA_API_SOURCE
+      },
+      _max: {
+        leaderFillAtMs: true
+      }
+    });
+
+    return aggregate._max.leaderFillAtMs ? Number(aggregate._max.leaderFillAtMs) : null;
+  }
+
+  async upsertLeaderWallets(leaderId: string, wallets: string[], seenAt: Date): Promise<void> {
+    const normalized = [...new Set(wallets.map((wallet) => wallet.toLowerCase()))];
+    if (normalized.length === 0) {
+      return;
+    }
+
+    const existing = await this.prisma.leaderWallet.findMany({
+      where: {
+        leaderId
+      },
+      select: {
+        walletAddress: true,
+        isPrimary: true
+      }
+    });
+
+    const hasPrimary = existing.some((wallet) => wallet.isPrimary);
+    const primaryCandidate = normalized[0];
+
+    for (const walletAddress of normalized) {
+      await this.prisma.leaderWallet.upsert({
+        where: {
+          leaderId_walletAddress: {
+            leaderId,
+            walletAddress
+          }
+        },
+        create: {
+          leaderId,
+          walletAddress,
+          source: DATA_API_SOURCE,
+          isActive: true,
+          isPrimary: !hasPrimary && walletAddress === primaryCandidate,
+          firstSeenAt: seenAt,
+          lastSeenAt: seenAt
+        },
+        update: {
+          source: DATA_API_SOURCE,
+          isActive: true,
+          lastSeenAt: seenAt
+        }
+      });
+    }
+  }
+
+  async saveLeaderPositionSnapshots(args: {
+    leaderId: string;
+    snapshotAt: Date;
+    snapshotAtMs: number;
+    positions: DataApiPosition[];
+  }): Promise<number> {
+    if (args.positions.length === 0) {
+      return 0;
+    }
+
+    const result = await this.prisma.leaderPositionSnapshot.createMany({
+      data: args.positions.map((position) => this.toLeaderPositionRow(args.leaderId, args.snapshotAt, args.snapshotAtMs, position))
+    });
+
+    return result.count;
+  }
+
+  async saveLeaderTradeEvents(args: { leaderId: string; events: NormalizedTradeEvent[] }): Promise<number> {
+    if (args.events.length === 0) {
+      return 0;
+    }
+
+    const result = await this.prisma.leaderTradeEvent.createMany({
+      data: args.events.map((event) => ({
+        leaderId: args.leaderId,
+        source: DATA_API_SOURCE,
+        triggerId: event.triggerId,
+        transactionHash: event.transactionHash,
+        logIndex: null,
+        leaderFillAtMs: BigInt(event.leaderFillAtMs),
+        wsReceivedAtMs: null,
+        detectedAtMs: BigInt(event.detectedAtMs),
+        marketId: event.marketId ?? null,
+        tokenId: event.tokenId,
+        outcome: event.outcome ?? null,
+        side: event.side,
+        shares: String(event.shares),
+        price: String(event.price),
+        notionalUsd: String(event.notionalUsd),
+        payload: event.payload as Prisma.InputJsonValue
+      })),
+      skipDuplicates: true
+    });
+
+    return result.count;
+  }
+
+  async saveLeaderPollMeta(args: {
+    leaderId: string;
+    pollKind: "positions" | "trades";
+    meta: Record<string, unknown>;
+  }): Promise<void> {
+    const leader = await this.prisma.leader.findUnique({
+      where: { id: args.leaderId },
+      select: { metadata: true }
+    });
+
+    const baseMetadata = ensureObject(leader?.metadata);
+    const ingestion = ensureObject(baseMetadata.ingestion);
+    const currentPoll = ensureObject(ingestion[args.pollKind]);
+    ingestion[args.pollKind] = {
+      ...currentPoll,
+      ...args.meta
+    };
+    ingestion.lastUpdatedAtMs = Date.now();
+
+    await this.prisma.leader.update({
+      where: { id: args.leaderId },
+      data: {
+        metadata: {
+          ...baseMetadata,
+          ingestion
+        } as Prisma.InputJsonValue
+      }
+    });
+  }
+
+  async savePollFailure(args: {
+    leaderId: string;
+    pollKind: "positions" | "trades";
+    message: string;
+    retryable: boolean;
+    attemptCount: number;
+    context?: Record<string, unknown>;
+  }): Promise<void> {
+    await this.prisma.errorEvent.create({
+      data: {
+        component: "WORKER",
+        severity: args.retryable ? "WARN" : "ERROR",
+        code: args.pollKind === "positions" ? "LEADER_POSITIONS_POLL_FAILED" : "LEADER_TRADES_POLL_FAILED",
+        message: args.message,
+        relatedLeaderId: args.leaderId,
+        context: {
+          pollKind: args.pollKind,
+          retryable: args.retryable,
+          attemptCount: args.attemptCount,
+          ...(args.context ?? {})
+        }
+      }
+    });
+  }
+
+  async saveWorkerPollStatus(status: LeaderPollerStatus): Promise<void> {
+    const degraded =
+      status.positions.consecutiveFailures > 0 ||
+      status.trades.consecutiveFailures > 0 ||
+      status.positions.lastError !== undefined ||
+      status.trades.lastError !== undefined;
+
+    await this.prisma.systemStatus.upsert({
+      where: {
+        component: "WORKER"
+      },
+      create: {
+        component: "WORKER",
+        status: degraded ? "DEGRADED" : "OK",
+        details: toInputJsonValue({
+          leaderIngestion: status
+        })
+      },
+      update: {
+        status: degraded ? "DEGRADED" : "OK",
+        details: toInputJsonValue({
+          leaderIngestion: status
+        })
+      }
+    });
+  }
+
+  private toLeaderPositionRow(
+    leaderId: string,
+    snapshotAt: Date,
+    snapshotAtMs: number,
+    position: DataApiPosition
+  ): Prisma.LeaderPositionSnapshotCreateManyInput {
+    return {
+      leaderId,
+      snapshotAt,
+      snapshotAtMs: BigInt(snapshotAtMs),
+      tokenId: position.asset,
+      marketId: position.conditionId,
+      outcome: position.outcome ?? null,
+      shares: String(position.size),
+      avgPrice: position.avgPrice !== undefined ? String(position.avgPrice) : null,
+      currentPrice: position.curPrice !== undefined ? String(position.curPrice) : null,
+      initialValueUsd: position.initialValue !== undefined ? String(position.initialValue) : null,
+      currentValueUsd: position.currentValue !== undefined ? String(position.currentValue) : null,
+      cashPnlUsd: position.cashPnl !== undefined ? String(position.cashPnl) : null,
+      realizedPnlUsd: position.realizedPnl !== undefined ? String(position.realizedPnl) : null,
+      negativeRisk: position.negativeRisk ?? false,
+      payload: {
+        source: DATA_API_SOURCE,
+        raw: position
+      } as Prisma.InputJsonValue
+    };
+  }
+}
+
+function ensureObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function toInputJsonValue(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
