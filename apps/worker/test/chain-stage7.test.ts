@@ -38,6 +38,10 @@ class FakeSocket extends EventEmitter {
 class FakeChainStore implements ChainTriggerStore {
   wallets: Array<{ leaderId: string; walletAddress: string }> = [];
   persisted: Array<{ triggerId: string; side: string; tokenId: string; price: string }> = [];
+  persistResult: { inserted: boolean; dedupedByCanonicalKey: boolean } = {
+    inserted: true,
+    dedupedByCanonicalKey: false
+  };
   rollbacks: Array<{ triggerId: string; leaderId: string; tokenId: string }> = [];
   reconcileTasks: Array<{ triggerId: string; leaderId: string; tokenId: string }> = [];
   errors: Array<{ message: string; context: Record<string, unknown> }> = [];
@@ -51,13 +55,14 @@ class FakeChainStore implements ChainTriggerStore {
     side: "BUY" | "SELL";
     tokenId: string;
     price: string;
-  }): Promise<void> {
+  }): Promise<{ inserted: boolean; dedupedByCanonicalKey: boolean }> {
     this.persisted.push({
       triggerId: trigger.triggerId,
       side: trigger.side,
       tokenId: trigger.tokenId,
       price: trigger.price
     });
+    return this.persistResult;
   }
 
   async markTriggerRollback(args: {
@@ -138,6 +143,45 @@ test("Stage 7 decodes OrderFilled BUY trigger and dedupes txHash:logIndex", asyn
   assert.equal(status.lastDetectLagMs, 0);
 });
 
+test("Stage 7 decodes tracked taker wallet and flips side relative to maker", async () => {
+  const store = new FakeChainStore();
+  const takerWallet = "0xdddddddddddddddddddddddddddddddddddddddd";
+  store.wallets = [{ leaderId: "leader-taker", walletAddress: takerWallet }];
+
+  const pipeline = new ChainTriggerPipeline({
+    store,
+    deduper: new InMemoryTriggerDeduper(() => 40_000),
+    config: {
+      enabled: false,
+      wsUrl: "wss://alchemy.example",
+      exchangeContracts: ["0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"],
+      dedupeTtlSeconds: 3600,
+      walletRefreshIntervalMs: 30_000,
+      reconcileQueueMaxSize: 100
+    },
+    now: () => 40_000
+  });
+
+  await pipeline.refreshLeaderWalletDirectory();
+
+  // maker buys token with USDC; tracked leader is taker, so side must be SELL.
+  const payload = buildLogNotification({
+    topic0: ORDER_FILLED_TOPIC0,
+    txHash: "0x4444444444444444444444444444444444444444444444444444444444444444",
+    logIndex: 4,
+    makerAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    takerAddress: takerWallet,
+    eventDataSlots: [0n, 321n, 1_500_000n, 3_000_000n, 10_000n]
+  });
+
+  await pipeline.processNotification(payload, 40_000);
+
+  assert.equal(store.persisted.length, 1);
+  assert.equal(store.persisted[0]?.side, "SELL");
+  assert.equal(store.persisted[0]?.tokenId, "321");
+  assert.equal(store.persisted[0]?.price, "0.5");
+});
+
 test("Stage 7 handles OrdersMatched SELL and removed=true reorg rollback queueing", async () => {
   const store = new FakeChainStore();
   const leaderWallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -195,6 +239,43 @@ test("Stage 7 handles OrdersMatched SELL and removed=true reorg rollback queuein
   assert.equal(status.queueSize, 1);
 });
 
+test("Stage 7 counts canonical-key DB dedupe as duplicate when store reports non-insert", async () => {
+  const store = new FakeChainStore();
+  const leaderWallet = "0xcccccccccccccccccccccccccccccccccccccccc";
+  store.wallets = [{ leaderId: "leader-3", walletAddress: leaderWallet }];
+  store.persistResult = { inserted: false, dedupedByCanonicalKey: true };
+
+  const pipeline = new ChainTriggerPipeline({
+    store,
+    deduper: new InMemoryTriggerDeduper(() => 30_000),
+    config: {
+      enabled: false,
+      wsUrl: "wss://alchemy.example",
+      exchangeContracts: ["0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"],
+      dedupeTtlSeconds: 3600,
+      walletRefreshIntervalMs: 30_000,
+      reconcileQueueMaxSize: 100
+    },
+    now: () => 30_000
+  });
+
+  await pipeline.refreshLeaderWalletDirectory();
+  await pipeline.processNotification(
+    buildLogNotification({
+      topic0: ORDER_FILLED_TOPIC0,
+      txHash: "0x3333333333333333333333333333333333333333333333333333333333333333",
+      logIndex: 3,
+      makerAddress: leaderWallet,
+      eventDataSlots: [0n, 123n, 2_000_000n, 4_000_000n, 10_000n]
+    }),
+    30_000
+  );
+
+  const status = pipeline.getStatus();
+  assert.equal(status.persistedTriggers, 0);
+  assert.equal(status.duplicateTriggers, 1);
+});
+
 test("Stage 7 subscribes Alchemy logs with leader wallet topic filters", async () => {
   const store = new FakeChainStore();
   const socket = new FakeSocket();
@@ -221,22 +302,30 @@ test("Stage 7 subscribes Alchemy logs with leader wallet topic filters", async (
   await pipeline.start();
   socket.open();
 
-  assert.equal(socket.sent.length, 2);
-  const first = JSON.parse(socket.sent[0] ?? "{}") as Record<string, unknown>;
-  const second = JSON.parse(socket.sent[1] ?? "{}") as Record<string, unknown>;
-
-  assert.equal(first.method, "eth_subscribe");
-  assert.equal(second.method, "eth_subscribe");
-
-  const firstTopics = ((first.params as unknown[])?.[1] as { topics?: unknown[] })?.topics ?? [];
-  const secondTopics = ((second.params as unknown[])?.[1] as { topics?: unknown[] })?.topics ?? [];
-
-  assert.equal(firstTopics[0], ORDER_FILLED_TOPIC0);
-  assert.equal(secondTopics[0], ORDERS_MATCHED_TOPIC0);
-  assert.deepEqual(firstTopics[2], [
+  assert.equal(socket.sent.length, 4);
+  const subscriptions = socket.sent.map((payload) => JSON.parse(payload) as Record<string, unknown>);
+  const topicsList = subscriptions.map(
+    (entry) => ((entry.params as unknown[])?.[1] as { topics?: unknown[] })?.topics ?? []
+  );
+  const walletTopics = [
     encodeAddressTopic("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     encodeAddressTopic("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-  ]);
+  ];
+
+  const hasOrderFilledMaker = topicsList.some((topics) => topics[0] === ORDER_FILLED_TOPIC0 && Array.isArray(topics[2]));
+  const hasOrderFilledTaker = topicsList.some((topics) => topics[0] === ORDER_FILLED_TOPIC0 && Array.isArray(topics[3]));
+  const hasOrdersMatchedMaker = topicsList.some((topics) => topics[0] === ORDERS_MATCHED_TOPIC0 && Array.isArray(topics[2]));
+  const hasOrdersMatchedTaker = topicsList.some((topics) => topics[0] === ORDERS_MATCHED_TOPIC0 && Array.isArray(topics[3]));
+
+  assert.equal(hasOrderFilledMaker, true);
+  assert.equal(hasOrderFilledTaker, true);
+  assert.equal(hasOrdersMatchedMaker, true);
+  assert.equal(hasOrdersMatchedTaker, true);
+
+  const makerFilterTopics = topicsList.filter((topics) => Array.isArray(topics[2])).map((topics) => topics[2]);
+  const takerFilterTopics = topicsList.filter((topics) => Array.isArray(topics[3])).map((topics) => topics[3]);
+  assert.deepEqual(makerFilterTopics[0], walletTopics);
+  assert.deepEqual(takerFilterTopics[0], walletTopics);
 
   pipeline.stop();
 });
@@ -246,6 +335,7 @@ function buildLogNotification(input: {
   txHash: string;
   logIndex: number;
   makerAddress: string;
+  takerAddress?: string;
   eventDataSlots: bigint[];
 }): {
   jsonrpc: "2.0";
@@ -280,7 +370,7 @@ function buildLogNotification(input: {
           input.topic0,
           "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           encodeAddressTopic(input.makerAddress),
-          "0x000000000000000000000000cccccccccccccccccccccccccccccccccccccccc"
+          encodeAddressTopic(input.takerAddress ?? "0xcccccccccccccccccccccccccccccccccccccccc")
         ],
         transactionHash: input.txHash,
         transactionIndex: "0x0",

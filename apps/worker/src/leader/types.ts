@@ -24,6 +24,7 @@ export interface DataApiPositionsPageRequest {
 
 export interface NormalizedTradeEvent {
   triggerId: string;
+  canonicalKey: string;
   transactionHash?: string;
   leaderFillAtMs: number;
   detectedAtMs: number;
@@ -119,6 +120,7 @@ export interface LeaderDataApiClient {
 export interface LeaderPollerConfig {
   positionsIntervalMs: number;
   tradesIntervalMs: number;
+  tradesTakerOnly: boolean;
   pageLimit: number;
   batchSize: number;
   maxRetries: number;

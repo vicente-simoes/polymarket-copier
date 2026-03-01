@@ -324,6 +324,122 @@ test("Stage 9 guardrail failures stay pending and do not place orders", async ()
   assert.equal(store.failures.length, 0);
 });
 
+test("Stage 9 handles reverse-ordered CLOB book levels without false spread/thin-book blocks", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_250_000;
+  store.attempts.set(
+    "attempt-reversed-book",
+    makeAttempt({
+      id: "attempt-reversed-book",
+      tokenId: "token-reversed-book",
+      side: "BUY",
+      accumulatedDeltaShares: 2,
+      accumulatedDeltaNotionalUsd: 1.83
+    })
+  );
+  store.contexts.set(
+    "attempt-reversed-book",
+    makeContext("attempt-reversed-book", {
+      tokenPrice: 0.915
+    })
+  );
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-reversed-book" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-reversed-book",
+      bestBid: 0.91,
+      bestAsk: 0.92,
+      midPrice: 0.915,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "REST" as const,
+      wsConnected: false
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-reversed-book",
+      // Reverse-ordered, matching live CLOB ordering observed in production.
+      bids: [
+        { price: 0.01, size: 100 },
+        { price: 0.4, size: 50 },
+        { price: 0.91, size: 200 }
+      ],
+      asks: [
+        { price: 0.99, size: 100 },
+        { price: 0.95, size: 50 },
+        { price: 0.92, size: 200 }
+      ]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+  assert.equal(store.deferred.length, 0);
+});
+
+test("Stage 9 max price per share can be disabled per-attempt via override", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_500_000;
+  store.attempts.set("attempt-price-override", makeAttempt({
+    id: "attempt-price-override",
+    tokenId: "token-price-override",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1.2
+  }));
+  store.contexts.set("attempt-price-override", {
+    ...makeContext("attempt-price-override", {
+      tokenPrice: 0.6
+    }),
+    maxPricePerShareOverride: null
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-price-override" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxPricePerShare: 0.5
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-price-override",
+      bestBid: 0.59,
+      bestAsk: 0.6,
+      midPrice: 0.595,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-price-override",
+      bids: [{ price: 0.59, size: 100 }],
+      asks: [{ price: 0.6, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+  assert.equal(store.deferred.length, 0);
+});
+
 test("Stage 9 failed attempts retry with backoff until they can be placed", async () => {
   const store = new FakeExecutionStore();
   let nowMs = 3_000_000;
@@ -444,6 +560,127 @@ test("Stage 15 dry-run mode keeps decision pipeline active without submitting or
   assert.equal(store.deferred[1]?.terminalStatus, undefined);
   assert.equal(store.attempts.get("attempt-dry-run")?.retries, 2);
   assert.equal(venue.requests.length, 0);
+});
+
+test("Stage 9 retries use latest pending delta sizing instead of stale attempt snapshot", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 5_000_000;
+
+  store.attempts.set("attempt-live-delta", makeAttempt({
+    id: "attempt-live-delta",
+    tokenId: "token-live-delta",
+    side: "BUY",
+    accumulatedDeltaShares: 88,
+    accumulatedDeltaNotionalUsd: 85.888301
+  }));
+  store.contexts.set("attempt-live-delta", {
+    ...makeContext("attempt-live-delta", {
+      tokenPrice: 0.6
+    }),
+    pendingDeltaStatus: "ELIGIBLE",
+    pendingDeltaShares: 5,
+    pendingDeltaNotionalUsd: 3
+  });
+
+  store.orders.set("preexisting-1", {
+    id: "preexisting-1",
+    idempotencyKey: "preexisting-1",
+    copyProfileId: "copy-profile-1",
+    tokenId: "token-other",
+    intendedNotionalUsd: 15,
+    status: "PLACED",
+    attemptedAt: new Date(nowMs - 1000)
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-live-delta" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxHourlyNotionalTurnoverUsd: 18,
+      maxDailyNotionalTurnoverUsd: 100
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-live-delta",
+      bestBid: 0.59,
+      bestAsk: 0.6,
+      midPrice: 0.595,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-live-delta",
+      bids: [{ price: 0.59, size: 100 }],
+      asks: [{ price: 0.6, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(store.deferred.length, 0);
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+});
+
+test("Stage 9 expires attempt when linked pending delta is no longer active", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 6_000_000;
+
+  store.attempts.set("attempt-converted", makeAttempt({
+    id: "attempt-converted",
+    tokenId: "token-converted",
+    side: "BUY",
+    accumulatedDeltaShares: 20,
+    accumulatedDeltaNotionalUsd: 10
+  }));
+  store.contexts.set("attempt-converted", {
+    ...makeContext("attempt-converted", {
+      tokenPrice: 0.5
+    }),
+    pendingDeltaStatus: "CONVERTED",
+    pendingDeltaShares: 0,
+    pendingDeltaNotionalUsd: 0
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-submit" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-converted",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-converted",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "EXPIRED");
+  assert.equal(store.deferred[0]?.terminalStatus, "EXPIRED");
 });
 
 function makeAttempt(overrides: Partial<ExecutionAttemptRecord> & Pick<ExecutionAttemptRecord, "id" | "tokenId" | "side">): ExecutionAttemptRecord {

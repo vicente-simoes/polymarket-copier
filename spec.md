@@ -237,8 +237,12 @@ When filtering by an indexed address topic, the topic value is the 20-byte addre
 
 **Idempotency + reorg handling:**
 - Deduplicate triggers by `txHash + logIndex` in Redis (SETNX + TTL).
+- Persist **one canonical trade row** per leader trade across all ingestion sources.
+  - Canonical identity is a normalized fingerprint key (wallet + token + side + size + price + fill-second), not source-specific IDs.
+  - If both WS and REST observe the same trade, **the first source to arrive creates the row**.
+  - Later observations from the other source must enrich metadata on that same row (audit fields), never create a second row.
 - Handle chain reorgs: logs may be re-emitted with `removed: true` (treat as rollback signal).
-  - If a trigger is rolled back, enqueue an **immediate reconcile** for that leader & tokenId.
+  - If a trigger is rolled back, locate the existing trade row by `triggerId`, then `(txHash, logIndex)`, then canonical key if needed; enqueue an **immediate reconcile** for that leader & tokenId.
 
 **Why this matters for speed:**
 This keeps the hot path to: WS receive → local decode → enqueue copy decision → (optional) order placement, without waiting on any market-data fetch. Market/portfolio enrichment happens after.
@@ -258,7 +262,11 @@ Sources:
   - Track `tick_size_change` events so rounding doesn’t cause rejects
 
 ### 3.3 Trading (follower execution)
-Follower order placement uses the **CLOB API** (authenticated) with signed orders and API credentials.
+Follower order placement uses the **CLOB API** with an explicit **L1 + L2** auth split:
+- **L1 (wallet private key)** signs orders (EIP-712 signed order payloads)
+- **L2 (API key / secret / passphrase)** authenticates CLOB requests and the user-channel websocket
+
+For proxy/safe account setups, order creation must also use the correct SDK signing mode (`signatureType`) and, when required, the corresponding `funderAddress`.
 
 Supported order types (per docs):
 - **FAK** (Fill-And-Kill) — market-style execution; fills available liquidity immediately, cancels remainder (partial fill OK).
@@ -275,6 +283,9 @@ Important behavioral details (must reflect in implementation):
   - **BUY**: specify the **dollar amount** to spend.
   - **SELL**: specify the **number of shares** to sell.
 - Negative risk markets: when `neg_risk=true` (from book summary / market metadata), order creation must set the SDK option `negRisk: true`.
+- Current execution policy nuance:
+  - For **FAK** in v0.1, we enforce **minimum notional** (`$1`) but do **not** hard-block on `min_order_size` during planning.
+  - `min_order_size` remains useful metadata for diagnostics and for non-FAK policies.
 
 ### 3.4 Rate limits / throttling
 All endpoints are rate-limited and throttled (not always hard rejected), so we need:
@@ -307,8 +318,11 @@ Maintain per token:
 - `pending_delta_notional_est` (signed, using cached best price)
 
 Rule:
-- If delta < $1 notional (or < min_order_size), accumulate it.
+- If delta < $1 notional, accumulate it.
 - When accumulated delta crosses execution threshold, place one order for the net delta.
+- `pending_delta_*` is the authoritative source of executable size. Active attempts must re-read linked pending-delta size on every retry rather than relying on stale attempt snapshots.
+- If a linked pending delta becomes `CONVERTED`, `EXPIRED`, missing, or net-zero, the attempt must transition to terminal expired/closed (no further submission retries).
+- Reconcile/netting must include currently-open pending tokens in its token universe so orphan pending deltas are cleared even when a token temporarily disappears from both leader and follower latest snapshots.
 
 This prevents “skip everything” behavior when the leader makes lots of small edits.
 
@@ -333,7 +347,10 @@ This section turns the docs-driven order-type behavior into concrete rules so th
 
 **Step 1 — Compute deltas in shares**
 - For each token, compute: `delta_shares = target_shares - follower_shares`.
-- If `abs(delta_shares)` is below `min_order_size`, keep accumulating via `pending_delta_shares` and do not place an order.
+- Convert to an estimated notional using current price context and enforce `min_notional_per_order` (default `$1`).
+- If estimated notional is below threshold, keep accumulating via `pending_delta_shares` / `pending_delta_notional`.
+- For **FAK** path in v0.1, do not block solely on `min_order_size`.
+- On retries, execution must consume the latest linked `pending_delta_shares` / `pending_delta_notional` so updated leader/follower state (e.g., a leader reducing/selling) is reflected immediately in planned size.
 
 **Step 1.5 — Compute leader attribution weights (for PnL-by-leader)**
 - For the token we are about to trade, compute an attribution weight vector `w[leader]` using the same rule as in the Portfolio section (“Leader attribution + PnL by leader”).
@@ -371,11 +388,10 @@ This section turns the docs-driven order-type behavior into concrete rules so th
   - SELL: `amount` is **shares to sell**.
 - BUY sizing:
   - `ideal_spend = delta_shares × mid` (or a VWAP estimate if available)
-  - `min_spend_for_min_shares = min_order_size × price_cap`
-  - `spend = max(ideal_spend, min_spend_for_min_shares, min_notional_per_order)`
+  - `spend = max(ideal_spend, min_notional_per_order)`
   - Block/retry if `spend` exceeds available USDC after reserves/caps.
 - SELL sizing:
-  - `shares_to_sell = abs(delta_shares)` (must be >= `min_order_size`)
+  - `shares_to_sell = abs(delta_shares)`
 
 **Step 6 — Depth/thin-book check (not heavy)**
 - Use a small-depth book fetch (or cached depth if fresh) to estimate the VWAP for the intended spend/shares.
@@ -383,6 +399,9 @@ This section turns the docs-driven order-type behavior into concrete rules so th
 
 **Step 7 — Place the order using the SDK create order flow**
 - Prefer the SDK’s “create + sign + submit” helpers (e.g. `createAndPostMarketOrder` / `createAndPostOrder`) with the correct `tickSize` and `negRisk` flags.
+- Initialize the SDK with both:
+  - the follower **private key signer** (L1 order signing / EIP-712), and
+  - the follower **CLOB API credentials** (L2 authenticated requests)
 - Always pass the resolved `tickSize` and `negRisk` options from market metadata.
 
 ---
@@ -814,7 +833,7 @@ Columns:
   - **Previous page** (only if possible)
   - **First page** (only if we’re not already on it)
 
-**Table columns (one row per trade)**
+**Table columns (one row per canonical trade event)**
 - **Leader fill timestamp** (`leader_fill_at_ms`): the **true on-chain time** of the leader’s transaction (Polygon block timestamp) when we detect via on-chain WS; if we only have REST fallback (Data API), use the Data API trade `timestamp` (seconds) converted to ms.
 - **Detect lag (ms)**: `detected_at_ms - leader_fill_at_ms`
 - **Leader user** (name/handle)
@@ -825,7 +844,7 @@ Columns:
 - **Shares**
 - **Price / share**
 - **Notional** (total spent/received)
-- **Source**: **WebSocket** or **REST fallback API**
+- **Source**: **WebSocket** or **REST fallback API** (**first ingestion source** for that trade)
 
 **Timestamp fields we store (for audit + UI):**
 - `leader_fill_at_ms` (unix millis) + `leader_fill_source` (`CHAIN` or `DATA_API`)
@@ -837,6 +856,8 @@ Columns:
 - Only after that, we may enrich missing display fields (e.g., market/outcome labels) via the API **if necessary**.
 - If WS is sufficient to get everything, prefer WS-only and keep REST strictly as a **fallback** if WS temporarily fails.
 - Always persist and display the **source** (WS vs REST fallback) for audit/debugging.
+- REST fallback must **not** create duplicate rows for trades already captured from WS; it should enrich the existing row only.
+- WS must also avoid creating duplicates for trades already stored from REST fallback; it should enrich the existing row only.
 
 **Mobile optimization**
 - For portrait mobile, the trade view should not be a tiny unreadable table.
@@ -845,13 +866,13 @@ Columns:
 
 ### 8.6 Copies page
 
-**Goal:** understand the copy pipeline end-to-end: what we *want* to copy, what we *actually tried* to execute, what is *currently blocked*, and what got *skipped* (and why).
+**Goal:** understand the copy pipeline end-to-end: what we *want* to copy, what is *currently being attempted*, what we *already sent to venue*, and what got *skipped* (and why).
 
 **Top status (summary cards)**
 - **CLOB authentication**: OK / ERROR (and last auth refresh time)
 - **User Channel WS**: connected / disconnected (and last message time)
 - **Time since last reconciliation**
-- **Potential copies pending $1+**: number of pending deltas that are still accumulating notional to reach the $1 minimum
+- **Pending < $1**: number of pending deltas currently below minimum executable notional
 - **Open orders**: number of currently open orders
 
 > All summary cards should show a **last updated** timestamp.
@@ -863,19 +884,18 @@ All tables:
 - default sort is **most recent first**
 - are mobile-friendly (see mobile notes below)
 
-#### A) Open potential copies (pending / not yet executable)
+#### A) Open potential copies (pending deltas, not yet in active attempt loop)
 
-These are “copy attempts” that exist in the accumulator layer but are **not yet eligible** to become real orders (and have **not expired**).
+These are pending deltas in the accumulator layer that are **not currently in an active attempt**.
 
 Each row:
 - **Created at** (date + time)
-- **Leader** (the leader whose activity contributed to this pending delta)
+- **Leader** (single leader or multi-leader contributors for this delta)
 - **Market** (market name, with outcome smaller below — same style as other tables)
 - **Side** (BUY / SELL)
-- **Pending notional** (the net notional we currently want to trade; often **< $1**)
-- **Status / block reason** (why it’s not executable *yet*), examples:
+- **Pending notional** (the net notional we currently want to trade)
+- **Status / block reason** (why it remains pending), examples:
   - order too small ($1 minimum not met)
-  - min order size not met after tick/rounding
   - price difference too high vs guards
   - slippage too high
   - spread too large / book too thin
@@ -884,12 +904,35 @@ Each row:
 
 Lifecycle:
 - Leaves this table when:
-  - it becomes eligible and is converted into a real order (→ appears in **Executions**), or
-  - it expires (→ appears in **Skipped attempts** with reason = `expired`)
+  - it is picked up into an active attempt (→ appears in **Attempting**), or
+  - it is finalized as skipped/expired (→ appears in **Skipped attempts**)
 
-#### B) Executions (orders placed / attempted)
+#### B) Attempting (active in-flight attempts)
 
-This table is the audit log of **actual execution attempts** (typically **FAK** orders) placed by the bot.
+This table is the live view of active `copy_attempt` rows (`PENDING`, `RETRYING`, `EXECUTING`) that are currently being evaluated/retried by the execution loop.
+
+Each row:
+- **Created at** + **Last attempted at**
+- **Leader** (single or multiple contributors)
+- **Market** + **Outcome**
+- **Side**
+- **Attempt size** (current linked pending-delta notional + shares; fallback to attempt snapshot only if pending delta is unavailable)
+- **Price/share** (derived as `attempt_notional_usd / attempt_shares`; shown as `n/a` when shares are non-positive)
+- **Current spread** (best ask - best bid for that token from worker market books)
+- **Attempt status**
+- **Retries / max retries**
+- **Why delayed/blocked** (best available message/reason), plus latest order status/error when available
+  - messages should be human-readable (e.g., `not enough balance / allowance`, `Market Ws Disconnected`) rather than raw JSON payload blobs.
+
+Lifecycle:
+- Leaves this table when:
+  - an order row is created/placed (→ visible in **Executions**), or
+  - the linked pending delta is converted/expired/net-zero and the attempt is terminally expired/failed/skipped (→ visible in **Skipped attempts**)
+
+#### C) Executions (orders placed / attempted)
+
+This table is the audit log of **venue-submitted execution attempts** (typically **FAK** orders) that received an exchange order id.
+Rows that fail before a real venue order id exists (e.g., submit rejects like `not enough balance / allowance`) should remain visible through **Attempting** state/reason history, not as execution rows.
 
 Each row should include enough data to answer “what happened and why?”:
 - **Attempted at** (date + time)
@@ -913,9 +956,9 @@ Each row should include enough data to answer “what happened and why?”:
 Retry behavior:
 - If an execution fails, mark it **FAILED** with a reason and schedule **automatic reattempts** with backoff (to avoid stuck copies).
 - Retries should stop once the attempt expires (configured max expiration time).
-- The UI should make retries obvious (e.g., show a retries count and/or “last retry at” in expanded details).
+- Retry state and reasons are primarily visible in **Attempting**.
 
-#### C) Skipped attempts (final non-executions, grouped)
+#### D) Skipped attempts (final non-executions, grouped)
 
 This table is the log of copy attempts that **will not be executed** (either permanently skipped or expired), grouped by **token id** (outcome token / position).
 
@@ -1131,6 +1174,7 @@ These items were previously “open questions” and are now decided:
   - We still avoid pathological markets via guardrails (spread/depth) and ignore resolved markets for new execution.
 - **On-chain trade detection**
   - We implement full ABI decoding for the exchange events and handle duplicates/reorgs correctly.
+  - Dedupe is enforced both intra-source (`txHash + logIndex` for chain triggers) and cross-source (canonical trade key across WS + REST fallback).
   - Token/market metadata is resolved via cached market metadata and REST enrichment when needed; REST remains the fallback if WS is degraded.
 
 ---
@@ -1153,7 +1197,9 @@ These items were previously “open questions” and are now decided:
   - when an event involving a leader address arrives, treat it as a trigger and enrich via Data API/CLOB
 - Otherwise (fallback):
   - poll new trades since last cursor
+  - cursor progression is based on the newest successfully **seen** trade timestamp, not only newly inserted rows
 - Then (either path):
+  - dedupe across WS + REST using canonical trade key and persist at most one row per trade
   - update target state (estimated)
   - for each token with updated target:
     - compute delta vs follower’s last known position
@@ -1169,7 +1215,9 @@ These items were previously “open questions” and are now decided:
 
 4) **Execution**
 - For each executable delta:
-  - check constraints: min_order_size, $1 min notional, tick_size, spread, slippage
+  - check constraints:
+    - for **FAK**: $1 min notional, tick_size rounding, spread/slippage/price guards, depth
+    - for non-FAK policies (future/optional): include `min_order_size` constraints as required
   - place order (FAK / marketable limit)
   - record audit + outcome
   - update follower state (optimistic, then confirmed via user channel or polling)
@@ -1295,6 +1343,10 @@ This appendix exists to make implementation unambiguous. Payloads are shown in a
 ]
 ```
 
+**Ingestion behavior requirements for this endpoint:**
+- Data-API rows are a fallback/confirmation source and must be cross-source deduped against WS-triggered trades using canonical trade key.
+- Poll cursor must advance from the newest **seen** trade timestamp even when all rows are deduped and `recordsInserted=0`.
+
 #### B.2.2 Get current positions for a user
 
 **Request shape (query params):**
@@ -1370,14 +1422,14 @@ This appendix exists to make implementation unambiguous. Payloads are shown in a
 `POST /order`
 ```json
 {
-  "order": "<signed order object>",
+  "order": "<signed order object (produced by SDK using follower private key / L1 signer)>",
   "owner": "<api key of order owner>",
   "orderType": "FAK|FOK|GTC|GTD",
   "postOnly": false
 }
 ```
 
-> The exact “signed order object” schema is handled by the official CLOB client; we treat it as an opaque blob at the API boundary.
+> The exact “signed order object” schema is handled by the official CLOB client; we treat it as an opaque blob at the API boundary. The `owner` field is the follower’s **L2 API key** (not the wallet address).
 
 ### B.4 Polymarket CLOB WebSocket (dashboard + optional trading signals)
 
@@ -1462,6 +1514,7 @@ This appendix exists to make implementation unambiguous. Payloads are shown in a
 
 Polymarket:
 - Docs home: https://docs.polymarket.com/
+- Auth overview (L1/L2 auth + headers): https://docs.polymarket.com/api-reference/authentication
 - CLOB: WSS User Channel (trade + order messages): https://docs.polymarket.com/developers/CLOB/websocket/user-channel
 - CLOB: WSS Market Channel (price_change / tick_size_change): https://docs.polymarket.com/developers/CLOB/websocket/market-channel
 - CLOB: REST Order Book Summary: https://docs.polymarket.com/api-reference/orderbook/get-order-book-summary
@@ -1483,3 +1536,4 @@ Explorers (to validate exchange contract addresses / event logs):
 
 Notes:
 - This spec includes example payload shapes copied/derived from the above docs. When implementing, prefer the official Polymarket clients/types for any signed-order payloads to avoid schema drift.
+- Order signing for CLOB order placement is an **L1 EIP-712 signing step** and is distinct from L2 API-key authentication.

@@ -104,10 +104,22 @@ export default function PositionDetailPage() {
     ? `/api/v1/copies?section=skipped&tokenId=${encodeURIComponent(tokenId)}&page=1&pageSize=50`
     : '/api/v1/copies?section=skipped&page=1&pageSize=50'
 
-  const positionState = useApiQuery<PortfolioPositionPayload>(positionQuery, { enabled: Boolean(tokenId) })
-  const executionsState = useApiQuery<CopyExecutionsPayload>(executionsQuery, { enabled: Boolean(tokenId) })
-  const openState = useApiQuery<CopyOpenPayload>(openQuery, { enabled: Boolean(tokenId) })
-  const skippedState = useApiQuery<CopySkippedPayload>(skippedQuery, { enabled: Boolean(tokenId) })
+  const positionState = useApiQuery<PortfolioPositionPayload>(positionQuery, {
+    enabled: Boolean(tokenId),
+    refreshIntervalMs: 20_000
+  })
+  const executionsState = useApiQuery<CopyExecutionsPayload>(executionsQuery, {
+    enabled: Boolean(tokenId),
+    refreshIntervalMs: 20_000
+  })
+  const openState = useApiQuery<CopyOpenPayload>(openQuery, {
+    enabled: Boolean(tokenId),
+    refreshIntervalMs: 20_000
+  })
+  const skippedState = useApiQuery<CopySkippedPayload>(skippedQuery, {
+    enabled: Boolean(tokenId),
+    refreshIntervalMs: 20_000
+  })
 
   const isLoading = positionState.isLoading || executionsState.isLoading || openState.isLoading || skippedState.isLoading
   const hasError = positionState.error || executionsState.error || openState.error || skippedState.error

@@ -10,6 +10,7 @@ import type {
   NormalizedTradeEvent,
   PollJobSnapshot
 } from "./types.js";
+import { buildCanonicalTradeKey } from "../ingestion/canonical-trade-key.js";
 
 interface PollerDependencies {
   dataApi: LeaderDataApiClient;
@@ -280,7 +281,7 @@ export class LeaderPoller {
             user: leader.profileAddress,
             limit: this.config.pageLimit,
             offset,
-            takerOnly: true
+            takerOnly: this.config.tradesTakerOnly
           }),
         { offset, cursorMs }
       );
@@ -327,6 +328,13 @@ export class LeaderPoller {
       events: tradeEvents
     });
 
+    const nextCursorMs =
+      newestSeenTradeAtMs === undefined
+        ? cursorMs
+        : cursorMs === null
+          ? newestSeenTradeAtMs
+          : Math.max(cursorMs, newestSeenTradeAtMs);
+
     await this.store.upsertLeaderWallets(leader.id, [...walletSet], new Date(this.now()));
     await this.store.saveLeaderPollMeta({
       leaderId: leader.id,
@@ -338,7 +346,7 @@ export class LeaderPoller {
         recordsInserted,
         oldestSeenTradeAtMs,
         newestSeenTradeAtMs,
-        cursorMs,
+        cursorMs: nextCursorMs,
         stopByCursor,
         runDurationMs: this.now() - startedAtMs
       }
@@ -434,9 +442,19 @@ function normalizeTradeEvent(leader: LeaderRecord, trade: DataApiTrade, detected
     trimNumeric(price),
     String(leaderFillAtMs)
   ].join(":");
+  const canonicalKey = buildCanonicalTradeKey({
+    leaderId: leader.id,
+    walletAddress: trade.proxyWallet,
+    tokenId,
+    side,
+    shares,
+    price,
+    leaderFillAtMs
+  });
 
   return {
     triggerId,
+    canonicalKey,
     transactionHash,
     leaderFillAtMs,
     detectedAtMs,

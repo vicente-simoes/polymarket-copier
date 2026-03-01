@@ -18,7 +18,7 @@ export interface ChainTrigger {
   exchangeContract: string;
   leaderId: string;
   leaderWallet: string;
-  leaderRole: "maker";
+  leaderRole: "maker" | "taker";
   tokenId: string;
   side: ChainTriggerSide;
   tokenAmountBaseUnits: string;
@@ -72,7 +72,10 @@ export interface ChainPipelineStatus {
 
 export interface ChainTriggerStore {
   listActiveLeaderWallets(): Promise<LeaderWalletLink[]>;
-  persistChainTrigger(trigger: ChainTrigger): Promise<void>;
+  persistChainTrigger(trigger: ChainTrigger): Promise<{
+    inserted: boolean;
+    dedupedByCanonicalKey: boolean;
+  }>;
   markTriggerRollback(args: {
     triggerId: string;
     leaderId: string;

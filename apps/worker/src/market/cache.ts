@@ -6,7 +6,8 @@ import type {
   MarketCacheConfig,
   MarketFreshnessMetrics,
   MarketMetadataSnapshot,
-  PriceSource
+  PriceSource,
+  SpreadState
 } from "./types.js";
 import type { MarketPriceUpdate, TickSizeUpdate } from "./ws.js";
 
@@ -19,7 +20,8 @@ interface MarketCacheEntry {
   metadataUpdatedAtMs?: number;
   wsBestBid?: number;
   wsBestAsk?: number;
-  wsPriceUpdatedAtMs?: number;
+  wsBestBidUpdatedAtMs?: number;
+  wsBestAskUpdatedAtMs?: number;
   restBestBid?: number;
   restBestAsk?: number;
   restPriceUpdatedAtMs?: number;
@@ -31,6 +33,8 @@ export interface MarketCacheOptions {
   redisStore?: MarketMetadataRedisStore;
   now?: () => number;
 }
+
+const SPREAD_STALE_MS = 5_000;
 
 export class MarketCache {
   private readonly restClient: ClobRestClient;
@@ -65,8 +69,24 @@ export class MarketCache {
       return;
     }
 
-    const books = await this.restClient.fetchBooks(tokenIds);
-    await Promise.all(books.map((book) => this.ingestRestBook(book)));
+    for (const batch of chunkTokens(tokenIds, 100)) {
+      try {
+        const books = await this.restClient.fetchBooks(batch);
+        await Promise.all(books.map((book) => this.ingestRestBook(book)));
+        continue;
+      } catch {
+        // Some CLOB deployments reject oversized or mixed batches. Fall back to per-token hydration.
+      }
+
+      for (const tokenId of batch) {
+        try {
+          const book = await this.restClient.fetchBook(tokenId);
+          await this.ingestRestBook(book);
+        } catch {
+          // Best-effort warm-up: leave token unresolved and let stale guards handle it upstream.
+        }
+      }
+    }
   }
 
   async ingestRestBook(book: ClobBookSummary): Promise<void> {
@@ -77,8 +97,8 @@ export class MarketCache {
     entry.minOrderSize = book.min_order_size;
     entry.negRisk = book.neg_risk;
     entry.metadataUpdatedAtMs = now;
-    entry.restBestBid = book.bids[0]?.price;
-    entry.restBestAsk = book.asks[0]?.price;
+    entry.restBestBid = bestBidFromLevels(book.bids);
+    entry.restBestAsk = bestAskFromLevels(book.asks);
     entry.restPriceUpdatedAtMs = now;
 
     if (this.redisStore) {
@@ -99,9 +119,14 @@ export class MarketCache {
 
   ingestWsPrice(update: MarketPriceUpdate): void {
     const entry = this.ensureEntry(update.tokenId);
-    entry.wsBestBid = update.bestBid ?? entry.wsBestBid;
-    entry.wsBestAsk = update.bestAsk ?? entry.wsBestAsk;
-    entry.wsPriceUpdatedAtMs = update.atMs;
+    if (update.bestBid !== undefined) {
+      entry.wsBestBid = update.bestBid;
+      entry.wsBestBidUpdatedAtMs = update.atMs;
+    }
+    if (update.bestAsk !== undefined) {
+      entry.wsBestAsk = update.bestAsk;
+      entry.wsBestAskUpdatedAtMs = update.atMs;
+    }
   }
 
   async ingestWsTickSize(update: TickSizeUpdate): Promise<void> {
@@ -125,20 +150,27 @@ export class MarketCache {
     }
   }
 
-  async getBookState(tokenId: string): Promise<MarketBookState> {
+  async getBookState(tokenId: string, options?: { wsConnected?: boolean }): Promise<MarketBookState> {
     const entry = this.ensureEntry(tokenId);
+    const now = this.now();
+    const wsConnected = options?.wsConnected ?? true;
     try {
       await this.ensureMetadata(entry);
-      await this.ensureRestPriceWhenNeeded(entry);
+      if (wsConnected) {
+        await this.ensureRestPriceWhenNeeded(entry);
+      } else {
+        await this.ensureRestPriceFresh(entry);
+      }
     } catch {
       // Keep serving the best-known snapshot; stale markers will block execution upstream.
     }
-    return this.toState(entry);
+    const state = this.toState(entry, now);
+    return this.withSpreadFields(state, entry, now, wsConnected);
   }
 
-  async getWatchedBookStates(): Promise<MarketBookState[]> {
+  async getWatchedBookStates(options?: { wsConnected?: boolean }): Promise<MarketBookState[]> {
     const tokenIds = this.getWatchedTokenIds();
-    return Promise.all(tokenIds.map((tokenId) => this.getBookState(tokenId)));
+    return Promise.all(tokenIds.map((tokenId) => this.getBookState(tokenId, options)));
   }
 
   getFreshnessMetrics(snapshotAtMs = this.now()): MarketFreshnessMetrics {
@@ -225,11 +257,7 @@ export class MarketCache {
 
   private async ensureRestPriceWhenNeeded(entry: MarketCacheEntry): Promise<void> {
     const now = this.now();
-    const wsPriceFresh =
-      entry.wsPriceUpdatedAtMs !== undefined &&
-      now - entry.wsPriceUpdatedAtMs <= this.config.wsPriceTtlMs &&
-      entry.wsBestBid !== undefined &&
-      entry.wsBestAsk !== undefined;
+    const wsPriceFresh = this.isWsPriceFresh(entry, now);
 
     const restPriceFresh =
       entry.restPriceUpdatedAtMs !== undefined &&
@@ -238,6 +266,22 @@ export class MarketCache {
       entry.restBestAsk !== undefined;
 
     if (wsPriceFresh || restPriceFresh) {
+      return;
+    }
+
+    const book = await this.restClient.fetchBook(entry.tokenId);
+    await this.ingestRestBook(book);
+  }
+
+  private async ensureRestPriceFresh(entry: MarketCacheEntry): Promise<void> {
+    const now = this.now();
+    const restPriceFresh =
+      entry.restPriceUpdatedAtMs !== undefined &&
+      now - entry.restPriceUpdatedAtMs <= this.config.restPriceTtlMs &&
+      entry.restBestBid !== undefined &&
+      entry.restBestAsk !== undefined;
+
+    if (restPriceFresh) {
       return;
     }
 
@@ -273,11 +317,7 @@ export class MarketCache {
       staleReasons.push("STALE_METADATA");
     }
 
-    const wsPriceFresh =
-      entry.wsPriceUpdatedAtMs !== undefined &&
-      now - entry.wsPriceUpdatedAtMs <= this.config.wsPriceTtlMs &&
-      entry.wsBestBid !== undefined &&
-      entry.wsBestAsk !== undefined;
+    const wsPriceFresh = this.isWsPriceFresh(entry, now);
 
     const restPriceFresh =
       entry.restPriceUpdatedAtMs !== undefined &&
@@ -294,7 +334,7 @@ export class MarketCache {
       priceSource = "WS";
       bestBid = entry.wsBestBid;
       bestAsk = entry.wsBestAsk;
-      priceUpdatedAtMs = entry.wsPriceUpdatedAtMs;
+      priceUpdatedAtMs = this.wsPriceUpdatedAtMs(entry);
     } else if (restPriceFresh) {
       priceSource = "REST";
       bestBid = entry.restBestBid;
@@ -322,6 +362,8 @@ export class MarketCache {
       bestAsk,
       midPrice,
       priceSource,
+      wsConnected: false,
+      spreadState: "UNAVAILABLE",
       isStale: staleReasons.length > 0,
       staleReasons,
       metadataUpdatedAtMs: entry.metadataUpdatedAtMs,
@@ -336,4 +378,131 @@ export class MarketCache {
     entry.negRisk = snapshot.negRisk;
     entry.metadataUpdatedAtMs = snapshot.metadataUpdatedAtMs;
   }
+
+  private isWsPriceFresh(entry: MarketCacheEntry, now: number): boolean {
+    const bidFresh =
+      entry.wsBestBid !== undefined &&
+      entry.wsBestBidUpdatedAtMs !== undefined &&
+      now - entry.wsBestBidUpdatedAtMs <= this.config.wsPriceTtlMs;
+    const askFresh =
+      entry.wsBestAsk !== undefined &&
+      entry.wsBestAskUpdatedAtMs !== undefined &&
+      now - entry.wsBestAskUpdatedAtMs <= this.config.wsPriceTtlMs;
+    return bidFresh && askFresh;
+  }
+
+  private wsPriceUpdatedAtMs(entry: MarketCacheEntry): number | undefined {
+    if (entry.wsBestBidUpdatedAtMs === undefined || entry.wsBestAskUpdatedAtMs === undefined) {
+      return undefined;
+    }
+    // A two-sided WS quote is only as fresh as its oldest side.
+    return Math.min(entry.wsBestBidUpdatedAtMs, entry.wsBestAskUpdatedAtMs);
+  }
+
+  private withSpreadFields(
+    state: MarketBookState,
+    entry: MarketCacheEntry,
+    now: number,
+    wsConnected: boolean
+  ): MarketBookState {
+    const spreadView = wsConnected
+      ? this.computeWsSpreadView(entry, now)
+      : this.computeRestSpreadView(entry, now);
+
+    return {
+      ...state,
+      wsConnected,
+      spreadState: spreadView.spreadState,
+      spreadUsd: spreadView.spreadUsd,
+      quoteUpdatedAtMs: spreadView.quoteUpdatedAtMs
+    };
+  }
+
+  private computeWsSpreadView(
+    entry: MarketCacheEntry,
+    now: number
+  ): { spreadState: SpreadState; spreadUsd?: number; quoteUpdatedAtMs?: number } {
+    const quoteUpdatedAtMs = this.wsPriceUpdatedAtMs(entry);
+    if (
+      quoteUpdatedAtMs === undefined ||
+      entry.wsBestBid === undefined ||
+      entry.wsBestAsk === undefined ||
+      !Number.isFinite(entry.wsBestBid) ||
+      !Number.isFinite(entry.wsBestAsk) ||
+      entry.wsBestAsk < entry.wsBestBid
+    ) {
+      return { spreadState: "UNAVAILABLE" };
+    }
+
+    const spreadUsd = entry.wsBestAsk - entry.wsBestBid;
+    const ageMs = Math.max(0, now - quoteUpdatedAtMs);
+    if (ageMs > SPREAD_STALE_MS) {
+      return { spreadState: "STALE", quoteUpdatedAtMs };
+    }
+
+    return { spreadState: "LIVE", spreadUsd, quoteUpdatedAtMs };
+  }
+
+  private computeRestSpreadView(
+    entry: MarketCacheEntry,
+    now: number
+  ): { spreadState: SpreadState; spreadUsd?: number; quoteUpdatedAtMs?: number } {
+    const quoteUpdatedAtMs = entry.restPriceUpdatedAtMs;
+    if (
+      quoteUpdatedAtMs === undefined ||
+      entry.restBestBid === undefined ||
+      entry.restBestAsk === undefined ||
+      !Number.isFinite(entry.restBestBid) ||
+      !Number.isFinite(entry.restBestAsk) ||
+      entry.restBestAsk < entry.restBestBid
+    ) {
+      return { spreadState: "UNAVAILABLE" };
+    }
+
+    const spreadUsd = entry.restBestAsk - entry.restBestBid;
+    const ageMs = Math.max(0, now - quoteUpdatedAtMs);
+    if (ageMs > this.config.restPriceTtlMs) {
+      return { spreadState: "STALE", quoteUpdatedAtMs };
+    }
+
+    return { spreadState: "LIVE", spreadUsd, quoteUpdatedAtMs };
+  }
+}
+
+function chunkTokens(tokenIds: string[], size: number): string[][] {
+  if (size <= 0 || tokenIds.length <= size) {
+    return [tokenIds];
+  }
+
+  const chunks: string[][] = [];
+  for (let index = 0; index < tokenIds.length; index += size) {
+    chunks.push(tokenIds.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function bestBidFromLevels(levels: Array<{ price: number; size: number }>): number | undefined {
+  let best: number | undefined;
+  for (const level of levels) {
+    if (!Number.isFinite(level.price) || !Number.isFinite(level.size) || level.price <= 0 || level.size <= 0) {
+      continue;
+    }
+    if (best === undefined || level.price > best) {
+      best = level.price;
+    }
+  }
+  return best;
+}
+
+function bestAskFromLevels(levels: Array<{ price: number; size: number }>): number | undefined {
+  let best: number | undefined;
+  for (const level of levels) {
+    if (!Number.isFinite(level.price) || !Number.isFinite(level.size) || level.price <= 0 || level.size <= 0) {
+      continue;
+    }
+    if (best === undefined || level.price < best) {
+      best = level.price;
+    }
+  }
+  return best;
 }

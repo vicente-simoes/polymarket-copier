@@ -45,11 +45,14 @@ export class MarketDataService {
   }
 
   async getBookState(tokenId: string): Promise<MarketBookState> {
-    return this.cache.getBookState(tokenId);
+    return this.cache.getBookState(tokenId, {
+      wsConnected: this.wsClient.getMetrics().connected
+    });
   }
 
   async getWatchedBookStates(): Promise<MarketBookState[]> {
-    return this.cache.getWatchedBookStates();
+    const wsConnected = this.wsClient.getMetrics().connected;
+    return this.cache.getWatchedBookStates({ wsConnected });
   }
 
   getStatus(): MarketDataStatus {

@@ -1,6 +1,7 @@
 import http from "node:http";
 import { PrismaClient } from "@copybot/db";
 import { parseWorkerEnv } from "@copybot/shared";
+import { Wallet } from "ethers";
 import {
   ChainTriggerPipeline,
   InMemoryTriggerDeduper,
@@ -19,7 +20,12 @@ import {
   type MarketMetadataRedisStore
 } from "./market/index.js";
 import { FillAttributionService, PrismaFillAttributionStore } from "./fills/index.js";
-import { ClobExecutionClient, ExecutionEngine, PrismaExecutionStore } from "./execution/index.js";
+import {
+  ClobExecutionClient,
+  ExecutionEngine,
+  PrismaExecutionStore,
+  resolvePolymarketSigningConfig
+} from "./execution/index.js";
 import { PrismaTargetNettingStore, TargetNettingEngine } from "./target/index.js";
 import { PrismaReconcileStore, ReconcileEngine } from "./reconcile/index.js";
 import { workerLogger } from "./logger.js";
@@ -114,10 +120,74 @@ async function bootstrap(): Promise<void> {
 
   marketData.start();
 
-  const watchedTokenIds = parseTokenList(env.MARKET_WATCH_TOKEN_IDS);
-  if (watchedTokenIds.length > 0) {
-    await marketData.setWatchedTokenIds(watchedTokenIds);
+  const staticWatchedTokenIds = parseTokenList(env.MARKET_WATCH_TOKEN_IDS);
+  const dynamicMarketWatchRefreshIntervalMs = 5_000;
+  let lastWatchedTokenKey = "";
+
+  async function refreshWatchedTokenUniverse(): Promise<void> {
+    const [attemptTokens, pendingTokens] = await Promise.all([
+      prisma.copyAttempt.findMany({
+        where: {
+          status: {
+            in: ["PENDING", "RETRYING", "EXECUTING"]
+          },
+          decision: "PENDING"
+        },
+        select: {
+          tokenId: true
+        },
+        distinct: ["tokenId"]
+      }),
+      prisma.pendingDelta.findMany({
+        where: {
+          status: {
+            in: ["PENDING", "ELIGIBLE", "BLOCKED"]
+          }
+        },
+        select: {
+          tokenId: true
+        },
+        distinct: ["tokenId"]
+      })
+    ]);
+
+    const tokenSet = new Set<string>(staticWatchedTokenIds);
+    for (const row of attemptTokens) {
+      if (row.tokenId) {
+        tokenSet.add(row.tokenId);
+      }
+    }
+    for (const row of pendingTokens) {
+      if (row.tokenId) {
+        tokenSet.add(row.tokenId);
+      }
+    }
+
+    const nextWatchedTokens = [...tokenSet].sort();
+    const nextKey = nextWatchedTokens.join(",");
+    if (nextKey === lastWatchedTokenKey) {
+      return;
+    }
+
+    await marketData.setWatchedTokenIds(nextWatchedTokens);
+    lastWatchedTokenKey = nextKey;
   }
+
+  try {
+    await refreshWatchedTokenUniverse();
+  } catch (error) {
+    workerLogger.warn("bootstrap.market_watch_refresh_failed", {
+      error: toErrorDetails(error)
+    });
+  }
+
+  setInterval(() => {
+    void refreshWatchedTokenUniverse().catch((error) => {
+      workerLogger.warn("market.watch_refresh_failed", {
+        error: toErrorDetails(error)
+      });
+    });
+  }, dynamicMarketWatchRefreshIntervalMs);
 
   const leaderPoller = new LeaderPoller({
     dataApi: new DataApiClient({
@@ -127,6 +197,7 @@ async function bootstrap(): Promise<void> {
     config: {
       positionsIntervalMs: env.RECONCILE_INTERVAL_SECONDS * 1000,
       tradesIntervalMs: env.LEADER_TRADES_POLL_INTERVAL_SECONDS * 1000,
+      tradesTakerOnly: env.LEADER_TRADES_TAKER_ONLY,
       pageLimit: env.LEADER_POLL_PAGE_LIMIT,
       batchSize: env.LEADER_POLL_BATCH_SIZE,
       maxRetries: env.LEADER_POLL_MAX_RETRIES,
@@ -178,13 +249,31 @@ async function bootstrap(): Promise<void> {
   });
   targetNetting.start();
 
+  const signingConfig = resolvePolymarketSigningConfig(env, {
+    required: env.EXECUTION_ENGINE_ENABLED
+  });
+  const polymarketSignerAddress = deriveSignerAddress(signingConfig?.privateKey);
+
+  if (signingConfig?.signatureTypeName === "EOA" && !signingConfig.funderAddress) {
+    workerLogger.warn("worker.polymarket_signing_mode_warning", {
+      message:
+        "Using EOA signing without funderAddress. If your funded Polymarket account is proxy/safe-backed, set POLYMARKET_SIGNATURE_TYPE and POLYMARKET_FUNDER_ADDRESS.",
+      signerAddress: polymarketSignerAddress,
+      signatureType: signingConfig.signatureTypeName
+    });
+  }
+
   const executionEngine = new ExecutionEngine({
     store: new PrismaExecutionStore(prisma),
     venueClient: new ClobExecutionClient({
       baseUrl: env.CLOB_REST_BASE_URL,
       apiKey: env.POLYMARKET_API_KEY,
       apiSecret: env.POLYMARKET_API_SECRET,
-      passphrase: env.POLYMARKET_PASSPHRASE
+      passphrase: env.POLYMARKET_PASSPHRASE,
+      privateKey: signingConfig?.privateKey,
+      chainId: signingConfig?.chainId,
+      signatureType: signingConfig?.signatureType,
+      funderAddress: signingConfig?.funderAddress
     }),
     config: {
       enabled: env.EXECUTION_ENGINE_ENABLED,
@@ -200,6 +289,7 @@ async function bootstrap(): Promise<void> {
       maxWorseningSellUsd: env.MAX_WORSENING_SELL_USD,
       maxSlippageBps: env.MAX_SLIPPAGE_BPS,
       maxSpreadUsd: env.MAX_SPREAD_USD,
+      maxPricePerShare: env.MAX_PRICE_PER_SHARE_USD,
       maxDailyNotionalTurnoverUsd: env.MAX_DAILY_NOTIONAL_TURNOVER_USD,
       maxHourlyNotionalTurnoverUsd: env.MAX_HOURLY_NOTIONAL_TURNOVER_USD,
       cooldownPerMarketSeconds: env.COOLDOWN_PER_MARKET_SECONDS
@@ -216,7 +306,8 @@ async function bootstrap(): Promise<void> {
         minOrderSize: state.minOrderSize,
         negRisk: state.negRisk,
         isStale: state.isStale,
-        priceSource: state.priceSource
+        priceSource: state.priceSource,
+        wsConnected: state.wsConnected
       };
     },
     fetchOrderBook: async (tokenId) => {
@@ -418,7 +509,8 @@ async function bootstrap(): Promise<void> {
     clobMarketWsUrl: maskSecret(env.CLOB_MARKET_WS_URL),
     clobUserWsUrl: maskSecret(env.CLOB_USER_WS_URL),
     marketWsEnabled: env.MARKET_WS_ENABLED,
-    marketWatchedTokensCount: watchedTokenIds.length,
+    marketWatchedTokensCount: staticWatchedTokenIds.length,
+    marketWatchRefreshIntervalMs: dynamicMarketWatchRefreshIntervalMs,
     dataApiBaseUrl: env.DATA_API_BASE_URL,
     chainTriggerWsEnabled: env.CHAIN_TRIGGER_WS_ENABLED,
     chainTriggerExchangeContracts: exchangeContracts,
@@ -438,7 +530,11 @@ async function bootstrap(): Promise<void> {
     executionRetryBackoffBaseMs: env.EXECUTION_RETRY_BACKOFF_BASE_MS,
     executionRetryBackoffMaxMs: env.EXECUTION_RETRY_BACKOFF_MAX_MS,
     executionDryRunMode: env.DRY_RUN_MODE,
+    polymarketSignerAddress,
+    polymarketSignatureType: signingConfig?.signatureTypeName ?? null,
+    polymarketFunderAddress: signingConfig?.funderAddress ?? null,
     leaderTradesPollIntervalSeconds: env.LEADER_TRADES_POLL_INTERVAL_SECONDS,
+    leaderTradesTakerOnly: env.LEADER_TRADES_TAKER_ONLY,
     leaderPollPageLimit: env.LEADER_POLL_PAGE_LIMIT,
     leaderPollBatchSize: env.LEADER_POLL_BATCH_SIZE,
     leaderPollMaxRetries: env.LEADER_POLL_MAX_RETRIES,
@@ -498,6 +594,18 @@ function toTargetPriceSource(priceSource: "WS" | "REST" | "NONE"): "MARKET_WS" |
     return "MARKET_REST";
   }
   return "UNKNOWN";
+}
+
+function deriveSignerAddress(privateKey: string | undefined): string | null {
+  if (!privateKey) {
+    return null;
+  }
+
+  try {
+    return new Wallet(privateKey).address;
+  } catch {
+    return null;
+  }
 }
 
 void bootstrap().catch((error) => {

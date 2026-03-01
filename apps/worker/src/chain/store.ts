@@ -1,5 +1,6 @@
 import { Prisma, PrismaClient } from "@copybot/db";
 import type { ChainTrigger, ChainTriggerStore, LeaderWalletLink, ReconcileTask } from "./types.js";
+import { buildCanonicalTradeKey } from "../ingestion/canonical-trade-key.js";
 
 const CHAIN_SOURCE = "CHAIN";
 
@@ -30,13 +31,27 @@ export class PrismaChainTriggerStore implements ChainTriggerStore {
     }));
   }
 
-  async persistChainTrigger(trigger: ChainTrigger): Promise<void> {
+  async persistChainTrigger(trigger: ChainTrigger): Promise<{
+    inserted: boolean;
+    dedupedByCanonicalKey: boolean;
+  }> {
+    const canonicalKey = buildCanonicalTradeKey({
+      leaderId: trigger.leaderId,
+      walletAddress: trigger.leaderWallet,
+      tokenId: trigger.tokenId,
+      side: trigger.side,
+      shares: trigger.shares,
+      price: trigger.price,
+      leaderFillAtMs: trigger.leaderFillAtMs
+    });
+
     try {
       await this.prisma.leaderTradeEvent.create({
         data: {
           leaderId: trigger.leaderId,
           source: CHAIN_SOURCE,
           triggerId: trigger.triggerId,
+          canonicalKey,
           transactionHash: trigger.transactionHash,
           logIndex: trigger.logIndex,
           leaderFillAtMs: BigInt(trigger.leaderFillAtMs),
@@ -61,9 +76,23 @@ export class PrismaChainTriggerStore implements ChainTriggerStore {
           })
         }
       });
+      return {
+        inserted: true,
+        dedupedByCanonicalKey: false
+      };
     } catch (error) {
       if (isUniqueViolation(error)) {
-        return;
+        if (isCanonicalKeyViolation(error)) {
+          await this.mergeChainObservationIntoCanonicalTrade(trigger, canonicalKey);
+          return {
+            inserted: false,
+            dedupedByCanonicalKey: true
+          };
+        }
+        return {
+          inserted: false,
+          dedupedByCanonicalKey: false
+        };
       }
       throw error;
     }
@@ -76,7 +105,13 @@ export class PrismaChainTriggerStore implements ChainTriggerStore {
     removedAtMs: number;
     payload: Record<string, unknown>;
   }): Promise<void> {
-    const existing = await this.prisma.leaderTradeEvent.findUnique({
+    const transactionHash =
+      typeof args.payload.transactionHash === "string" ? args.payload.transactionHash.toLowerCase() : undefined;
+    const logIndex =
+      typeof args.payload.logIndex === "number" && Number.isInteger(args.payload.logIndex) ? args.payload.logIndex : undefined;
+    const canonicalKey = typeof args.payload.canonicalKey === "string" ? args.payload.canonicalKey : undefined;
+
+    let existing = await this.prisma.leaderTradeEvent.findUnique({
       where: {
         triggerId: args.triggerId
       },
@@ -85,6 +120,36 @@ export class PrismaChainTriggerStore implements ChainTriggerStore {
         payload: true
       }
     });
+
+    if (!existing && transactionHash !== undefined && logIndex !== undefined) {
+      existing = await this.prisma.leaderTradeEvent.findUnique({
+        where: {
+          transactionHash_logIndex: {
+            transactionHash,
+            logIndex
+          }
+        },
+        select: {
+          id: true,
+          payload: true
+        }
+      });
+    }
+
+    if (!existing && canonicalKey) {
+      existing = await this.prisma.leaderTradeEvent.findUnique({
+        where: {
+          leaderId_canonicalKey: {
+            leaderId: args.leaderId,
+            canonicalKey
+          }
+        },
+        select: {
+          id: true,
+          payload: true
+        }
+      });
+    }
 
     if (existing) {
       const payload = ensureObject(existing.payload);
@@ -117,6 +182,49 @@ export class PrismaChainTriggerStore implements ChainTriggerStore {
           removedAtMs: args.removedAtMs,
           payload: args.payload
         })
+      }
+    });
+  }
+
+  private async mergeChainObservationIntoCanonicalTrade(trigger: ChainTrigger, canonicalKey: string): Promise<void> {
+    const existing = await this.prisma.leaderTradeEvent.findUnique({
+      where: {
+        leaderId_canonicalKey: {
+          leaderId: trigger.leaderId,
+          canonicalKey
+        }
+      },
+      select: {
+        id: true,
+        payload: true,
+        transactionHash: true,
+        logIndex: true,
+        wsReceivedAtMs: true
+      }
+    });
+
+    if (!existing) {
+      return;
+    }
+
+    const payload = mergePayloadSource(existing.payload, CHAIN_SOURCE, trigger.detectedAtMs, {
+      chain: {
+        triggerId: trigger.triggerId,
+        event: trigger.event,
+        leaderWallet: trigger.leaderWallet,
+        transactionHash: trigger.transactionHash,
+        logIndex: trigger.logIndex,
+        wsReceivedAtMs: trigger.wsReceivedAtMs
+      }
+    });
+
+    await this.prisma.leaderTradeEvent.update({
+      where: { id: existing.id },
+      data: {
+        transactionHash: existing.transactionHash ?? trigger.transactionHash,
+        logIndex: existing.logIndex ?? trigger.logIndex,
+        wsReceivedAtMs: existing.wsReceivedAtMs ?? BigInt(trigger.wsReceivedAtMs),
+        payload: toInputJsonValue(payload)
       }
     });
   }
@@ -169,4 +277,45 @@ function isUniqueViolation(error: unknown): boolean {
     error instanceof Prisma.PrismaClientKnownRequestError &&
     error.code === "P2002"
   );
+}
+
+function isCanonicalKeyViolation(error: unknown): boolean {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") {
+    return false;
+  }
+
+  const target = (error.meta?.target ?? []) as unknown;
+  if (Array.isArray(target)) {
+    return target.includes("leaderId") && target.includes("canonicalKey");
+  }
+
+  if (typeof target === "string") {
+    return target.includes("canonicalKey");
+  }
+
+  return false;
+}
+
+function mergePayloadSource(
+  value: unknown,
+  source: "CHAIN" | "DATA_API",
+  observedAtMs: number,
+  extras: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const payload = ensureObject(value);
+  const seenSourcesRaw = Array.isArray(payload.seenSources) ? payload.seenSources : [];
+  const seenSources = [...new Set(seenSourcesRaw.filter((entry): entry is string => typeof entry === "string"))];
+  if (!seenSources.includes(source)) {
+    seenSources.push(source);
+  }
+
+  const sourceObservedAtMs = ensureObject(payload.sourceObservedAtMs);
+  sourceObservedAtMs[source] = observedAtMs;
+
+  return {
+    ...payload,
+    ...extras,
+    seenSources,
+    sourceObservedAtMs
+  };
 }

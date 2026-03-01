@@ -281,7 +281,8 @@ export async function GET(request: NextRequest) {
       const capsConfigured =
         toNumber(settings.maxExposurePerLeaderUsd) > 0 ||
         toNumber(settings.maxExposurePerMarketOutcomeUsd) > 0 ||
-        toNumber(settings.maxDailyNotionalTurnoverUsd) > 0
+        toNumber(settings.maxDailyNotionalTurnoverUsd) > 0 ||
+        toNumber(settings.maxPricePerShareUsd) > 0
 
       profileLinkByLeader.set(link.leaderId, {
         copyProfileId: link.copyProfileId,
@@ -396,20 +397,7 @@ export async function POST(request: NextRequest) {
                 defaultRatio: true
               }
             })
-          : await tx.copyProfile.findFirst({
-              where: {
-                status: {
-                  in: ['ACTIVE', 'PAUSED']
-                }
-              },
-              orderBy: {
-                createdAt: 'asc'
-              },
-              select: {
-                id: true,
-                defaultRatio: true
-              }
-            })
+          : await ensureActiveCopyProfile(tx, body.ratio)
 
       if (!profile) {
         return {
@@ -479,6 +467,70 @@ export async function POST(request: NextRequest) {
 
     return jsonError(500, 'LEADER_CREATE_FAILED', toErrorMessage(error))
   }
+}
+
+async function ensureActiveCopyProfile(
+  tx: Prisma.TransactionClient,
+  requestedRatio?: number
+): Promise<{ id: string; defaultRatio: Prisma.Decimal } | null> {
+  const active = await tx.copyProfile.findFirst({
+    where: {
+      status: 'ACTIVE'
+    },
+    orderBy: {
+      createdAt: 'asc'
+    },
+    select: {
+      id: true,
+      defaultRatio: true
+    }
+  })
+
+  if (active) {
+    return active
+  }
+
+  const existing = await tx.copyProfile.findFirst({
+    orderBy: {
+      createdAt: 'asc'
+    },
+    select: {
+      id: true,
+      defaultRatio: true
+    }
+  })
+
+  if (existing) {
+    return tx.copyProfile.update({
+      where: {
+        id: existing.id
+      },
+      data: {
+        status: 'ACTIVE'
+      },
+      select: {
+        id: true,
+        defaultRatio: true
+      }
+    })
+  }
+
+  return tx.copyProfile.create({
+    data: {
+      name: 'default',
+      followerAddress: '0x0000000000000000000000000000000000000000',
+      status: 'ACTIVE',
+      defaultRatio: String(requestedRatio ?? 0.05),
+      config: {
+        autoCreated: true,
+        autoCreatedBy: 'leaders.create'
+      }
+    },
+    select: {
+      id: true,
+      defaultRatio: true
+    }
+  })
 }
 
 function asObject(value: unknown): Record<string, unknown> {

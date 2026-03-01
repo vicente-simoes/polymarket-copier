@@ -1,5 +1,6 @@
 'use client'
 
+import Link from 'next/link'
 import { useMemo, useState } from 'react'
 import { CircleGauge, ClipboardList, Clock3, Layers3, ListChecks, Workflow } from 'lucide-react'
 import { useApiQuery } from '@/components/dashboard/use-api-query'
@@ -13,7 +14,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { buildCopiesQuery } from '@/lib/dashboard/query-builders'
 import { formatCurrency, formatDateTime, formatNumber, formatRelativeSeconds } from '@/lib/format'
 
-type Section = 'open' | 'executions' | 'skipped'
+type Section = 'open' | 'attempting' | 'executions' | 'skipped'
 
 interface CopiesData {
   section: Section
@@ -37,15 +38,56 @@ interface CopiesData {
       createdAt: string
       leaderId: string | null
       leaderName: string | null
+      leaderNames: string[]
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
       outcome: string | null
       side: 'BUY' | 'SELL'
       pendingNotionalUsd: number
+      minExecutableNotionalUsd: number
+      minOrderSizeShares: number | null
       pendingShares: number
       status: 'PENDING' | 'ELIGIBLE' | 'BLOCKED' | 'EXPIRED' | 'CONVERTED'
       blockReason: string | null
       expiresAt: string | null
+    }>
+    pagination: {
+      page: number
+      pageSize: number
+      total: number
+      totalPages: number
+    }
+  } | null
+  attempting: {
+    items: Array<{
+      id: string
+      createdAt: string
+      attemptedAt: string | null
+      leaderId: string | null
+      leaderName: string | null
+      leaderNames: string[]
+      tokenId: string
+      marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
+      outcome: string | null
+      side: 'BUY' | 'SELL'
+      accumulatedDeltaNotionalUsd: number
+      accumulatedDeltaShares: number
+      spreadState: 'LIVE' | 'STALE' | 'UNAVAILABLE'
+      spreadAgeMs: number | null
+      currentSpreadUsd: number | null
+      retries: number
+      maxRetries: number
+      status: 'PENDING' | 'RETRYING' | 'EXECUTING'
+      reason: string | null
+      message: string | null
+      lastOrderStatus: 'PLACED' | 'PARTIALLY_FILLED' | 'FILLED' | 'FAILED' | 'CANCELLED' | 'RETRYING' | null
+      lastOrderError: string | null
+      pendingStatus: 'PENDING' | 'ELIGIBLE' | 'BLOCKED' | 'EXPIRED' | 'CONVERTED' | null
+      pendingBlockReason: string | null
     }>
     pagination: {
       page: number
@@ -63,6 +105,8 @@ interface CopiesData {
       leaderName: string | null
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
       outcome: string | null
       side: 'BUY' | 'SELL'
       intendedNotionalUsd: number
@@ -89,6 +133,8 @@ interface CopiesData {
     groups: Array<{
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
       outcome: string | null
       skipCount: number
       lastSkippedAt: string
@@ -102,6 +148,8 @@ interface CopiesData {
       leaderName: string | null
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
       outcome: string | null
       side: 'BUY' | 'SELL'
       reason: string | null
@@ -129,6 +177,167 @@ function statusTone(status: string): 'positive' | 'warning' | 'negative' | 'neut
   return 'neutral'
 }
 
+function clobAuthPillClass(status: CopiesData['summary']['clobAuthentication']['status']): string {
+  if (status === 'OK') {
+    return 'border-emerald-400/45 bg-emerald-500/20 text-emerald-300'
+  }
+  if (status === 'ERROR') {
+    return 'border-rose-400/45 bg-rose-500/20 text-rose-300'
+  }
+  return 'border-cyan-400/45 bg-cyan-500/20 text-cyan-300'
+}
+
+function userChannelPillClass(status: CopiesData['summary']['userChannel']['status']): string {
+  if (status === 'CONNECTED') {
+    return 'border-cyan-400/45 bg-cyan-500/20 text-cyan-300'
+  }
+  if (status === 'DISCONNECTED') {
+    return 'border-rose-400/45 bg-rose-500/20 text-rose-300'
+  }
+  return 'border-amber-400/45 bg-amber-500/20 text-amber-300'
+}
+
+function formatCurrencyDetailed(value: number, maxFractionDigits = 6): string {
+  if (!Number.isFinite(value)) {
+    return '$0'
+  }
+
+  return (
+    '$' +
+    new Intl.NumberFormat('en-US', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: maxFractionDigits
+    }).format(value)
+  )
+}
+
+type OpenRow = NonNullable<CopiesData['open']>['items'][number]
+type AttemptingRow = NonNullable<CopiesData['attempting']>['items'][number]
+
+function openLeaderLabel(row: OpenRow): string {
+  if (row.leaderNames.length > 0) {
+    return row.leaderNames.join(', ')
+  }
+  return row.leaderName ?? 'n/a'
+}
+
+function openStatusTone(row: OpenRow): 'positive' | 'warning' | 'negative' | 'neutral' {
+  if (row.blockReason) {
+    return 'warning'
+  }
+  return statusTone(row.status)
+}
+
+function openStatusLabel(row: OpenRow): string {
+  return row.status
+}
+
+function openStatusDetail(row: OpenRow): string {
+  return row.blockReason ?? 'n/a'
+}
+
+function attemptingLeaderLabel(row: AttemptingRow): string {
+  if (row.leaderNames.length > 0) {
+    return row.leaderNames.join(', ')
+  }
+  return row.leaderName ?? 'n/a'
+}
+
+function attemptingStatusTone(status: AttemptingRow['status']): 'warning' | 'neutral' {
+  if (status === 'RETRYING') {
+    return 'warning'
+  }
+  return 'neutral'
+}
+
+function humanizeReasonText(value: string): string {
+  if (!/^[A-Z0-9_]+$/.test(value)) {
+    return value
+  }
+
+  return value
+    .toLowerCase()
+    .split('_')
+    .filter((part) => part.length > 0)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function attemptingReason(row: AttemptingRow): string {
+  const reason = row.message ?? row.lastOrderError ?? row.reason ?? row.pendingBlockReason ?? 'n/a'
+  return humanizeReasonText(reason)
+}
+
+function attemptingPricePerShareUsd(row: AttemptingRow): number | null {
+  if (!Number.isFinite(row.accumulatedDeltaShares) || row.accumulatedDeltaShares <= 0) {
+    return null
+  }
+  if (!Number.isFinite(row.accumulatedDeltaNotionalUsd) || row.accumulatedDeltaNotionalUsd <= 0) {
+    return null
+  }
+  return row.accumulatedDeltaNotionalUsd / row.accumulatedDeltaShares
+}
+
+function attemptingSpreadLabel(row: AttemptingRow): string {
+  if (row.spreadState === 'LIVE' && row.currentSpreadUsd !== null) {
+    return formatCurrencyDetailed(row.currentSpreadUsd, 6)
+  }
+  if (row.spreadState === 'STALE') {
+    return 'STALE'
+  }
+  return 'n/a'
+}
+
+function attemptingSpreadDetail(row: AttemptingRow): string | null {
+  if (row.spreadState !== 'STALE' || row.spreadAgeMs === null) {
+    return null
+  }
+  return `${Math.max(1, Math.trunc(row.spreadAgeMs / 1000))}s old`
+}
+
+function toPolymarketMarketUrl(marketSlug: string | null | undefined): string | null {
+  if (!marketSlug) {
+    return null
+  }
+  const normalized = marketSlug.trim().replace(/^\/+|\/+$/g, '')
+  if (!normalized) {
+    return null
+  }
+  const encodedPath = normalized
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/')
+
+  if (!encodedPath) {
+    return null
+  }
+
+  return `https://polymarket.com/event/${encodedPath}`
+}
+
+function MarketLink({
+  marketSlug,
+  marketLabel,
+  fallback
+}: {
+  marketSlug: string | null | undefined
+  marketLabel: string | null | undefined
+  fallback: string
+}) {
+  const label = marketLabel ?? fallback
+  const href = toPolymarketMarketUrl(marketSlug)
+  if (!href) {
+    return <span className="text-[#E7E7E7]">{label}</span>
+  }
+  return (
+    <Link href={href} target="_blank" rel="noreferrer" className="text-[#E7E7E7] underline-offset-4 hover:underline">
+      {label}
+    </Link>
+  )
+}
+
 const panelClass =
   'rounded-2xl border border-white/10 bg-[#0D0D0D]/95 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] backdrop-blur'
 
@@ -150,7 +359,9 @@ export default function CopiesPage() {
     })
   }, [section, page, selectedSkippedToken])
 
-  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<CopiesData>(query)
+  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<CopiesData>(query, {
+    refreshIntervalMs: 10_000
+  })
 
   if (isLoading && !data) {
     return <LoadingState title="Loading copy pipeline" description="Fetching pending copies, executions, and skipped attempts." />
@@ -164,11 +375,13 @@ export default function CopiesPage() {
     return <EmptyState title="No copies data" description="Copy pipeline entries will appear after trade detection and reconcile cycles." />
   }
 
-  const pagination = data.open?.pagination ?? data.executions?.pagination ?? data.skipped?.pagination
+  const pagination = data.open?.pagination ?? data.attempting?.pagination ?? data.executions?.pagination ?? data.skipped?.pagination
   const visibleRows =
     section === 'open'
       ? (data.open?.items.length ?? 0)
-      : section === 'executions'
+      : section === 'attempting'
+        ? (data.attempting?.items.length ?? 0)
+        : section === 'executions'
         ? (data.executions?.items.length ?? 0)
         : selectedSkippedToken
           ? (data.skipped?.details?.length ?? 0)
@@ -186,7 +399,7 @@ export default function CopiesPage() {
           <div className="space-y-2">
             <p className="text-xs uppercase tracking-[0.22em] text-[#919191]">Pipeline</p>
             <h2 className="text-2xl font-semibold text-[#E7E7E7] md:text-3xl">Copies</h2>
-            <p className="max-w-2xl text-sm text-[#919191]">Open potential copies, execution attempts, and skipped outcomes.</p>
+            <p className="max-w-2xl text-sm text-[#919191]">Open potential copies, in-flight attempts, execution records, and skipped outcomes.</p>
           </div>
           <TimestampBadge value={generatedAt} />
         </div>
@@ -198,7 +411,11 @@ export default function CopiesPage() {
               <CircleGauge className="size-4 text-[#86efac]" />
             </div>
             <div className="mt-2">
-              <StatusPill label={data.summary.clobAuthentication.status} tone={statusTone(data.summary.clobAuthentication.status)} />
+              <StatusPill
+                label={data.summary.clobAuthentication.status}
+                tone={statusTone(data.summary.clobAuthentication.status)}
+                className={clobAuthPillClass(data.summary.clobAuthentication.status)}
+              />
             </div>
             <p className="mt-2 text-xs text-[#919191]">{formatDateTime(data.summary.clobAuthentication.lastCheckedAt)}</p>
           </div>
@@ -209,7 +426,11 @@ export default function CopiesPage() {
               <Workflow className="size-4 text-cyan-300" />
             </div>
             <div className="mt-2">
-              <StatusPill label={data.summary.userChannel.status} tone={statusTone(data.summary.userChannel.status)} />
+              <StatusPill
+                label={data.summary.userChannel.status}
+                tone={statusTone(data.summary.userChannel.status)}
+                className={userChannelPillClass(data.summary.userChannel.status)}
+              />
             </div>
             <p className="mt-2 text-xs text-[#919191]">{formatDateTime(data.summary.userChannel.lastMessageAt)}</p>
           </div>
@@ -268,6 +489,18 @@ export default function CopiesPage() {
             </Button>
             <Button
               size="sm"
+              variant={section === 'attempting' ? 'default' : 'outline'}
+              className={section === 'attempting' ? 'rounded-xl bg-[#86efac] text-black hover:bg-[#9af5b1]' : outlineButtonClass}
+              onClick={() => {
+                setSection('attempting')
+                setPage(1)
+                setSelectedSkippedToken(null)
+              }}
+            >
+              Attempting
+            </Button>
+            <Button
+              size="sm"
               variant={section === 'executions' ? 'default' : 'outline'}
               className={section === 'executions' ? 'rounded-xl bg-[#86efac] text-black hover:bg-[#9af5b1]' : outlineButtonClass}
               onClick={() => {
@@ -292,6 +525,7 @@ export default function CopiesPage() {
           </div>
 
           {section === 'open' ? <OpenSection data={data} /> : null}
+          {section === 'attempting' ? <AttemptingSection data={data} /> : null}
           {section === 'executions' ? <ExecutionsSection data={data} /> : null}
           {section === 'skipped' ? (
             <SkippedSection
@@ -332,7 +566,7 @@ function OpenSection({ data }: { data: CopiesData }) {
   const rows = data.open?.items ?? []
 
   if (rows.length === 0) {
-    return <EmptyState title="No open potential copies" description="No pending copy attempts are currently blocked or accumulating." />
+    return <EmptyState title="No open potential copies" description="No pending or blocked potential copies currently." />
   }
 
   return (
@@ -353,16 +587,24 @@ function OpenSection({ data }: { data: CopiesData }) {
             {rows.map((row) => (
               <TableRow key={row.id} className="hover:bg-white/[0.03]">
                 <TableCell className="px-3 text-[#CFCFCF]">{formatDateTime(row.createdAt)}</TableCell>
-                <TableCell className="px-3 text-[#E7E7E7]">{row.leaderName ?? 'n/a'}</TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">{openLeaderLabel(row)}</TableCell>
                 <TableCell className="px-3">
-                  <p className="text-[#E7E7E7]">{row.marketId ?? row.tokenId}</p>
+                  <p>
+                    <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                  </p>
                   <p className="text-xs text-[#919191]">{row.outcome ?? row.tokenId}</p>
                 </TableCell>
                 <TableCell className="px-3 text-[#E7E7E7]">{row.side}</TableCell>
-                <TableCell className="px-3 text-[#E7E7E7]">{formatCurrency(row.pendingNotionalUsd)}</TableCell>
                 <TableCell className="px-3">
-                  <StatusPill label={row.status} tone={statusTone(row.status)} />
-                  <p className="mt-1 text-xs text-[#919191]">{row.blockReason ?? 'n/a'}</p>
+                  <p className="text-[#E7E7E7]">{formatCurrencyDetailed(row.pendingNotionalUsd)}</p>
+                  <p className="text-xs text-[#919191]">min {formatCurrencyDetailed(row.minExecutableNotionalUsd)}</p>
+                </TableCell>
+                <TableCell className="px-3">
+                  <StatusPill label={openStatusLabel(row)} tone={openStatusTone(row)} />
+                  <p className="mt-1 text-xs text-[#919191]">{openStatusDetail(row)}</p>
+                  {row.blockReason === 'MIN_ORDER_SIZE' && row.minOrderSizeShares !== null ? (
+                    <p className="text-xs text-[#919191]">min size {formatNumber(row.minOrderSizeShares, 6)} shares</p>
+                  ) : null}
                 </TableCell>
               </TableRow>
             ))}
@@ -375,17 +617,136 @@ function OpenSection({ data }: { data: CopiesData }) {
           <details key={row.id} className={mobileCardClass}>
             <summary className="cursor-pointer list-none">
               <div className="flex items-center justify-between gap-2">
-                <p className="text-sm font-medium text-[#E7E7E7]">{row.side} · {formatCurrency(row.pendingNotionalUsd)}</p>
-                <StatusPill label={row.status} tone={statusTone(row.status)} />
+                <p className="text-sm font-medium text-[#E7E7E7]">{row.side} · {formatCurrencyDetailed(row.pendingNotionalUsd)}</p>
+                <StatusPill label={openStatusLabel(row)} tone={openStatusTone(row)} />
               </div>
               <p className="text-xs text-[#919191]">{formatDateTime(row.createdAt)}</p>
             </summary>
             <div className="mt-2 space-y-1 text-sm text-[#E7E7E7]">
-              <p>Leader: {row.leaderName ?? 'n/a'}</p>
+              <p>Leader: {openLeaderLabel(row)}</p>
               <p>Token: {row.tokenId}</p>
+              <p>
+                Market:{' '}
+                <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+              </p>
               <p>Outcome: {row.outcome ?? 'Unknown outcome'}</p>
-              <p>Reason: {row.blockReason ?? 'n/a'}</p>
+              <p>Status detail: {openStatusDetail(row)}</p>
+              {row.blockReason === 'MIN_ORDER_SIZE' && row.minOrderSizeShares !== null ? (
+                <p>Min order size: {formatNumber(row.minOrderSizeShares, 6)} shares</p>
+              ) : null}
+              <p>Pending notional: {formatCurrencyDetailed(row.pendingNotionalUsd)}</p>
+              <p>Min executable: {formatCurrencyDetailed(row.minExecutableNotionalUsd)}</p>
               <p>Pending shares: {formatNumber(row.pendingShares)}</p>
+            </div>
+          </details>
+        ))}
+      </div>
+    </>
+  )
+}
+
+function AttemptingSection({ data }: { data: CopiesData }) {
+  const rows = data.attempting?.items ?? []
+
+  if (rows.length === 0) {
+    return <EmptyState title="No in-flight attempts" description="No potential copies are currently being attempted." />
+  }
+
+  return (
+    <>
+      <div className={tableWrapClass}>
+        <Table>
+          <TableHeader className="[&_tr]:border-white/10">
+            <TableRow className="hover:bg-transparent">
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Created at</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Leader</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Market</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Side</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Attempt size</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Price/share</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Spread</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Status</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Why delayed/blocked</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody className="[&_tr]:border-white/5">
+            {rows.map((row) => (
+              <TableRow key={row.id} className="hover:bg-white/[0.03]">
+                <TableCell className="px-3 text-[#CFCFCF]">
+                  <p>{formatDateTime(row.createdAt)}</p>
+                  {row.attemptedAt ? <p className="text-xs text-[#919191]">last {formatDateTime(row.attemptedAt)}</p> : null}
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">{attemptingLeaderLabel(row)}</TableCell>
+                <TableCell className="px-3">
+                  <p>
+                    <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                  </p>
+                  <p className="text-xs text-[#919191]">{row.outcome ?? row.tokenId}</p>
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">{row.side}</TableCell>
+                <TableCell className="px-3">
+                  <p className="text-[#E7E7E7]">{formatCurrencyDetailed(row.accumulatedDeltaNotionalUsd)}</p>
+                  <p className="text-xs text-[#919191]">{formatNumber(row.accumulatedDeltaShares, 6)} shares</p>
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">
+                  {attemptingPricePerShareUsd(row) === null ? 'n/a' : formatCurrencyDetailed(attemptingPricePerShareUsd(row) ?? 0, 6)}
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">
+                  <p>{attemptingSpreadLabel(row)}</p>
+                  {attemptingSpreadDetail(row) ? <p className="text-xs text-[#919191]">{attemptingSpreadDetail(row)}</p> : null}
+                </TableCell>
+                <TableCell className="px-3">
+                  <StatusPill label={row.status} tone={attemptingStatusTone(row.status)} />
+                  <p className="mt-1 text-xs text-[#919191]">
+                    retries {row.retries}/{row.maxRetries}
+                  </p>
+                  {row.lastOrderStatus ? <p className="text-xs text-[#919191]">last order {row.lastOrderStatus}</p> : null}
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">
+                  <p>{attemptingReason(row)}</p>
+                  {row.pendingBlockReason ? (
+                    <p className="text-xs text-[#919191]">pending block {humanizeReasonText(row.pendingBlockReason)}</p>
+                  ) : null}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <div className="space-y-2 md:hidden">
+        {rows.map((row) => (
+          <details key={row.id} className={mobileCardClass}>
+            <summary className="cursor-pointer list-none">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-medium text-[#E7E7E7]">
+                  {row.side} · {formatCurrencyDetailed(row.accumulatedDeltaNotionalUsd)}
+                </p>
+                <StatusPill label={row.status} tone={attemptingStatusTone(row.status)} />
+              </div>
+              <p className="text-xs text-[#919191]">{formatDateTime(row.createdAt)}</p>
+            </summary>
+            <div className="mt-2 space-y-1 text-sm text-[#E7E7E7]">
+              <p>Leader: {attemptingLeaderLabel(row)}</p>
+              <p>Token: {row.tokenId}</p>
+              <p>
+                Market:{' '}
+                <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+              </p>
+              <p>Outcome: {row.outcome ?? 'Unknown outcome'}</p>
+              <p>Retries: {row.retries}/{row.maxRetries}</p>
+              {row.attemptedAt ? <p>Last attempt: {formatDateTime(row.attemptedAt)}</p> : null}
+              {row.lastOrderStatus ? <p>Last order status: {row.lastOrderStatus}</p> : null}
+              <p>Reason: {attemptingReason(row)}</p>
+              {row.pendingBlockReason ? <p>Pending block: {humanizeReasonText(row.pendingBlockReason)}</p> : null}
+              <p>Attempt notional: {formatCurrencyDetailed(row.accumulatedDeltaNotionalUsd)}</p>
+              <p>Attempt shares: {formatNumber(row.accumulatedDeltaShares, 6)}</p>
+              <p>
+                Price/share:{' '}
+                {attemptingPricePerShareUsd(row) === null ? 'n/a' : formatCurrencyDetailed(attemptingPricePerShareUsd(row) ?? 0, 6)}
+              </p>
+              <p>Current spread: {attemptingSpreadLabel(row)}</p>
+              {attemptingSpreadDetail(row) ? <p>Spread age: {attemptingSpreadDetail(row)}</p> : null}
             </div>
           </details>
         ))}
@@ -425,7 +786,9 @@ function ExecutionsSection({ data }: { data: CopiesData }) {
                 <TableCell className="px-3 text-[#CFCFCF]">{formatDateTime(row.attemptedAt)}</TableCell>
                 <TableCell className="px-3 text-[#E7E7E7]">{row.leaderName ?? 'n/a'}</TableCell>
                 <TableCell className="px-3">
-                  <p className="text-[#E7E7E7]">{row.marketId ?? row.tokenId}</p>
+                  <p>
+                    <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                  </p>
                   <p className="text-xs text-[#919191]">{row.outcome ?? row.tokenId}</p>
                 </TableCell>
                 <TableCell className="px-3 text-[#E7E7E7]">{row.side}</TableCell>
@@ -440,7 +803,7 @@ function ExecutionsSection({ data }: { data: CopiesData }) {
                 </TableCell>
                 <TableCell className="px-3 text-[#E7E7E7]">{formatCurrency(row.feePaidUsd)}</TableCell>
                 <TableCell className="px-3">
-                  <StatusPill label={row.status} tone={statusTone(row.status)} />
+                  <StatusPill label={row.status} tone={row.status === 'PLACED' ? 'positive' : statusTone(row.status)} />
                   {row.retryCount > 0 ? <p className="mt-1 text-xs text-[#919191]">Retries: {row.retryCount}</p> : null}
                 </TableCell>
                 <TableCell className="px-3 text-[#E7E7E7]">{row.errorMessage ?? row.reason ?? 'n/a'}</TableCell>
@@ -456,13 +819,17 @@ function ExecutionsSection({ data }: { data: CopiesData }) {
             <summary className="cursor-pointer list-none">
               <div className="flex items-center justify-between gap-2">
                 <p className="text-sm font-medium text-[#E7E7E7]">{row.side} · {formatCurrency(row.intendedNotionalUsd)}</p>
-                <StatusPill label={row.status} tone={statusTone(row.status)} />
+                <StatusPill label={row.status} tone={row.status === 'PLACED' ? 'positive' : statusTone(row.status)} />
               </div>
               <p className="text-xs text-[#919191]">{formatDateTime(row.attemptedAt)}</p>
             </summary>
             <div className="mt-2 space-y-1 text-sm text-[#E7E7E7]">
               <p>Leader: {row.leaderName ?? 'n/a'}</p>
               <p>Token: {row.tokenId}</p>
+              <p>
+                Market:{' '}
+                <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+              </p>
               <p>Outcome: {row.outcome ?? 'Unknown outcome'}</p>
               <p>Price cap: {formatNumber(row.priceLimit, 4)}</p>
               <p>Order id: {row.externalOrderId ?? 'n/a'}</p>
@@ -515,7 +882,9 @@ function SkippedSection({
             <TableBody className="[&_tr]:border-white/5">
               {groups.map((group) => (
                 <TableRow key={group.tokenId} className="hover:bg-white/[0.03]">
-                  <TableCell className="px-3 text-[#E7E7E7]">{group.marketId ?? group.tokenId}</TableCell>
+                  <TableCell className="px-3">
+                    <MarketLink marketSlug={group.marketSlug} marketLabel={group.marketLabel} fallback={group.marketId ?? group.tokenId} />
+                  </TableCell>
                   <TableCell className="px-3 font-mono text-xs text-[#CFCFCF]">{group.tokenId}</TableCell>
                   <TableCell className="px-3 text-[#E7E7E7]">{group.outcome ?? 'Unknown outcome'}</TableCell>
                   <TableCell className="px-3 text-[#E7E7E7]">{formatNumber(group.skipCount, 0)}</TableCell>
@@ -535,7 +904,9 @@ function SkippedSection({
         <div className="space-y-2 md:hidden">
           {groups.map((group) => (
             <div key={group.tokenId} className={mobileCardClass}>
-              <p className="text-sm font-medium text-[#E7E7E7]">{group.marketId ?? group.tokenId}</p>
+              <p className="text-sm font-medium">
+                <MarketLink marketSlug={group.marketSlug} marketLabel={group.marketLabel} fallback={group.marketId ?? group.tokenId} />
+              </p>
               <p className="text-xs text-[#919191]">Token {group.tokenId}</p>
               <p className="text-xs text-[#919191]">Outcome {group.outcome ?? 'Unknown outcome'}</p>
               <p className="text-sm text-[#E7E7E7]">Skips {formatNumber(group.skipCount, 0)}</p>
@@ -581,7 +952,12 @@ function SkippedSection({
                     <TableCell className="px-3 text-[#CFCFCF]">{formatDateTime(row.createdAt)}</TableCell>
                     <TableCell className="px-3 text-[#E7E7E7]">{row.side}</TableCell>
                     <TableCell className="px-3 text-[#E7E7E7]">{row.leaderName ?? 'n/a'}</TableCell>
-                    <TableCell className="px-3 text-[#E7E7E7]">{row.outcome ?? 'Unknown outcome'}</TableCell>
+                    <TableCell className="px-3 text-[#E7E7E7]">
+                      <p>{row.outcome ?? 'Unknown outcome'}</p>
+                      <p className="text-xs text-[#919191]">
+                        <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                      </p>
+                    </TableCell>
                     <TableCell className="px-3 text-[#E7E7E7]">{row.reason ?? 'n/a'}</TableCell>
                     <TableCell className="px-3 text-[#E7E7E7]">{formatCurrency(row.accumulatedDeltaNotionalUsd)}</TableCell>
                   </TableRow>
@@ -599,6 +975,10 @@ function SkippedSection({
                 </div>
                 <p className="text-xs text-[#919191]">Leader: {row.leaderName ?? 'n/a'}</p>
                 <p className="text-xs text-[#919191]">Outcome: {row.outcome ?? 'Unknown outcome'}</p>
+                <p className="text-xs text-[#919191]">
+                  Market:{' '}
+                  <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                </p>
                 <p className="text-sm text-[#E7E7E7]">{row.reason ?? 'n/a'}</p>
                 <p className="text-xs text-[#919191]">Accumulated delta {formatCurrency(row.accumulatedDeltaNotionalUsd)}</p>
               </div>

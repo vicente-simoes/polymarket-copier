@@ -48,8 +48,12 @@ export interface ExecutionAttemptContext {
   copyProfileStatus: "ACTIVE" | "PAUSED" | "DISABLED";
   copySystemEnabled?: boolean;
   leaderStatus?: "ACTIVE" | "PAUSED" | "DISABLED";
+  maxPricePerShareOverride?: number | null;
   pendingDeltaId?: string;
   pendingDeltaStatus?: "PENDING" | "ELIGIBLE" | "BLOCKED" | "EXPIRED" | "CONVERTED";
+  pendingDeltaBlockReason?: string;
+  pendingDeltaShares?: number;
+  pendingDeltaNotionalUsd?: number;
   pendingDeltaMetadata: Record<string, unknown>;
 }
 
@@ -64,6 +68,7 @@ export interface ExecutionMarketSnapshot {
   negRisk?: boolean;
   isStale: boolean;
   priceSource: "WS" | "REST" | "NONE";
+  wsConnected?: boolean;
 }
 
 export interface ExecutionBookLevel {

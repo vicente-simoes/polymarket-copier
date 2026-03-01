@@ -165,6 +165,7 @@ export default function LeaderDetailPage() {
   const [maxExposurePerMarketUsd, setMaxExposurePerMarketUsd] = useState('')
   const [maxDailyTurnoverUsd, setMaxDailyTurnoverUsd] = useState('')
   const [maxSlippageBps, setMaxSlippageBps] = useState('')
+  const [maxPricePerShareUsd, setMaxPricePerShareUsd] = useState('')
   const [minNotionalUsd, setMinNotionalUsd] = useState('')
   const [minDeltaNotionalUsd, setMinDeltaNotionalUsd] = useState('')
   const [minDeltaShares, setMinDeltaShares] = useState('')
@@ -190,6 +191,7 @@ export default function LeaderDetailPage() {
     setMaxExposurePerMarketUsd(toNumberOrBlank(settings.maxExposurePerMarketOutcomeUsd))
     setMaxDailyTurnoverUsd(toNumberOrBlank(settings.maxDailyNotionalTurnoverUsd))
     setMaxSlippageBps(toNumberOrBlank(settings.maxSlippageBps))
+    setMaxPricePerShareUsd(toNumberOrBlank(settings.maxPricePerShareUsd))
     setMinNotionalUsd(toNumberOrBlank(settings.minNotionalPerOrderUsd))
     setMinDeltaNotionalUsd(toNumberOrBlank(settings.minDeltaNotionalUsd))
     setMinDeltaShares(toNumberOrBlank(settings.minDeltaShares))
@@ -240,6 +242,7 @@ export default function LeaderDetailPage() {
             : {}),
           ...(maxDailyTurnoverUsd.trim().length > 0 ? { maxDailyNotionalTurnoverUsd: Number(maxDailyTurnoverUsd) } : {}),
           ...(maxSlippageBps.trim().length > 0 ? { maxSlippageBps: Number(maxSlippageBps) } : {}),
+          ...(maxPricePerShareUsd.trim().length > 0 ? { maxPricePerShareUsd: Number(maxPricePerShareUsd) } : {}),
           ...(minNotionalUsd.trim().length > 0 ? { minNotionalPerOrderUsd: Number(minNotionalUsd) } : {}),
           ...(minDeltaNotionalUsd.trim().length > 0 ? { minDeltaNotionalUsd: Number(minDeltaNotionalUsd) } : {}),
           ...(minDeltaShares.trim().length > 0 ? { minDeltaShares: Number(minDeltaShares) } : {})
@@ -392,6 +395,7 @@ export default function LeaderDetailPage() {
           <div className="grid gap-3 md:grid-cols-2">
             <Input className={inputClass} value={ratio} onChange={(event) => setRatio(event.target.value)} placeholder="Ratio" />
             <Input className={inputClass} value={maxSlippageBps} onChange={(event) => setMaxSlippageBps(event.target.value)} placeholder="Max slippage bps" />
+            <Input className={inputClass} value={maxPricePerShareUsd} onChange={(event) => setMaxPricePerShareUsd(event.target.value)} placeholder="Max price per share (USD)" />
             <Input className={inputClass} value={maxExposurePerLeaderUsd} onChange={(event) => setMaxExposurePerLeaderUsd(event.target.value)} placeholder="Max exposure per leader (USD)" />
             <Input className={inputClass} value={maxExposurePerMarketUsd} onChange={(event) => setMaxExposurePerMarketUsd(event.target.value)} placeholder="Max exposure per market/outcome (USD)" />
             <Input className={inputClass} value={maxDailyTurnoverUsd} onChange={(event) => setMaxDailyTurnoverUsd(event.target.value)} placeholder="Max daily turnover (USD)" />

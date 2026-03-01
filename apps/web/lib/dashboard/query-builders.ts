@@ -63,7 +63,7 @@ export function buildTradesQuery(args: {
 }
 
 export function buildCopiesQuery(args: {
-  section: 'open' | 'executions' | 'skipped'
+  section: 'open' | 'attempting' | 'executions' | 'skipped'
   page: number
   pageSize?: number
   tokenId?: string | null

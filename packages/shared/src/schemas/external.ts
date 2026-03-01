@@ -96,5 +96,12 @@ export function parseDataApiPosition(input: unknown): DataApiPosition {
 }
 
 export function parseClobBookSummary(input: unknown): ClobBookSummary {
-  return ClobBookSummarySchema.parse(input);
+  const parsed = ClobBookSummarySchema.parse(input);
+  return {
+    ...parsed,
+    // CLOB payloads can arrive unsorted (or with bids ascending / asks descending).
+    // Normalize here so downstream code can safely treat index 0 as top-of-book.
+    bids: [...parsed.bids].sort((a, b) => b.price - a.price),
+    asks: [...parsed.asks].sort((a, b) => a.price - b.price)
+  };
 }

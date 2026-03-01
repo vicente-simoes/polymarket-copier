@@ -124,9 +124,10 @@ export class TargetNettingEngine {
       };
     }
 
-    const [leaderPositions, followerPositions] = await Promise.all([
+    const [leaderPositions, followerPositions, openPendingTokenIds] = await Promise.all([
       this.store.getLatestLeaderPositions(leaderIds),
-      this.store.getLatestFollowerPositions(profile.copyProfileId)
+      this.store.getLatestFollowerPositions(profile.copyProfileId),
+      this.store.listOpenPendingTokenIds(profile.copyProfileId)
     ]);
 
     const ratioByLeader = new Map(profile.leaders.map((leader) => [leader.leaderId, leader.ratio]));
@@ -177,7 +178,7 @@ export class TargetNettingEngine {
       leaderBreakdownByToken.set(position.tokenId, breakdown);
     }
 
-    const tokenUniverse = new Set<string>([...targetSharesByToken.keys(), ...followerSharesByToken.keys()]);
+    const tokenUniverse = new Set<string>([...targetSharesByToken.keys(), ...followerSharesByToken.keys(), ...openPendingTokenIds]);
     let pendingUpdated = 0;
     let attemptsCreated = 0;
 
@@ -194,6 +195,7 @@ export class TargetNettingEngine {
       const side: PendingDeltaSide = deltaShares > 0 ? "BUY" : "SELL";
       const absoluteDeltaShares = Math.abs(deltaShares);
       const marketId = targetMarketByToken.get(tokenId);
+      const primaryLeaderId = resolvePrimaryLeaderId(leaderBreakdownByToken.get(tokenId));
 
       let tokenPrice = targetPriceByToken.get(tokenId)?.price;
       let priceSource = targetPriceByToken.get(tokenId)?.source ?? "UNKNOWN";
@@ -213,10 +215,8 @@ export class TargetNettingEngine {
       const deltaNotionalUsd = absoluteDeltaShares * tokenPrice;
       const trackingErrorBps = computeTrackingErrorBps(targetShares, followerShares, deltaShares);
       const thresholdResult = evaluateThresholds({
-        deltaShares: absoluteDeltaShares,
         deltaNotionalUsd,
         minNotionalUsd: this.config.minNotionalUsd,
-        minOrderSize,
         trackingErrorBps,
         requiredTrackingErrorBps: this.config.trackingErrorBps
       });
@@ -229,6 +229,7 @@ export class TargetNettingEngine {
 
       const pending = await this.store.upsertPendingDelta({
         copyProfileId: profile.copyProfileId,
+        leaderId: primaryLeaderId,
         tokenId,
         marketId,
         side,
@@ -268,6 +269,7 @@ export class TargetNettingEngine {
 
       await this.store.createCopyAttempt({
         copyProfileId: profile.copyProfileId,
+        leaderId: primaryLeaderId,
         pendingDeltaId: pending.id,
         tokenId,
         marketId,
@@ -330,10 +332,8 @@ function computeTrackingErrorBps(targetShares: number, followerShares: number, d
 }
 
 function evaluateThresholds(args: {
-  deltaShares: number;
   deltaNotionalUsd: number;
   minNotionalUsd: number;
-  minOrderSize: number;
   trackingErrorBps: number;
   requiredTrackingErrorBps: number;
 }): { eligible: boolean; reason?: "MIN_NOTIONAL" | "MIN_ORDER_SIZE" | "UNKNOWN" } {
@@ -341,13 +341,6 @@ function evaluateThresholds(args: {
     return {
       eligible: false,
       reason: "MIN_NOTIONAL"
-    };
-  }
-
-  if (args.minOrderSize > 0 && args.deltaShares < args.minOrderSize) {
-    return {
-      eligible: false,
-      reason: "MIN_ORDER_SIZE"
     };
   }
 
@@ -366,6 +359,25 @@ function evaluateThresholds(args: {
 function roundTo(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
+}
+
+function resolvePrimaryLeaderId(leaderShares: Record<string, number> | undefined): string | undefined {
+  if (!leaderShares) {
+    return undefined;
+  }
+
+  let bestLeaderId: string | undefined;
+  let bestShares = 0;
+
+  for (const [leaderId, shares] of Object.entries(leaderShares)) {
+    if (!Number.isFinite(shares) || shares <= bestShares) {
+      continue;
+    }
+    bestLeaderId = leaderId;
+    bestShares = shares;
+  }
+
+  return bestLeaderId;
 }
 
 function toErrorMessage(error: unknown): string {

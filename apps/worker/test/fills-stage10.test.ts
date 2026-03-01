@@ -59,7 +59,14 @@ test("Stage 10 user-channel WS client subscribes and parses trade/order messages
   socket.open();
 
   assert.equal(socket.sent.length, 1);
-  assert.match(socket.sent[0] ?? "", /"channel":"user"/);
+  const subscribePayload = JSON.parse(socket.sent[0] ?? "{}") as {
+    type?: string;
+    auth?: { apiKey?: string; secret?: string; passphrase?: string };
+  };
+  assert.equal(subscribePayload.type, "user");
+  assert.equal(subscribePayload.auth?.apiKey, "key");
+  assert.equal(subscribePayload.auth?.secret, "secret");
+  assert.equal(subscribePayload.auth?.passphrase, "pass");
 
   socket.message({
     event_type: "trade",

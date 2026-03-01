@@ -116,7 +116,9 @@ export default function LeadersPage() {
     })
   }, [page, searchFilter, statusFilter])
 
-  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<LeaderListData>(query)
+  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<LeaderListData>(query, {
+    refreshIntervalMs: 20_000
+  })
 
   const pageStats = useMemo(() => {
     if (!data) {

@@ -24,16 +24,11 @@ export function decodeChainTrigger(payload: unknown, walletToLeader: Map<string,
     return null;
   }
 
-  const leaderTopic = log.topics[2];
-  if (!leaderTopic) {
+  const participant = resolveLeaderParticipant(log.topics, walletToLeader);
+  if (!participant) {
     return null;
   }
-
-  const leaderWallet = decodeAddressTopic(leaderTopic);
-  const leaderId = walletToLeader.get(leaderWallet);
-  if (!leaderId) {
-    return null;
-  }
+  const { leaderId, leaderWallet, leaderRole } = participant;
 
   const dataSlots = decodeDataSlots(log.data, event === "OrderFilled" ? 5 : 4);
   const makerAssetId = dataSlots[0];
@@ -68,6 +63,7 @@ export function decodeChainTrigger(payload: unknown, walletToLeader: Map<string,
   const leaderFillAtMs = resolveLeaderFillAtMs(payload, wsReceivedAtMs);
   const detectedAtMs = nowMs;
   const triggerId = buildTriggerId(txHash, logIndex);
+  const side = leaderRole === "maker" ? sideInfo.side : flipSide(sideInfo.side);
 
   return {
     triggerId,
@@ -76,9 +72,9 @@ export function decodeChainTrigger(payload: unknown, walletToLeader: Map<string,
     exchangeContract: log.address.toLowerCase(),
     leaderId,
     leaderWallet,
-    leaderRole: "maker",
+    leaderRole,
     tokenId: sideInfo.tokenId.toString(),
-    side: sideInfo.side,
+    side,
     tokenAmountBaseUnits: sideInfo.tokenAmountBaseUnits.toString(),
     usdcAmountBaseUnits: sideInfo.usdcAmountBaseUnits.toString(),
     feeBaseUnits: fee.toString(),
@@ -98,6 +94,33 @@ export function decodeChainTrigger(payload: unknown, walletToLeader: Map<string,
       topics: [...log.topics]
     }
   };
+}
+
+function resolveLeaderParticipant(
+  topics: string[],
+  walletToLeader: Map<string, string>
+): { leaderId: string; leaderWallet: string; leaderRole: "maker" | "taker" } | null {
+  const makerWallet = topics[2] ? decodeAddressTopic(topics[2]) : undefined;
+  const takerWallet = topics[3] ? decodeAddressTopic(topics[3]) : undefined;
+  const makerLeaderId = makerWallet ? walletToLeader.get(makerWallet) : undefined;
+  if (makerLeaderId) {
+    return {
+      leaderId: makerLeaderId,
+      leaderWallet: makerWallet,
+      leaderRole: "maker"
+    };
+  }
+
+  const takerLeaderId = takerWallet ? walletToLeader.get(takerWallet) : undefined;
+  if (takerLeaderId) {
+    return {
+      leaderId: takerLeaderId,
+      leaderWallet: takerWallet,
+      leaderRole: "taker"
+    };
+  }
+
+  return null;
 }
 
 export function encodeAddressTopic(address: string): string {
@@ -219,6 +242,10 @@ function deriveSide(input: {
   }
 
   return null;
+}
+
+function flipSide(side: ChainTriggerSide): ChainTriggerSide {
+  return side === "BUY" ? "SELL" : "BUY";
 }
 
 function formatUnits(value: bigint, decimals: number): string {

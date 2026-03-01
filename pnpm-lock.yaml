@@ -213,6 +213,12 @@ importers:
       '@copybot/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@polymarket/clob-client':
+        specifier: ^5.2.4
+        version: 5.2.4(typescript@5.7.2)(zod@3.25.76)
+      ethers:
+        specifier: '5'
+        version: 5.8.0
       redis:
         specifier: 5.8.2
         version: 5.8.2

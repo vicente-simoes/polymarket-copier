@@ -169,7 +169,9 @@ const detailsSummaryClass = 'cursor-pointer pr-6 text-sm font-medium text-[#E7E7
 const outlineButtonClass = 'rounded-xl border-white/10 bg-white/[0.02] text-[#E7E7E7] hover:bg-white/[0.06] hover:text-white'
 
 export default function StatusPage() {
-  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<StatusData>('/api/v1/status')
+  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<StatusData>('/api/v1/status', {
+    refreshIntervalMs: 10_000
+  })
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null)
 
   async function copyLastErrorDetails() {

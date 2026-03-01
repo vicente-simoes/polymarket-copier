@@ -73,6 +73,8 @@ export class PrismaExecutionStore implements ExecutionStore {
       },
       select: {
         id: true,
+        copyProfileId: true,
+        leaderId: true,
         pendingDeltaId: true,
         copyProfile: {
           select: {
@@ -88,6 +90,9 @@ export class PrismaExecutionStore implements ExecutionStore {
         pendingDelta: {
           select: {
             status: true,
+            blockReason: true,
+            pendingDeltaShares: true,
+            pendingDeltaNotionalUsd: true,
             metadata: true
           }
         }
@@ -98,13 +103,40 @@ export class PrismaExecutionStore implements ExecutionStore {
       return null;
     }
 
+    const profileMaxPricePerShare = readMaxPricePerShareOverrideFromProfileConfig(attempt.copyProfile.config);
+    const leaderSettings = attempt.leaderId
+      ? await this.prisma.copyProfileLeader.findUnique({
+          where: {
+            copyProfileId_leaderId: {
+              copyProfileId: attempt.copyProfileId,
+              leaderId: attempt.leaderId
+            }
+          },
+          select: {
+            settings: true
+          }
+        })
+      : null;
+    const leaderMaxPricePerShare = readMaxPricePerShareOverrideFromLeaderSettings(leaderSettings?.settings);
+
     return {
       attemptId: attempt.id,
       copyProfileStatus: attempt.copyProfile.status as "ACTIVE" | "PAUSED" | "DISABLED",
       copySystemEnabled: readCopySystemEnabledFromConfig(attempt.copyProfile.config),
       leaderStatus: attempt.leader?.status as "ACTIVE" | "PAUSED" | "DISABLED" | undefined,
+      maxPricePerShareOverride:
+        leaderMaxPricePerShare !== undefined ? leaderMaxPricePerShare : profileMaxPricePerShare,
       pendingDeltaId: attempt.pendingDeltaId ?? undefined,
       pendingDeltaStatus: attempt.pendingDelta?.status as "PENDING" | "ELIGIBLE" | "BLOCKED" | "EXPIRED" | "CONVERTED" | undefined,
+      pendingDeltaBlockReason: attempt.pendingDelta?.blockReason ?? undefined,
+      pendingDeltaShares:
+        attempt.pendingDelta?.pendingDeltaShares !== null && attempt.pendingDelta?.pendingDeltaShares !== undefined
+          ? Number(attempt.pendingDelta.pendingDeltaShares)
+          : undefined,
+      pendingDeltaNotionalUsd:
+        attempt.pendingDelta?.pendingDeltaNotionalUsd !== null && attempt.pendingDelta?.pendingDeltaNotionalUsd !== undefined
+          ? Number(attempt.pendingDelta.pendingDeltaNotionalUsd)
+          : undefined,
       pendingDeltaMetadata: asObject(attempt.pendingDelta?.metadata)
     };
   }
@@ -290,12 +322,32 @@ export class PrismaExecutionStore implements ExecutionStore {
     });
 
     if (input.pendingDeltaId) {
-      await tx.pendingDelta.update({
+      const activeStatuses = ["PENDING", "ELIGIBLE", "BLOCKED"] as const;
+      if (input.terminalStatus === "EXPIRED") {
+        await tx.pendingDelta.updateMany({
+          where: {
+            id: input.pendingDeltaId,
+            status: {
+              in: activeStatuses
+            }
+          },
+          data: {
+            status: "EXPIRED",
+            blockReason: "EXPIRED"
+          }
+        });
+        return;
+      }
+
+      await tx.pendingDelta.updateMany({
         where: {
-          id: input.pendingDeltaId
+          id: input.pendingDeltaId,
+          status: {
+            in: activeStatuses
+          }
         },
         data: {
-          status: input.terminalStatus === "EXPIRED" ? "EXPIRED" : "PENDING",
+          status: "PENDING",
           blockReason: mapSkipReason(input.reason)
         }
       });
@@ -366,4 +418,40 @@ function readCopySystemEnabledFromConfig(value: unknown): boolean {
     return configured;
   }
   return true;
+}
+
+function readMaxPricePerShareOverrideFromProfileConfig(value: unknown): number | null | undefined {
+  const config = asObject(value);
+  const guardrails = asObject(config.guardrails);
+  return readOptionalPositiveNumberOverride(guardrails.maxPricePerShareUsd);
+}
+
+function readMaxPricePerShareOverrideFromLeaderSettings(value: unknown): number | null | undefined {
+  const settings = asObject(value);
+  return readOptionalPositiveNumberOverride(settings.maxPricePerShareUsd);
+}
+
+function readOptionalPositiveNumberOverride(value: unknown): number | null | undefined {
+  if (value === null) {
+    return null;
+  }
+
+  const parsed = readNumber(value);
+  if (parsed === undefined || parsed <= 0) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function readNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
 }

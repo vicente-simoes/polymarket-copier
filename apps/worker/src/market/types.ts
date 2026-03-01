@@ -1,4 +1,5 @@
 export type PriceSource = "WS" | "REST" | "NONE";
+export type SpreadState = "LIVE" | "STALE" | "UNAVAILABLE";
 
 export interface MarketMetadataSnapshot {
   tokenId: string;
@@ -26,6 +27,10 @@ export interface MarketBookState {
   bestAsk?: number;
   midPrice?: number;
   priceSource: PriceSource;
+  wsConnected: boolean;
+  spreadState: SpreadState;
+  spreadUsd?: number;
+  quoteUpdatedAtMs?: number;
   isStale: boolean;
   staleReasons: ("MISSING_METADATA" | "STALE_METADATA" | "STALE_PRICE" | "MISSING_PRICE")[];
   metadataUpdatedAtMs?: number;

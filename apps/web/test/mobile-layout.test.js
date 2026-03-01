@@ -18,7 +18,7 @@ test('portrait-mobile table fallbacks exist for table-heavy pages', () => {
 
   for (const page of pages) {
     const source = readWorkspaceFile(page)
-    assert.match(source, /hidden md:block/)
+    assert.match(source, /hidden[^\n]*md:block/)
     assert.match(source, /md:hidden/)
   }
 })

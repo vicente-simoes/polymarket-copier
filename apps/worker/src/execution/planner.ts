@@ -89,7 +89,8 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
     deltaShares: signedDelta,
     midPrice: input.midPrice,
     priceLimit,
-    minOrderSizeShares: input.minOrderSize,
+    // FAK sizing is not gated by venue min-order-size; enforce notional instead.
+    minOrderSizeShares: 0,
     minNotionalUsd: input.minNotionalUsd
   });
 
@@ -177,16 +178,12 @@ function estimateBookFill(args: {
   }
 
   if (args.side === "BUY") {
-    const levels = args.asks;
+    const levels = sortAsks(args.asks);
     let remainingUsd = args.amount;
     let consumedShares = 0;
     let consumedUsd = 0;
 
     for (const level of levels) {
-      if (level.price <= 0 || level.size <= 0) {
-        continue;
-      }
-
       if (level.price > args.priceLimit) {
         break;
       }
@@ -211,16 +208,12 @@ function estimateBookFill(args: {
     };
   }
 
-  const levels = args.bids;
+  const levels = sortBids(args.bids);
   let remainingShares = args.amount;
   let soldShares = 0;
   let soldUsd = 0;
 
   for (const level of levels) {
-    if (level.price <= 0 || level.size <= 0) {
-      continue;
-    }
-
     if (level.price < args.priceLimit) {
       break;
     }
@@ -305,4 +298,20 @@ function mapGuardrailReason(reason: GuardrailFailureReason | undefined): Executi
 function roundTo(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
+}
+
+function sortBids(levels: ExecutionBookLevel[]): ExecutionBookLevel[] {
+  return levels
+    .filter(isFiniteLevel)
+    .sort((left, right) => right.price - left.price);
+}
+
+function sortAsks(levels: ExecutionBookLevel[]): ExecutionBookLevel[] {
+  return levels
+    .filter(isFiniteLevel)
+    .sort((left, right) => left.price - right.price);
+}
+
+function isFiniteLevel(level: ExecutionBookLevel): boolean {
+  return Number.isFinite(level.price) && Number.isFinite(level.size) && level.price > 0 && level.size > 0;
 }

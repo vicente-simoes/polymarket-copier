@@ -50,8 +50,8 @@ export class ClobRestClient {
 
   topOfBook(summary: ClobBookSummary): { bestBid?: number; bestAsk?: number } {
     return {
-      bestBid: summary.bids[0]?.price,
-      bestAsk: summary.asks[0]?.price
+      bestBid: bestBidFromLevels(summary.bids),
+      bestAsk: bestAskFromLevels(summary.asks)
     };
   }
 
@@ -78,4 +78,30 @@ export class ClobRestClient {
 
     throw new Error("Unexpected /books response shape");
   }
+}
+
+function bestBidFromLevels(levels: Array<{ price: number; size: number }>): number | undefined {
+  let best: number | undefined;
+  for (const level of levels) {
+    if (!Number.isFinite(level.price) || !Number.isFinite(level.size) || level.price <= 0 || level.size <= 0) {
+      continue;
+    }
+    if (best === undefined || level.price > best) {
+      best = level.price;
+    }
+  }
+  return best;
+}
+
+function bestAskFromLevels(levels: Array<{ price: number; size: number }>): number | undefined {
+  let best: number | undefined;
+  for (const level of levels) {
+    if (!Number.isFinite(level.price) || !Number.isFinite(level.size) || level.price <= 0 || level.size <= 0) {
+      continue;
+    }
+    if (best === undefined || level.price < best) {
+      best = level.price;
+    }
+  }
+  return best;
 }

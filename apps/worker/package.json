@@ -11,8 +11,10 @@
     "test": "node --import tsx --test test/**/*.test.ts"
   },
   "dependencies": {
+    "@polymarket/clob-client": "^5.2.4",
     "@copybot/db": "workspace:*",
     "@copybot/shared": "workspace:*",
+    "ethers": "5",
     "redis": "5.8.2",
     "ws": "8.18.3"
   },

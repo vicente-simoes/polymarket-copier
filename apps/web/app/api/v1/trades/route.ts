@@ -7,6 +7,7 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 const SourceSchema = z.enum(['CHAIN', 'DATA_API'])
+const BACKFILL_DETECT_LAG_THRESHOLD_MS = 5 * 60 * 1000
 
 const TradesDataSchema = z.object({
   items: z.array(
@@ -18,9 +19,11 @@ const TradesDataSchema = z.object({
       wsReceivedAtMs: z.string().nullable(),
       detectedAtMs: z.string(),
       detectLagMs: z.number().int().nonnegative(),
+      isBackfill: z.boolean(),
       wsLagMs: z.number().int().nonnegative().nullable(),
       marketId: z.string().nullable(),
       marketLabel: z.string().nullable(),
+      marketSlug: z.string().nullable(),
       tokenId: z.string(),
       outcome: z.string().nullable(),
       side: z.enum(['BUY', 'SELL']),
@@ -130,6 +133,8 @@ export async function GET(request: NextRequest) {
           const leaderFillAtMs = Number(row.leaderFillAtMs)
           const detectedAtMs = Number(row.detectedAtMs)
           const wsReceivedAtMs = row.wsReceivedAtMs ? Number(row.wsReceivedAtMs) : null
+          const detectLagMs = Math.max(0, detectedAtMs - leaderFillAtMs)
+          const isBackfill = row.source === 'DATA_API' && detectLagMs >= BACKFILL_DETECT_LAG_THRESHOLD_MS
 
           return {
             id: row.id,
@@ -138,10 +143,12 @@ export async function GET(request: NextRequest) {
             leaderFillAtMs: String(leaderFillAtMs),
             wsReceivedAtMs: wsReceivedAtMs !== null ? String(wsReceivedAtMs) : null,
             detectedAtMs: String(detectedAtMs),
-            detectLagMs: Math.max(0, detectedAtMs - leaderFillAtMs),
+            detectLagMs,
+            isBackfill,
             wsLagMs: wsReceivedAtMs !== null ? Math.max(0, wsReceivedAtMs - leaderFillAtMs) : null,
             marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
             marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+            marketSlug: tokenMetadata.get(row.tokenId)?.marketSlug ?? null,
             tokenId: row.tokenId,
             outcome: row.outcome ?? tokenMetadata.get(row.tokenId)?.outcome ?? null,
             side: row.side,
@@ -171,6 +178,7 @@ export async function GET(request: NextRequest) {
 type TokenMetadata = {
   marketId: string | null
   marketLabel: string | null
+  marketSlug: string | null
   outcome: string | null
 }
 
@@ -234,6 +242,7 @@ async function resolveTradeTokenMetadata(tokenIds: string[]): Promise<Map<string
     const current = metadata.get(row.tokenId) ?? {
       marketId: null,
       marketLabel: null,
+      marketSlug: null,
       outcome: null
     }
 
@@ -241,6 +250,7 @@ async function resolveTradeTokenMetadata(tokenIds: string[]): Promise<Map<string
     const next: TokenMetadata = {
       marketId: current.marketId ?? row.marketId ?? payloadInfo.marketId ?? null,
       marketLabel: current.marketLabel ?? payloadInfo.marketLabel ?? null,
+      marketSlug: choosePreferredMarketSlug(current.marketSlug, payloadInfo.marketSlug) ?? null,
       outcome: current.outcome ?? row.outcome ?? payloadInfo.outcome ?? null
     }
 
@@ -269,14 +279,54 @@ function extractMarketMetadataFromPayload(payload: unknown): Partial<TokenMetada
   const title = readString(raw, 'title')
   const slug = readString(raw, 'slug')
   const eventSlug = readString(raw, 'eventSlug')
+  const marketSlug = buildPolymarketEventPath(eventSlug, slug)
   const marketId = readString(raw, 'conditionId') ?? readString(raw, 'market')
   const outcome = readString(raw, 'outcome')
 
   return {
     marketId: marketId ?? null,
     marketLabel: title ?? slug ?? eventSlug ?? null,
+    marketSlug: marketSlug ?? null,
     outcome: outcome ?? null
   }
+}
+
+function buildPolymarketEventPath(eventSlug: string | undefined, marketSlug: string | undefined): string | undefined {
+  const normalizedEvent = normalizeSlugSegment(eventSlug)
+  const normalizedMarket = normalizeSlugSegment(marketSlug)
+
+  if (normalizedEvent && normalizedMarket && normalizedEvent !== normalizedMarket) {
+    return `${normalizedEvent}/${normalizedMarket}`
+  }
+
+  return normalizedMarket ?? normalizedEvent
+}
+
+function normalizeSlugSegment(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined
+  }
+  const normalized = value.trim().replace(/^\/+|\/+$/g, '')
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function choosePreferredMarketSlug(
+  currentSlug: string | null | undefined,
+  nextSlug: string | null | undefined
+): string | undefined {
+  const normalizedCurrent = normalizeSlugSegment(currentSlug ?? undefined)
+  const normalizedNext = normalizeSlugSegment(nextSlug ?? undefined)
+
+  if (!normalizedCurrent) {
+    return normalizedNext
+  }
+  if (!normalizedNext) {
+    return normalizedCurrent
+  }
+  if (!normalizedCurrent.includes('/') && normalizedNext.includes('/')) {
+    return normalizedNext
+  }
+  return normalizedCurrent
 }
 
 function asObject(value: unknown): Record<string, unknown> {

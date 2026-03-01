@@ -3,12 +3,13 @@ import { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { jsonContract, jsonError, paginationMeta, parsePagination, toIso, toNumber } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
-import { fetchWorkerHealth } from '@/lib/server/worker-health'
+import { fetchWorkerHealth, fetchWorkerMarketBooks } from '@/lib/server/worker-health'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-const SectionSchema = z.enum(['open', 'executions', 'skipped'])
+const SectionSchema = z.enum(['open', 'attempting', 'executions', 'skipped'])
+const SpreadStateSchema = z.enum(['LIVE', 'STALE', 'UNAVAILABLE'])
 
 const CopiesDataSchema = z.object({
   section: SectionSchema,
@@ -34,15 +35,60 @@ const CopiesDataSchema = z.object({
           createdAt: z.string(),
           leaderId: z.string().nullable(),
           leaderName: z.string().nullable(),
+          leaderNames: z.array(z.string()),
           tokenId: z.string(),
           marketId: z.string().nullable(),
+          marketLabel: z.string().nullable(),
+          marketSlug: z.string().nullable(),
           outcome: z.string().nullable(),
           side: z.enum(['BUY', 'SELL']),
           pendingNotionalUsd: z.number(),
+          minExecutableNotionalUsd: z.number(),
+          minOrderSizeShares: z.number().nullable(),
           pendingShares: z.number(),
           status: z.enum(['PENDING', 'ELIGIBLE', 'BLOCKED', 'EXPIRED', 'CONVERTED']),
           blockReason: z.string().nullable(),
           expiresAt: z.string().nullable()
+        })
+      ),
+      pagination: z.object({
+        page: z.number().int().positive(),
+        pageSize: z.number().int().positive(),
+        total: z.number().int().nonnegative(),
+        totalPages: z.number().int().positive()
+      })
+    })
+    .nullable(),
+  attempting: z
+    .object({
+      items: z.array(
+        z.object({
+          id: z.string(),
+          createdAt: z.string(),
+          attemptedAt: z.string().nullable(),
+          leaderId: z.string().nullable(),
+          leaderName: z.string().nullable(),
+          leaderNames: z.array(z.string()),
+          tokenId: z.string(),
+          marketId: z.string().nullable(),
+          marketLabel: z.string().nullable(),
+          marketSlug: z.string().nullable(),
+          outcome: z.string().nullable(),
+          side: z.enum(['BUY', 'SELL']),
+          accumulatedDeltaNotionalUsd: z.number(),
+          accumulatedDeltaShares: z.number(),
+          spreadState: SpreadStateSchema,
+          spreadAgeMs: z.number().int().nonnegative().nullable(),
+          currentSpreadUsd: z.number().nullable(),
+          retries: z.number().int().nonnegative(),
+          maxRetries: z.number().int().nonnegative(),
+          status: z.enum(['PENDING', 'RETRYING', 'EXECUTING']),
+          reason: z.string().nullable(),
+          message: z.string().nullable(),
+          lastOrderStatus: z.enum(['PLACED', 'PARTIALLY_FILLED', 'FILLED', 'FAILED', 'CANCELLED', 'RETRYING']).nullable(),
+          lastOrderError: z.string().nullable(),
+          pendingStatus: z.enum(['PENDING', 'ELIGIBLE', 'BLOCKED', 'EXPIRED', 'CONVERTED']).nullable(),
+          pendingBlockReason: z.string().nullable()
         })
       ),
       pagination: z.object({
@@ -64,6 +110,8 @@ const CopiesDataSchema = z.object({
           leaderName: z.string().nullable(),
           tokenId: z.string(),
           marketId: z.string().nullable(),
+          marketLabel: z.string().nullable(),
+          marketSlug: z.string().nullable(),
           outcome: z.string().nullable(),
           side: z.enum(['BUY', 'SELL']),
           intendedNotionalUsd: z.number(),
@@ -95,6 +143,8 @@ const CopiesDataSchema = z.object({
           z.object({
             tokenId: z.string(),
             marketId: z.string().nullable(),
+            marketLabel: z.string().nullable(),
+            marketSlug: z.string().nullable(),
             outcome: z.string().nullable(),
             skipCount: z.number().int().nonnegative(),
             lastSkippedAt: z.string(),
@@ -112,6 +162,8 @@ const CopiesDataSchema = z.object({
             leaderName: z.string().nullable(),
             tokenId: z.string(),
             marketId: z.string().nullable(),
+            marketLabel: z.string().nullable(),
+            marketSlug: z.string().nullable(),
             outcome: z.string().nullable(),
             side: z.enum(['BUY', 'SELL']),
             reason: z.string().nullable(),
@@ -173,6 +225,9 @@ export async function GET(request: NextRequest) {
         where: {
           status: {
             in: ['PLACED', 'PARTIALLY_FILLED', 'RETRYING']
+          },
+          externalOrderId: {
+            not: null
           }
         }
       }),
@@ -232,7 +287,15 @@ export async function GET(request: NextRequest) {
     if (section === 'open') {
       const openWhere: Prisma.PendingDeltaWhereInput = {
         status: {
-          in: ['PENDING', 'BLOCKED']
+          in: ['PENDING', 'BLOCKED', 'ELIGIBLE']
+        },
+        copyAttempts: {
+          none: {
+            status: {
+              in: ['PENDING', 'RETRYING', 'EXECUTING']
+            },
+            decision: 'PENDING'
+          }
         },
         OR: [
           {
@@ -244,13 +307,6 @@ export async function GET(request: NextRequest) {
             }
           }
         ],
-        copyAttempts: {
-          none: {
-            status: {
-              in: ['PENDING', 'RETRYING', 'EXECUTING']
-            }
-          }
-        },
         ...(tokenId ? { tokenId } : {})
       }
 
@@ -273,9 +329,11 @@ export async function GET(request: NextRequest) {
             marketId: true,
             side: true,
             pendingDeltaNotionalUsd: true,
+            minExecutableNotionalUsd: true,
             pendingDeltaShares: true,
             status: true,
             blockReason: true,
+            metadata: true,
             expiresAt: true,
             leader: {
               select: {
@@ -285,7 +343,8 @@ export async function GET(request: NextRequest) {
           }
         })
       ])
-      const outcomeByToken = await resolveOutcomeByToken(rows.map((row) => row.tokenId))
+      const tokenMetadata = await resolveTokenMetadataByToken(rows.map((row) => row.tokenId))
+      const leaderNamesByRow = await resolveOpenLeaderNames(rows)
 
       return jsonContract(
         CopiesDataSchema,
@@ -297,17 +356,165 @@ export async function GET(request: NextRequest) {
               id: row.id,
               createdAt: row.createdAt.toISOString(),
               leaderId: row.leaderId,
-              leaderName: row.leader?.name ?? null,
+              leaderName: leaderNamesByRow.get(row.id)?.[0] ?? row.leader?.name ?? null,
+              leaderNames: leaderNamesByRow.get(row.id) ?? [],
               tokenId: row.tokenId,
-              marketId: row.marketId,
-              outcome: outcomeByToken.get(row.tokenId) ?? null,
+              marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+              marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+              marketSlug: tokenMetadata.get(row.tokenId)?.marketSlug ?? null,
+              outcome: tokenMetadata.get(row.tokenId)?.outcome ?? null,
               side: row.side,
               pendingNotionalUsd: toNumber(row.pendingDeltaNotionalUsd),
+              minExecutableNotionalUsd: toNumber(row.minExecutableNotionalUsd),
+              minOrderSizeShares: extractMinOrderSizeShares(row.metadata),
               pendingShares: toNumber(row.pendingDeltaShares),
               status: row.status,
               blockReason: row.blockReason,
               expiresAt: toIso(row.expiresAt)
             })),
+            pagination: paginationMeta(pagination, total)
+          },
+          attempting: null,
+          executions: null,
+          skipped: null
+        },
+        {
+          cacheSeconds: 5
+        }
+      )
+    }
+
+    if (section === 'attempting') {
+      const attemptingWhere: Prisma.CopyAttemptWhereInput = {
+        status: {
+          in: ['PENDING', 'RETRYING', 'EXECUTING']
+        },
+        decision: 'PENDING',
+        ...(tokenId ? { tokenId } : {})
+      }
+
+      const [total, rows] = await Promise.all([
+        prisma.copyAttempt.count({
+          where: attemptingWhere
+        }),
+        prisma.copyAttempt.findMany({
+          where: attemptingWhere,
+          orderBy: {
+            createdAt: 'desc'
+          },
+          skip: pagination.skip,
+          take: pagination.pageSize,
+          select: {
+            id: true,
+            createdAt: true,
+            attemptedAt: true,
+            leaderId: true,
+            tokenId: true,
+            marketId: true,
+            side: true,
+            accumulatedDeltaNotionalUsd: true,
+            accumulatedDeltaShares: true,
+            retries: true,
+            maxRetries: true,
+            status: true,
+            reason: true,
+            errorPayload: true,
+            leader: {
+              select: {
+                name: true
+              }
+            },
+            pendingDelta: {
+              select: {
+                status: true,
+                blockReason: true,
+                pendingDeltaNotionalUsd: true,
+                pendingDeltaShares: true,
+                metadata: true
+              }
+            },
+            copyOrders: {
+              orderBy: {
+                attemptedAt: 'desc'
+              },
+              take: 1,
+              select: {
+                status: true,
+                errorMessage: true
+              }
+            }
+          }
+        })
+      ])
+
+      const tokenMetadata = await resolveTokenMetadataByToken(rows.map((row) => row.tokenId))
+      const spreadByToken = await resolveCurrentSpreadsByToken(rows.map((row) => row.tokenId))
+      const leaderNamesByRow = await resolveOpenLeaderNames(
+        rows.map((row) => ({
+          id: row.id,
+          leaderId: row.leaderId,
+          leader: row.leader,
+          metadata: row.pendingDelta?.metadata
+        }))
+      )
+
+      return jsonContract(
+        CopiesDataSchema,
+        {
+          section,
+          summary,
+          open: null,
+          attempting: {
+            items: rows.map((row) => {
+              const latestOrder = row.copyOrders[0] ?? null
+              const spreadInfo = spreadByToken.get(row.tokenId) ?? {
+                spreadState: 'UNAVAILABLE' as const,
+                spreadAgeMs: null,
+                currentSpreadUsd: null
+              }
+              const pendingNotionalUsd =
+                row.pendingDelta?.pendingDeltaNotionalUsd !== null && row.pendingDelta?.pendingDeltaNotionalUsd !== undefined
+                  ? toNumber(row.pendingDelta.pendingDeltaNotionalUsd)
+                  : null
+              const pendingShares =
+                row.pendingDelta?.pendingDeltaShares !== null && row.pendingDelta?.pendingDeltaShares !== undefined
+                  ? toNumber(row.pendingDelta.pendingDeltaShares)
+                  : null
+              const attemptNotionalUsd =
+                row.accumulatedDeltaNotionalUsd !== null && row.accumulatedDeltaNotionalUsd !== undefined
+                  ? toNumber(row.accumulatedDeltaNotionalUsd)
+                  : null
+              const attemptShares =
+                row.accumulatedDeltaShares !== null && row.accumulatedDeltaShares !== undefined ? toNumber(row.accumulatedDeltaShares) : null
+              return {
+                id: row.id,
+                createdAt: row.createdAt.toISOString(),
+                attemptedAt: toIso(row.attemptedAt),
+                leaderId: row.leaderId,
+                leaderName: leaderNamesByRow.get(row.id)?.[0] ?? row.leader?.name ?? null,
+                leaderNames: leaderNamesByRow.get(row.id) ?? [],
+                tokenId: row.tokenId,
+                marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+                marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+                marketSlug: tokenMetadata.get(row.tokenId)?.marketSlug ?? null,
+                outcome: tokenMetadata.get(row.tokenId)?.outcome ?? null,
+                side: row.side,
+                accumulatedDeltaNotionalUsd: pendingNotionalUsd ?? attemptNotionalUsd ?? 0,
+                accumulatedDeltaShares: pendingShares ?? attemptShares ?? 0,
+                spreadState: spreadInfo.spreadState,
+                spreadAgeMs: spreadInfo.spreadAgeMs,
+                currentSpreadUsd: spreadInfo.currentSpreadUsd,
+                retries: row.retries,
+                maxRetries: row.maxRetries,
+                status: toAttemptingStatus(row.status),
+                reason: row.reason,
+                message: extractAttemptMessage(row.errorPayload),
+                lastOrderStatus: latestOrder?.status ?? null,
+                lastOrderError: normalizeOrderErrorMessage(latestOrder?.errorMessage),
+                pendingStatus: row.pendingDelta?.status ?? null,
+                pendingBlockReason: row.pendingDelta?.blockReason ?? null
+              }
+            }),
             pagination: paginationMeta(pagination, total)
           },
           executions: null,
@@ -321,6 +528,9 @@ export async function GET(request: NextRequest) {
 
     if (section === 'executions') {
       const executionWhere: Prisma.CopyOrderWhereInput = {
+        externalOrderId: {
+          not: null
+        },
         ...(tokenId ? { tokenId } : {})
       }
 
@@ -366,7 +576,7 @@ export async function GET(request: NextRequest) {
           }
         })
       ])
-      const outcomeByToken = await resolveOutcomeByToken(rows.map((row) => row.tokenId))
+      const tokenMetadata = await resolveTokenMetadataByToken(rows.map((row) => row.tokenId))
 
       return jsonContract(
         CopiesDataSchema,
@@ -374,6 +584,7 @@ export async function GET(request: NextRequest) {
           section,
           summary,
           open: null,
+          attempting: null,
           executions: {
             items: rows.map((row) => ({
               id: row.id,
@@ -382,8 +593,10 @@ export async function GET(request: NextRequest) {
               leaderId: row.copyAttempt?.leaderId ?? null,
               leaderName: row.copyAttempt?.leader?.name ?? null,
               tokenId: row.tokenId,
-              marketId: row.marketId,
-              outcome: outcomeByToken.get(row.tokenId) ?? null,
+              marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+              marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+              marketSlug: tokenMetadata.get(row.tokenId)?.marketSlug ?? null,
+              outcome: tokenMetadata.get(row.tokenId)?.outcome ?? null,
               side: row.side,
               intendedNotionalUsd: toNumber(row.intendedNotionalUsd),
               intendedShares: toNumber(row.intendedShares),
@@ -392,7 +605,7 @@ export async function GET(request: NextRequest) {
               feePaidUsd: toNumber(row.feePaidUsd),
               status: row.status,
               reason: row.copyAttempt?.reason ?? null,
-              errorMessage: row.errorMessage,
+              errorMessage: normalizeOrderErrorMessage(row.errorMessage),
               accumulatedDeltaNotionalUsd:
                 row.copyAttempt?.accumulatedDeltaNotionalUsd !== null &&
                 row.copyAttempt?.accumulatedDeltaNotionalUsd !== undefined
@@ -447,7 +660,7 @@ export async function GET(request: NextRequest) {
           }
         })
       ])
-      const outcomeByToken = await resolveOutcomeByToken(details.map((row) => row.tokenId))
+      const tokenMetadata = await resolveTokenMetadataByToken(details.map((row) => row.tokenId))
 
       return jsonContract(
         CopiesDataSchema,
@@ -455,6 +668,7 @@ export async function GET(request: NextRequest) {
           section,
           summary,
           open: null,
+          attempting: null,
           executions: null,
           skipped: {
             mode: 'details',
@@ -466,8 +680,10 @@ export async function GET(request: NextRequest) {
               leaderId: row.leaderId,
               leaderName: row.leader?.name ?? null,
               tokenId: row.tokenId,
-              marketId: row.marketId,
-              outcome: outcomeByToken.get(row.tokenId) ?? null,
+              marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+              marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+              marketSlug: tokenMetadata.get(row.tokenId)?.marketSlug ?? null,
+              outcome: tokenMetadata.get(row.tokenId)?.outcome ?? null,
               side: row.side,
               reason: row.reason,
               accumulatedDeltaNotionalUsd: toNumber(row.accumulatedDeltaNotionalUsd)
@@ -508,7 +724,7 @@ export async function GET(request: NextRequest) {
 
     const total = sortedGroups.length
     const paged = sortedGroups.slice(pagination.skip, pagination.skip + pagination.pageSize)
-    const outcomeByToken = await resolveOutcomeByToken(paged.map((row) => row.tokenId))
+    const tokenMetadata = await resolveTokenMetadataByToken(paged.map((row) => row.tokenId))
 
     const topReasonByKey = new Map<string, string | null>()
     for (const group of reasonCounts) {
@@ -533,13 +749,16 @@ export async function GET(request: NextRequest) {
         section,
         summary,
         open: null,
+        attempting: null,
         executions: null,
         skipped: {
           mode: 'groups',
           groups: paged.map((row) => ({
             tokenId: row.tokenId,
-            marketId: row.marketId,
-            outcome: outcomeByToken.get(row.tokenId) ?? null,
+            marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+            marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+            marketSlug: tokenMetadata.get(row.tokenId)?.marketSlug ?? null,
+            outcome: tokenMetadata.get(row.tokenId)?.outcome ?? null,
             skipCount: row._count._all,
             lastSkippedAt: (row._max.createdAt ?? new Date()).toISOString(),
             topReason: topReasonByKey.get(`${row.tokenId}::${row.marketId ?? ''}`) ?? null
@@ -569,40 +788,402 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-async function resolveOutcomeByToken(tokenIds: string[]): Promise<Map<string, string>> {
+type TokenMetadata = {
+  marketId: string | null
+  marketLabel: string | null
+  marketSlug: string | null
+  outcome: string | null
+}
+
+interface OpenRowLeaderMetaInput {
+  id: string
+  leaderId: string | null
+  leader?: { name: string } | null
+  metadata: unknown
+}
+
+async function resolveTokenMetadataByToken(tokenIds: string[]): Promise<Map<string, TokenMetadata>> {
   const uniqueTokenIds = [...new Set(tokenIds.filter((value) => value.length > 0))]
   if (uniqueTokenIds.length === 0) {
     return new Map()
   }
 
-  const rows = await prisma.leaderTradeEvent.findMany({
-    where: {
-      tokenId: {
-        in: uniqueTokenIds
+  const metadata = new Map<string, TokenMetadata>()
+
+  const [tradeRows, leaderPositionRows, followerPositionRows] = await Promise.all([
+    prisma.leaderTradeEvent.findMany({
+      where: {
+        tokenId: { in: uniqueTokenIds }
       },
-      outcome: {
-        not: null
+      orderBy: {
+        detectedAtMs: 'desc'
+      },
+      select: {
+        tokenId: true,
+        marketId: true,
+        outcome: true,
+        payload: true
+      },
+      take: Math.max(200, uniqueTokenIds.length * 8)
+    }),
+    prisma.leaderPositionSnapshot.findMany({
+      where: {
+        tokenId: { in: uniqueTokenIds }
+      },
+      orderBy: {
+        snapshotAt: 'desc'
+      },
+      select: {
+        tokenId: true,
+        marketId: true,
+        outcome: true,
+        payload: true
+      },
+      take: Math.max(200, uniqueTokenIds.length * 8)
+    }),
+    prisma.followerPositionSnapshot.findMany({
+      where: {
+        tokenId: { in: uniqueTokenIds }
+      },
+      orderBy: {
+        snapshotAt: 'desc'
+      },
+      select: {
+        tokenId: true,
+        marketId: true,
+        outcome: true,
+        payload: true
+      },
+      take: Math.max(200, uniqueTokenIds.length * 8)
+    })
+  ])
+
+  const applyRow = (row: { tokenId: string; marketId: string | null; outcome: string | null; payload: unknown }) => {
+    const current = metadata.get(row.tokenId) ?? {
+      marketId: null,
+      marketLabel: null,
+      marketSlug: null,
+      outcome: null
+    }
+
+    const payloadInfo = extractMarketMetadataFromPayload(row.payload)
+    const next: TokenMetadata = {
+      marketId: current.marketId ?? row.marketId ?? payloadInfo.marketId ?? null,
+      marketLabel: current.marketLabel ?? payloadInfo.marketLabel ?? null,
+      marketSlug: choosePreferredMarketSlug(current.marketSlug, payloadInfo.marketSlug) ?? null,
+      outcome: current.outcome ?? row.outcome ?? payloadInfo.outcome ?? null
+    }
+
+    if (next.marketId || next.marketLabel || next.outcome) {
+      metadata.set(row.tokenId, next)
+    }
+  }
+
+  for (const row of tradeRows) {
+    applyRow(row)
+  }
+  for (const row of leaderPositionRows) {
+    applyRow(row)
+  }
+  for (const row of followerPositionRows) {
+    applyRow(row)
+  }
+
+  return metadata
+}
+
+function extractMarketMetadataFromPayload(payload: unknown): Partial<TokenMetadata> {
+  const root = asObject(payload)
+  const raw = asObject(root.raw)
+
+  const title = readString(raw, 'title')
+  const slug = readString(raw, 'slug')
+  const eventSlug = readString(raw, 'eventSlug')
+  const marketSlug = buildPolymarketEventPath(eventSlug, slug)
+  const marketId = readString(raw, 'conditionId') ?? readString(raw, 'market')
+  const outcome = readString(raw, 'outcome')
+
+  return {
+    marketId: marketId ?? null,
+    marketLabel: title ?? slug ?? eventSlug ?? null,
+    marketSlug: marketSlug ?? null,
+    outcome: outcome ?? null
+  }
+}
+
+function buildPolymarketEventPath(eventSlug: string | undefined, marketSlug: string | undefined): string | undefined {
+  const normalizedEvent = normalizeSlugSegment(eventSlug)
+  const normalizedMarket = normalizeSlugSegment(marketSlug)
+
+  if (normalizedEvent && normalizedMarket && normalizedEvent !== normalizedMarket) {
+    return `${normalizedEvent}/${normalizedMarket}`
+  }
+
+  return normalizedMarket ?? normalizedEvent
+}
+
+function normalizeSlugSegment(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined
+  }
+  const normalized = value.trim().replace(/^\/+|\/+$/g, '')
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function choosePreferredMarketSlug(
+  currentSlug: string | null | undefined,
+  nextSlug: string | null | undefined
+): string | undefined {
+  const normalizedCurrent = normalizeSlugSegment(currentSlug ?? undefined)
+  const normalizedNext = normalizeSlugSegment(nextSlug ?? undefined)
+
+  if (!normalizedCurrent) {
+    return normalizedNext
+  }
+  if (!normalizedNext) {
+    return normalizedCurrent
+  }
+  if (!normalizedCurrent.includes('/') && normalizedNext.includes('/')) {
+    return normalizedNext
+  }
+  return normalizedCurrent
+}
+
+function readString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+async function resolveOpenLeaderNames(rows: OpenRowLeaderMetaInput[]): Promise<Map<string, string[]>> {
+  const leaderIds = new Set<string>()
+  const contributorIdsByRow = new Map<string, string[]>()
+
+  for (const row of rows) {
+    if (row.leaderId) {
+      leaderIds.add(row.leaderId)
+    }
+    const contributorIds = extractContributorLeaderIds(row.metadata)
+    contributorIdsByRow.set(row.id, contributorIds)
+    for (const leaderId of contributorIds) {
+      leaderIds.add(leaderId)
+    }
+  }
+
+  if (leaderIds.size === 0) {
+    return new Map()
+  }
+
+  const leaders = await prisma.leader.findMany({
+    where: {
+      id: {
+        in: [...leaderIds]
       }
     },
-    orderBy: {
-      detectedAtMs: 'desc'
-    },
     select: {
-      tokenId: true,
-      outcome: true
+      id: true,
+      name: true
     }
   })
 
-  const outcomeByToken = new Map<string, string>()
+  const leaderNameById = new Map(leaders.map((leader) => [leader.id, leader.name]))
+  const result = new Map<string, string[]>()
+
   for (const row of rows) {
-    if (!row.outcome) {
+    const contributorIds = contributorIdsByRow.get(row.id) ?? []
+    const names = contributorIds
+      .map((leaderId) => leaderNameById.get(leaderId))
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+
+    if (names.length > 0) {
+      result.set(row.id, names)
       continue
     }
-    if (!outcomeByToken.has(row.tokenId)) {
-      outcomeByToken.set(row.tokenId, row.outcome)
+
+    if (row.leaderId && leaderNameById.has(row.leaderId)) {
+      result.set(row.id, [leaderNameById.get(row.leaderId) as string])
+      continue
+    }
+
+    if (row.leader?.name) {
+      result.set(row.id, [row.leader.name])
     }
   }
-  return outcomeByToken
+
+  return result
+}
+
+function extractContributorLeaderIds(metadata: unknown): string[] {
+  const root = asObject(metadata)
+  const shares = asObject(root.leaderTargetShares)
+  const entries: Array<{ leaderId: string; shares: number }> = []
+
+  for (const [leaderId, value] of Object.entries(shares)) {
+    const sharesValue = toNumber(value)
+    if (!leaderId || sharesValue <= 0) {
+      continue
+    }
+    entries.push({ leaderId, shares: sharesValue })
+  }
+
+  entries.sort((left, right) => right.shares - left.shares)
+  return entries.map((entry) => entry.leaderId)
+}
+
+function extractMinOrderSizeShares(metadata: unknown): number | null {
+  const root = asObject(metadata)
+  const minOrderSize = toNumber(root.minOrderSize)
+  return minOrderSize > 0 ? minOrderSize : null
+}
+
+async function resolveCurrentSpreadsByToken(
+  tokenIds: string[]
+): Promise<Map<string, { spreadState: 'LIVE' | 'STALE' | 'UNAVAILABLE'; spreadAgeMs: number | null; currentSpreadUsd: number | null }>> {
+  const books = await fetchWorkerMarketBooks(tokenIds)
+  if (!books || books.length === 0) {
+    return new Map()
+  }
+
+  const now = Date.now()
+  const spreads = new Map<
+    string,
+    { spreadState: 'LIVE' | 'STALE' | 'UNAVAILABLE'; spreadAgeMs: number | null; currentSpreadUsd: number | null }
+  >()
+  for (const book of books) {
+    const spreadState =
+      book.spreadState === 'LIVE' || book.spreadState === 'STALE' || book.spreadState === 'UNAVAILABLE'
+        ? book.spreadState
+        : 'UNAVAILABLE'
+    const spreadAgeMs =
+      typeof book.quoteUpdatedAtMs === 'number' && Number.isFinite(book.quoteUpdatedAtMs)
+        ? Math.max(0, Math.trunc(now - book.quoteUpdatedAtMs))
+        : null
+
+    if (spreadState !== 'LIVE') {
+      spreads.set(book.tokenId, {
+        spreadState,
+        spreadAgeMs,
+        currentSpreadUsd: null
+      })
+      continue
+    }
+
+    const spreadValue =
+      typeof book.spreadUsd === 'number' && Number.isFinite(book.spreadUsd) && book.spreadUsd >= 0
+        ? book.spreadUsd
+        : null
+
+    if (spreadValue === null) {
+      spreads.set(book.tokenId, {
+        spreadState: 'UNAVAILABLE',
+        spreadAgeMs,
+        currentSpreadUsd: null
+      })
+      continue
+    }
+
+    spreads.set(book.tokenId, {
+      spreadState: 'LIVE',
+      spreadAgeMs,
+      currentSpreadUsd: spreadValue
+    })
+  }
+
+  return spreads
+}
+
+function extractAttemptMessage(payload: unknown): string | null {
+  if (typeof payload === 'string') {
+    return normalizeOrderErrorMessage(payload)
+  }
+
+  const root = asObject(payload)
+  const direct =
+    readString(root, 'message') ??
+    readString(root, 'error') ??
+    readString(root, 'detail') ??
+    readString(root, 'reason') ??
+    readString(root, 'cause')
+  if (direct) {
+    return normalizeOrderErrorMessage(direct)
+  }
+
+  const nestedError = asObject(root.error)
+  const nested =
+    readString(nestedError, 'message') ??
+    readString(nestedError, 'detail') ??
+    readString(nestedError, 'reason') ??
+    readString(nestedError, 'cause')
+  return normalizeOrderErrorMessage(nested)
+}
+
+function normalizeOrderErrorMessage(errorMessage: string | null | undefined): string | null {
+  if (!errorMessage) {
+    return null
+  }
+
+  const trimmed = errorMessage.trim()
+  if (trimmed.length === 0) {
+    return null
+  }
+
+  const withoutPrefix = trimmed.replace(/^CLOB order submit failed:\s*/i, '').replace(/^Error:\s*/i, '').trim()
+  const extractedFromJson = extractMessageFromJsonBlob(withoutPrefix)
+  if (extractedFromJson) {
+    return extractedFromJson
+  }
+
+  const extractedByPattern = extractMessageWithPattern(withoutPrefix)
+  if (extractedByPattern) {
+    return extractedByPattern
+  }
+
+  return withoutPrefix
+}
+
+function extractMessageFromJsonBlob(blob: string): string | null {
+  if (!(blob.startsWith('{') && blob.endsWith('}'))) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(blob)
+    const message = extractAttemptMessage(parsed)
+    if (message) {
+      return message
+    }
+  } catch {
+    return null
+  }
+
+  return null
+}
+
+function extractMessageWithPattern(text: string): string | null {
+  const quotedMatches = [
+    text.match(/"error"\s*:\s*"([^"]+)"/i),
+    text.match(/'error'\s*:\s*'([^']+)'/i),
+    text.match(/"message"\s*:\s*"([^"]+)"/i),
+    text.match(/'message'\s*:\s*'([^']+)'/i)
+  ]
+
+  for (const match of quotedMatches) {
+    const captured = match?.[1]?.trim()
+    if (captured) {
+      return captured
+    }
+  }
+
+  return null
+}
+
+function toAttemptingStatus(value: string): 'PENDING' | 'RETRYING' | 'EXECUTING' {
+  if (value === 'RETRYING') {
+    return 'RETRYING'
+  }
+  if (value === 'EXECUTING') {
+    return 'EXECUTING'
+  }
+  return 'PENDING'
 }
 
 function toErrorMessage(error: unknown): string {

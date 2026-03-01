@@ -35,6 +35,15 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
   }
 
   async getLatestDataApiTradeCursorMs(leaderId: string): Promise<number | null> {
+    const leader = await this.prisma.leader.findUnique({
+      where: { id: leaderId },
+      select: { metadata: true }
+    });
+    const metadataCursor = readMetadataTradesCursorMs(leader?.metadata);
+    if (metadataCursor !== null) {
+      return metadataCursor;
+    }
+
     const aggregate = await this.prisma.leaderTradeEvent.aggregate({
       where: {
         leaderId,
@@ -120,6 +129,7 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
         leaderId: args.leaderId,
         source: DATA_API_SOURCE,
         triggerId: event.triggerId,
+        canonicalKey: event.canonicalKey,
         transactionHash: event.transactionHash,
         logIndex: null,
         leaderFillAtMs: BigInt(event.leaderFillAtMs),
@@ -136,6 +146,12 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
       })),
       skipDuplicates: true
     });
+
+    if (result.count < args.events.length) {
+      for (const event of args.events) {
+        await this.mergeDataApiObservation(args.leaderId, event);
+      }
+    }
 
     return result.count;
   }
@@ -249,6 +265,50 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
       } as Prisma.InputJsonValue
     };
   }
+
+  private async mergeDataApiObservation(leaderId: string, event: NormalizedTradeEvent): Promise<void> {
+    const existing = await this.prisma.leaderTradeEvent.findUnique({
+      where: {
+        leaderId_canonicalKey: {
+          leaderId,
+          canonicalKey: event.canonicalKey
+        }
+      },
+      select: {
+        id: true,
+        source: true,
+        payload: true,
+        marketId: true,
+        outcome: true,
+        transactionHash: true
+      }
+    });
+
+    if (!existing) {
+      return;
+    }
+
+    if (existing.source === DATA_API_SOURCE) {
+      return;
+    }
+
+    const payload = mergePayloadSource(existing.payload, DATA_API_SOURCE, event.detectedAtMs, {
+      dataApi: {
+        triggerId: event.triggerId,
+        transactionHash: event.transactionHash ?? null
+      }
+    });
+
+    await this.prisma.leaderTradeEvent.update({
+      where: { id: existing.id },
+      data: {
+        transactionHash: existing.transactionHash ?? event.transactionHash ?? null,
+        marketId: existing.marketId ?? event.marketId ?? null,
+        outcome: existing.outcome ?? event.outcome ?? null,
+        payload: toInputJsonValue(payload)
+      }
+    });
+  }
 }
 
 function ensureObject(value: unknown): Record<string, unknown> {
@@ -261,4 +321,45 @@ function ensureObject(value: unknown): Record<string, unknown> {
 
 function toInputJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function readMetadataTradesCursorMs(value: unknown): number | null {
+  const metadata = ensureObject(value);
+  const ingestion = ensureObject(metadata.ingestion);
+  const trades = ensureObject(ingestion.trades);
+  const cursor = trades.cursorMs;
+  if (typeof cursor === "number" && Number.isFinite(cursor) && cursor > 0) {
+    return Math.floor(cursor);
+  }
+  if (typeof cursor === "string") {
+    const parsed = Number(cursor);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return null;
+}
+
+function mergePayloadSource(
+  value: unknown,
+  source: "CHAIN" | "DATA_API",
+  observedAtMs: number,
+  extras: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const payload = ensureObject(value);
+  const seenSourcesRaw = Array.isArray(payload.seenSources) ? payload.seenSources : [];
+  const seenSources = [...new Set(seenSourcesRaw.filter((entry): entry is string => typeof entry === "string"))];
+  if (!seenSources.includes(source)) {
+    seenSources.push(source);
+  }
+
+  const sourceObservedAtMs = ensureObject(payload.sourceObservedAtMs);
+  sourceObservedAtMs[source] = observedAtMs;
+
+  return {
+    ...payload,
+    ...extras,
+    seenSources,
+    sourceObservedAtMs
+  };
 }

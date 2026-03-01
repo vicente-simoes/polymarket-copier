@@ -98,6 +98,45 @@ test("ClobRestClient supports /book and /books response parsing", async () => {
   assert.match(seen[1]?.body ?? "", /tokenA/);
 });
 
+test("ClobRestClient normalizes top-of-book when payload levels are reverse-ordered", async () => {
+  const fetchImpl: typeof fetch = async () =>
+    new Response(
+      JSON.stringify({
+        market: "market-reversed",
+        asset_id: "token-reversed",
+        timestamp: "2023-10-01T12:00:00Z",
+        // Mirrors the ordering observed in live CLOB responses.
+        bids: [
+          { price: "0.01", size: "100" },
+          { price: "0.50", size: "5" },
+          { price: "0.49", size: "20" }
+        ],
+        asks: [
+          { price: "0.99", size: "10" },
+          { price: "0.52", size: "20" },
+          { price: "0.51", size: "15" }
+        ],
+        min_order_size: "1",
+        tick_size: "0.01",
+        neg_risk: false
+      }),
+      { status: 200 }
+    );
+
+  const client = new ClobRestClient({
+    baseUrl: "https://clob.polymarket.com",
+    fetchImpl
+  });
+
+  const book = await client.fetchBook("token-reversed");
+  assert.equal(book.bids[0]?.price, 0.5);
+  assert.equal(book.asks[0]?.price, 0.51);
+
+  const top = client.topOfBook(book);
+  assert.equal(top.bestBid, 0.5);
+  assert.equal(top.bestAsk, 0.51);
+});
+
 test("MarketCache prefers WS price, falls back to REST, and marks stale when refresh fails", async () => {
   let nowMs = 1_000_000;
   let failFetch = false;
@@ -222,6 +261,146 @@ test("MarketCache persists metadata in Redis layer and can hydrate it later", as
   assert.equal(state.negRisk, true);
   assert.equal(state.isStale, true);
   assert.ok(state.staleReasons.includes("MISSING_PRICE"));
+});
+
+test("MarketCache does not treat one-sided WS updates as fresh two-sided prices", async () => {
+  let nowMs = 2_000_000;
+
+  const restClient = {
+    async fetchBook(tokenId: string) {
+      return {
+        ...makeParsedBook(tokenId, 0.4, 0.6),
+        market: "market-beta",
+        asset_id: tokenId
+      };
+    },
+    async fetchBooks(tokenIds: string[]) {
+      return tokenIds.map((tokenId) => ({
+        ...makeParsedBook(tokenId, 0.4, 0.6),
+        market: "market-beta",
+        asset_id: tokenId
+      }));
+    }
+  } as ClobRestClient;
+
+  const cache = new MarketCache({
+    restClient,
+    now: () => nowMs,
+    config: {
+      metadataTtlMs: 60_000,
+      wsPriceTtlMs: 10_000,
+      restPriceTtlMs: 30_000,
+      redisMetadataTtlSeconds: 1800
+    }
+  });
+
+  const initial = await cache.getBookState("token-partial");
+  assert.equal(initial.priceSource, "REST");
+
+  cache.ingestWsPrice({
+    tokenId: "token-partial",
+    bestBid: 0.49,
+    bestAsk: 0.51,
+    atMs: nowMs
+  });
+
+  const wsBacked = await cache.getBookState("token-partial");
+  assert.equal(wsBacked.priceSource, "WS");
+
+  // Expire the original WS quote, then receive only a one-sided update.
+  nowMs += 11_000;
+  cache.ingestWsPrice({
+    tokenId: "token-partial",
+    bestBid: 0.5,
+    atMs: nowMs
+  });
+
+  // With a one-sided fresh WS update, cache should not surface WS as a fresh two-sided quote.
+  const fallback = await cache.getBookState("token-partial");
+  assert.equal(fallback.priceSource, "REST");
+  assert.equal(fallback.bestBid, 0.4);
+  assert.equal(fallback.bestAsk, 0.6);
+});
+
+test("MarketCache marks WS spread stale after 5s even when wsPriceTtl is longer", async () => {
+  let nowMs = 3_000_000;
+
+  const cache = new MarketCache({
+    restClient: {
+      async fetchBook(tokenId: string) {
+        return {
+          ...makeParsedBook(tokenId, 0.4, 0.6),
+          market: "market-gamma",
+          asset_id: tokenId
+        };
+      },
+      async fetchBooks(tokenIds: string[]) {
+        return tokenIds.map((tokenId) => ({
+          ...makeParsedBook(tokenId, 0.4, 0.6),
+          market: "market-gamma",
+          asset_id: tokenId
+        }));
+      }
+    } as ClobRestClient,
+    now: () => nowMs,
+    config: {
+      metadataTtlMs: 60_000,
+      wsPriceTtlMs: 15_000,
+      restPriceTtlMs: 30_000,
+      redisMetadataTtlSeconds: 1800
+    }
+  });
+
+  cache.ingestWsPrice({
+    tokenId: "token-spread-stale",
+    bestBid: 0.48,
+    bestAsk: 0.52,
+    atMs: nowMs
+  });
+
+  const live = await cache.getBookState("token-spread-stale", { wsConnected: true });
+  assert.equal(live.spreadState, "LIVE");
+  assert.ok(Math.abs((live.spreadUsd ?? 0) - 0.04) < 1e-9);
+
+  nowMs += 6_000;
+  const stale = await cache.getBookState("token-spread-stale", { wsConnected: true });
+  assert.equal(stale.spreadState, "STALE");
+  assert.equal(stale.spreadUsd, undefined);
+});
+
+test("MarketCache uses REST spread when WS is disconnected", async () => {
+  let nowMs = 4_000_000;
+
+  const cache = new MarketCache({
+    restClient: {
+      async fetchBook(tokenId: string) {
+        return {
+          ...makeParsedBook(tokenId, 0.11, 0.13),
+          market: "market-delta",
+          asset_id: tokenId
+        };
+      },
+      async fetchBooks(tokenIds: string[]) {
+        return tokenIds.map((tokenId) => ({
+          ...makeParsedBook(tokenId, 0.11, 0.13),
+          market: "market-delta",
+          asset_id: tokenId
+        }));
+      }
+    } as ClobRestClient,
+    now: () => nowMs,
+    config: {
+      metadataTtlMs: 60_000,
+      wsPriceTtlMs: 15_000,
+      restPriceTtlMs: 30_000,
+      redisMetadataTtlSeconds: 1800
+    }
+  });
+
+  const fallback = await cache.getBookState("token-rest-fallback", { wsConnected: false });
+  assert.equal(fallback.priceSource, "REST");
+  assert.equal(fallback.spreadState, "LIVE");
+  assert.ok(Math.abs((fallback.spreadUsd ?? 0) - 0.02) < 1e-9);
 });
 
 test("MarketWsClient subscribes by watched set and processes price/tick updates", async () => {

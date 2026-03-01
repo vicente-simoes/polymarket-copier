@@ -54,6 +54,9 @@ class FakeStore implements LeaderIngestionStore {
     meta: Record<string, unknown>;
   }): Promise<void> {
     this.pollMeta.push(args);
+    if (args.pollKind === "trades" && typeof args.meta.cursorMs === "number" && Number.isFinite(args.meta.cursorMs)) {
+      this.latestCursorByLeader.set(args.leaderId, Math.floor(args.meta.cursorMs));
+    }
   }
 
   async savePollFailure(args: {
@@ -132,7 +135,8 @@ test("Stage 6 trades poll paginates and ingests only rows at/after cursor", asyn
       maxRetries: 2,
       backoffBaseMs: 10,
       backoffMaxMs: 100,
-      maxPagesPerLeader: 10
+      maxPagesPerLeader: 10,
+      tradesTakerOnly: false
     }
   });
 
@@ -144,6 +148,7 @@ test("Stage 6 trades poll paginates and ingests only rows at/after cursor", asyn
   assert.equal(saved.length, 2);
   assert.equal(saved[0]?.tokenId, "token-1");
   assert.equal(saved[1]?.tokenId, "token-1");
+  assert.ok(saved[0]?.canonicalKey.startsWith("v1:leader-1:"));
   assert.ok(saved[0]?.triggerId.startsWith("data-api:leader-1:"));
   assert.equal(store.savedWallets.length, 1);
   assert.deepEqual(store.savedWallets[0]?.wallets.sort(), ["0xwallet1", "0xwallet2"]);
@@ -153,6 +158,74 @@ test("Stage 6 trades poll paginates and ingests only rows at/after cursor", asyn
   assert.equal(status.trades.totalFailures, 0);
   assert.equal(status.trades.lastRecordsSeen, 3);
   assert.equal(status.trades.lastRecordsInserted, 2);
+});
+
+test("Stage 6 cursor advances from newest seen trade even when dedupe skips inserts", async () => {
+  const store = new FakeStore();
+  const leader: LeaderRecord = {
+    id: "leader-1",
+    name: "Leader One",
+    profileAddress: "0x111"
+  };
+  store.leaders = [leader];
+  store.latestCursorByLeader.set(leader.id, 1_700_000_001_000);
+
+  const pageCalls: number[] = [];
+  let skipInserts = true;
+  const dataApi: LeaderDataApiClient = {
+    async fetchTradesPage(args) {
+      pageCalls.push(args.offset);
+      if (args.offset === 0) {
+        return [
+          makeTrade({ timestamp: 1_700_000_003, transactionHash: "0xaaa" }),
+          makeTrade({ timestamp: 1_700_000_002, transactionHash: "0xbbb" })
+        ];
+      }
+
+      return [
+        makeTrade({ timestamp: 1_700_000_000, transactionHash: "0xccc" }),
+        makeTrade({ timestamp: 1_699_999_999, transactionHash: "0xddd" })
+      ];
+    },
+    async fetchPositionsPage() {
+      return [];
+    }
+  };
+
+  const originalSaveLeaderTradeEvents = store.saveLeaderTradeEvents.bind(store);
+  store.saveLeaderTradeEvents = async (args) => {
+    store.savedTrades.push(args);
+    return skipInserts ? 0 : args.events.length;
+  };
+
+  const poller = new LeaderPoller({
+    dataApi,
+    store,
+    now: () => 1_800_000_000_000,
+    sleep: async () => undefined,
+    config: {
+      positionsIntervalMs: 60_000,
+      tradesIntervalMs: 30_000,
+      pageLimit: 2,
+      batchSize: 1,
+      maxRetries: 2,
+      backoffBaseMs: 10,
+      backoffMaxMs: 100,
+      maxPagesPerLeader: 10,
+      tradesTakerOnly: false
+    }
+  });
+
+  await poller.runTradesPoll();
+  assert.deepEqual(pageCalls, [0, 2]);
+  assert.equal(store.latestCursorByLeader.get(leader.id), 1_700_000_003_000);
+
+  pageCalls.length = 0;
+  skipInserts = false;
+  await poller.runTradesPoll();
+  assert.deepEqual(pageCalls, [0, 2]);
+
+  store.saveLeaderTradeEvents = originalSaveLeaderTradeEvents;
 });
 
 test("Stage 6 poller retries throttled requests with backoff", async () => {
@@ -196,7 +269,8 @@ test("Stage 6 poller retries throttled requests with backoff", async () => {
       maxRetries: 3,
       backoffBaseMs: 10,
       backoffMaxMs: 100,
-      maxPagesPerLeader: 2
+      maxPagesPerLeader: 2,
+      tradesTakerOnly: false
     }
   });
 

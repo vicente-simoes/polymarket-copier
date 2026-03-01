@@ -40,6 +40,19 @@ class FakeTargetStore implements TargetNettingStore {
     return this.followerByProfile.get(copyProfileId) ?? [];
   }
 
+  async listOpenPendingTokenIds(copyProfileId: string): Promise<string[]> {
+    const tokens = new Set<string>();
+    for (const pending of this.pendingByKey.values()) {
+      if (pending.copyProfileId !== copyProfileId) {
+        continue;
+      }
+      if (pending.status === "PENDING" || pending.status === "ELIGIBLE" || pending.status === "BLOCKED") {
+        tokens.add(pending.tokenId);
+      }
+    }
+    return [...tokens];
+  }
+
   async upsertPendingDelta(input: PendingDeltaInput): Promise<PendingDeltaRecord> {
     this.pendingInputs.push(input);
     const key = pendingKey(input.copyProfileId, input.tokenId, input.side);
@@ -202,7 +215,7 @@ test("Stage 8 small deltas accumulate into eligible attempts once notional thres
   assert.equal(store.attempts.size, 1);
 });
 
-test("Stage 8 price preference uses curPrice over market mid and blocks by min order size", async () => {
+test("Stage 8 price preference uses curPrice over market mid and does not block FAK by min order size", async () => {
   const store = new FakeTargetStore();
   store.profiles = [
     {
@@ -247,9 +260,9 @@ test("Stage 8 price preference uses curPrice over market mid and blocks by min o
   assert.ok(pending);
   assertApprox(pending.pendingDeltaShares, 1);
   assertApprox(pending.pendingDeltaNotionalUsd, 0.7);
-  assert.equal(pending.status, "PENDING");
-  assert.equal(pending.blockReason, "MIN_ORDER_SIZE");
-  assert.equal(store.attempts.size, 0);
+  assert.equal(pending.status, "ELIGIBLE");
+  assert.equal(pending.blockReason, undefined);
+  assert.equal(store.attempts.size, 1);
 });
 
 test("Stage 8 applies tracking error threshold before creating attempts", async () => {
@@ -304,6 +317,53 @@ test("Stage 8 applies tracking error threshold before creating attempts", async 
   assertApprox(pending.pendingDeltaNotionalUsd, 1);
   assert.equal(pending.status, "BLOCKED");
   assert.equal(pending.blockReason, "UNKNOWN");
+  assert.equal(store.attempts.size, 0);
+});
+
+test("Stage 8 clears stale pending deltas when token disappears from leader and follower snapshots", async () => {
+  const store = new FakeTargetStore();
+  store.profiles = [
+    {
+      copyProfileId: "cp-4",
+      defaultRatio: 1,
+      leaders: [{ leaderId: "leader-4", ratio: 1 }]
+    }
+  ];
+  store.leaderPositions = [];
+  store.followerByProfile.set("cp-4", []);
+
+  await store.upsertPendingDelta({
+    copyProfileId: "cp-4",
+    leaderId: "leader-4",
+    tokenId: "token-stale",
+    marketId: "market-stale",
+    side: "BUY",
+    pendingDeltaShares: 10,
+    pendingDeltaNotionalUsd: 5,
+    minExecutableNotionalUsd: 1,
+    status: "PENDING",
+    blockReason: "MIN_NOTIONAL",
+    metadata: {},
+    expiresAt: new Date(Date.now() + 60_000)
+  });
+  assert.ok(store.getPending("cp-4", "token-stale", "BUY"));
+
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 1,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    resolvePriceSnapshot: async () => null
+  });
+
+  await engine.run();
+
+  assert.equal(store.getPending("cp-4", "token-stale", "BUY"), undefined);
   assert.equal(store.attempts.size, 0);
 });
 

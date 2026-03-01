@@ -131,6 +131,22 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
     }));
   }
 
+  async listOpenPendingTokenIds(copyProfileId: string): Promise<string[]> {
+    const rows = await this.prisma.pendingDelta.findMany({
+      where: {
+        copyProfileId,
+        status: {
+          in: ["PENDING", "ELIGIBLE", "BLOCKED"]
+        }
+      },
+      select: {
+        tokenId: true
+      }
+    });
+
+    return [...new Set(rows.map((row) => row.tokenId))];
+  }
+
   async upsertPendingDelta(input: PendingDeltaInput): Promise<PendingDeltaRecord> {
     const result = await this.prisma.pendingDelta.upsert({
       where: {
@@ -142,6 +158,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
       },
       create: {
         copyProfileId: input.copyProfileId,
+        leaderId: input.leaderId ?? null,
         tokenId: input.tokenId,
         marketId: input.marketId ?? null,
         side: input.side,
@@ -154,6 +171,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
         metadata: toJsonValue(input.metadata)
       },
       update: {
+        leaderId: input.leaderId ?? null,
         marketId: input.marketId ?? null,
         pendingDeltaShares: String(input.pendingDeltaShares),
         pendingDeltaNotionalUsd: String(input.pendingDeltaNotionalUsd),
@@ -166,6 +184,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
       select: {
         id: true,
         copyProfileId: true,
+        leaderId: true,
         tokenId: true,
         marketId: true,
         side: true,
@@ -178,6 +197,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
     return {
       id: result.id,
       copyProfileId: result.copyProfileId,
+      leaderId: result.leaderId ?? undefined,
       tokenId: result.tokenId,
       marketId: result.marketId ?? undefined,
       side: result.side as PendingDeltaSide,
@@ -259,6 +279,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
 
   async createCopyAttempt(input: {
     copyProfileId: string;
+    leaderId?: string;
     pendingDeltaId: string;
     tokenId: string;
     marketId?: string;
@@ -272,6 +293,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
     await this.prisma.copyAttempt.create({
       data: {
         copyProfileId: input.copyProfileId,
+        leaderId: input.leaderId ?? null,
         pendingDeltaId: input.pendingDeltaId,
         tokenId: input.tokenId,
         marketId: input.marketId ?? null,

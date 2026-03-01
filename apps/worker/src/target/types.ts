@@ -38,6 +38,7 @@ export interface PriceSnapshot {
 
 export interface PendingDeltaInput {
   copyProfileId: string;
+  leaderId?: string;
   tokenId: string;
   marketId?: string;
   side: PendingDeltaSide;
@@ -53,6 +54,7 @@ export interface PendingDeltaInput {
 export interface PendingDeltaRecord {
   id: string;
   copyProfileId: string;
+  leaderId?: string;
   tokenId: string;
   marketId?: string;
   side: PendingDeltaSide;
@@ -71,12 +73,14 @@ export interface TargetNettingStore {
   listActiveCopyProfiles(): Promise<ActiveCopyProfile[]>;
   getLatestLeaderPositions(leaderIds: string[]): Promise<LeaderPositionPoint[]>;
   getLatestFollowerPositions(copyProfileId: string): Promise<FollowerPositionPoint[]>;
+  listOpenPendingTokenIds(copyProfileId: string): Promise<string[]>;
   upsertPendingDelta(input: PendingDeltaInput): Promise<PendingDeltaRecord>;
   expireOppositePendingDeltas(copyProfileId: string, tokenId: string, side: PendingDeltaSide): Promise<number>;
   clearTokenPendingDeltas(copyProfileId: string, tokenId: string): Promise<number>;
   findOpenCopyAttemptForPendingDelta(pendingDeltaId: string): Promise<OpenCopyAttemptRecord | null>;
   createCopyAttempt(input: {
     copyProfileId: string;
+    leaderId?: string;
     pendingDeltaId: string;
     tokenId: string;
     marketId?: string;

@@ -20,6 +20,41 @@ const booleanFromEnv = z.preprocess((value) => {
   return value;
 }, z.boolean());
 
+const optionalPositiveNumberFromEnv = z.preprocess((value) => {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value === "string" && value.trim().length === 0) {
+    return undefined;
+  }
+
+  return value;
+}, z.coerce.number().positive().optional());
+
+function normalizeSignatureType(raw: unknown): unknown {
+  if (typeof raw !== "string") {
+    return raw;
+  }
+
+  const value = raw.trim();
+  if (value.length === 0) {
+    return value;
+  }
+
+  if (value === "0") {
+    return "EOA";
+  }
+  if (value === "1") {
+    return "POLY_PROXY";
+  }
+  if (value === "2") {
+    return "POLY_GNOSIS_SAFE";
+  }
+
+  return value.toUpperCase();
+}
+
 export const WorkerEnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -28,6 +63,13 @@ export const WorkerEnvSchema = z.object({
   POLYMARKET_API_KEY: z.string().min(1),
   POLYMARKET_API_SECRET: z.string().min(1),
   POLYMARKET_PASSPHRASE: z.string().min(1),
+  POLYMARKET_FOLLOWER_PRIVATE_KEY: z.string().min(1).optional(),
+  POLYMARKET_CHAIN_ID: z.coerce.number().int().positive().default(137),
+  POLYMARKET_SIGNATURE_TYPE: z.preprocess(
+    normalizeSignatureType,
+    z.enum(["EOA", "POLY_PROXY", "POLY_GNOSIS_SAFE"]).default("EOA")
+  ),
+  POLYMARKET_FUNDER_ADDRESS: z.string().min(1).optional(),
   ALCHEMY_WS_URL: z.string().url(),
   DATA_API_BASE_URL: z.string().url().default("https://data-api.polymarket.com"),
   CLOB_REST_BASE_URL: z.string().url().default("https://clob.polymarket.com"),
@@ -65,6 +107,7 @@ export const WorkerEnvSchema = z.object({
   MARKET_CACHE_REST_PRICE_TTL_MS: z.coerce.number().int().positive().default(45000),
   MARKET_CACHE_REDIS_TTL_SECONDS: z.coerce.number().int().positive().default(1800),
   LEADER_TRADES_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(30),
+  LEADER_TRADES_TAKER_ONLY: booleanFromEnv.default(false),
   LEADER_POLL_PAGE_LIMIT: z.coerce.number().int().positive().default(100),
   LEADER_POLL_BATCH_SIZE: z.coerce.number().int().positive().default(5),
   LEADER_POLL_MAX_RETRIES: z.coerce.number().int().nonnegative().default(5),
@@ -76,6 +119,7 @@ export const WorkerEnvSchema = z.object({
   MAX_WORSENING_SELL_USD: z.coerce.number().nonnegative().default(0.06),
   MAX_SLIPPAGE_BPS: z.coerce.number().int().nonnegative().default(200),
   MAX_SPREAD_USD: z.coerce.number().nonnegative().default(0.03),
+  MAX_PRICE_PER_SHARE_USD: optionalPositiveNumberFromEnv,
   ATTEMPT_EXPIRATION_SECONDS: z.coerce.number().int().positive().default(7200),
   COOLDOWN_PER_MARKET_SECONDS: z.coerce.number().int().nonnegative().default(5),
   MAX_EXPOSURE_PER_LEADER_USD: z.coerce.number().positive().default(100),
@@ -90,5 +134,21 @@ export const WorkerEnvSchema = z.object({
 export type WorkerEnv = z.infer<typeof WorkerEnvSchema>;
 
 export function parseWorkerEnv(input: NodeJS.ProcessEnv = process.env): WorkerEnv {
-  return WorkerEnvSchema.parse(input);
+  return WorkerEnvSchema.parse(normalizeWorkerEnvInput(input));
+}
+
+function normalizeWorkerEnvInput(input: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const normalized: NodeJS.ProcessEnv = { ...input };
+
+  normalized.POLYMARKET_FOLLOWER_PRIVATE_KEY ??=
+    input.POLYMARKET_FOLLOWER_PRIVATE_KEY ?? input.FOLLOWER_PRIVATE_KEY ?? input.PRIVATE_KEY;
+
+  normalized.POLYMARKET_CHAIN_ID ??= input.POLYMARKET_CHAIN_ID ?? input.CHAIN_ID;
+
+  if (typeof input.POLYMARKET_FUNDER_ADDRESS === "string") {
+    const trimmed = input.POLYMARKET_FUNDER_ADDRESS.trim();
+    normalized.POLYMARKET_FUNDER_ADDRESS = trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  return normalized;
 }

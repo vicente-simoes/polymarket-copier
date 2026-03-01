@@ -11,6 +11,8 @@ Expected env (one of):
 Optional env:
   - CLOB_REST_BASE_URL (default: https://clob.polymarket.com)
   - POLYMARKET_CHAIN_ID or CHAIN_ID (default: 137)
+  - POLYMARKET_SIGNATURE_TYPE (EOA | POLY_PROXY | POLY_GNOSIS_SAFE | 0 | 1 | 2; default: EOA)
+  - POLYMARKET_FUNDER_ADDRESS (required for POLY_PROXY / POLY_GNOSIS_SAFE)
 
 Usage:
   pnpm polymarket:creds
@@ -42,6 +44,31 @@ function parsePositiveInt(raw, fallback) {
     return fallback;
   }
   return Math.trunc(parsed);
+}
+
+function parseSignatureType(raw) {
+  const value = typeof raw === "string" ? raw.trim().toUpperCase() : "";
+  if (value.length === 0 || value === "EOA" || value === "0") {
+    return { code: 0, name: "EOA" };
+  }
+  if (value === "POLY_PROXY" || value === "1") {
+    return { code: 1, name: "POLY_PROXY" };
+  }
+  if (value === "POLY_GNOSIS_SAFE" || value === "2") {
+    return { code: 2, name: "POLY_GNOSIS_SAFE" };
+  }
+
+  throw new Error(
+    `Unsupported POLYMARKET_SIGNATURE_TYPE=${String(raw)}. Expected EOA, POLY_PROXY, POLY_GNOSIS_SAFE (or 0/1/2).`
+  );
+}
+
+function parseOptionalAddress(raw) {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function mask(value) {
@@ -124,6 +151,21 @@ async function main() {
     firstNonEmpty([process.env.POLYMARKET_CHAIN_ID, process.env.CHAIN_ID]),
     137
   );
+  const signatureType = parseSignatureType(process.env.POLYMARKET_SIGNATURE_TYPE);
+  const funderAddress = parseOptionalAddress(process.env.POLYMARKET_FUNDER_ADDRESS);
+  const needsFunder = signatureType.code === 1 || signatureType.code === 2;
+
+  if (needsFunder && !funderAddress) {
+    console.error(
+      `POLYMARKET_FUNDER_ADDRESS is required when POLYMARKET_SIGNATURE_TYPE=${signatureType.name}.`
+    );
+    process.exit(1);
+  }
+
+  if (funderAddress && !/^0x[a-fA-F0-9]{40}$/.test(funderAddress)) {
+    console.error("Invalid POLYMARKET_FUNDER_ADDRESS format. Expected 0x + 40 hex chars.");
+    process.exit(1);
+  }
 
   const { ClobClient, Wallet } = await loadDeps();
   const signer = new Wallet(privateKey);
@@ -132,14 +174,18 @@ async function main() {
   console.log(`Host: ${host}`);
   console.log(`Chain ID: ${chainId}`);
   console.log(`Signer: ${signer.address}`);
+  console.log(`Signature type: ${signatureType.name} (${signatureType.code})`);
+  if (funderAddress) {
+    console.log(`Funder: ${funderAddress}`);
+  }
 
   let client;
   try {
-    client = new ClobClient(host, chainId, signer);
+    client = new ClobClient(host, chainId, signer, undefined, signatureType.code, funderAddress ?? undefined);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error("");
-    console.error("Failed to construct ClobClient with (host, chainId, signer).");
+    console.error("Failed to construct ClobClient with (host, chainId, signer, signatureType, funderAddress).");
     console.error("The SDK constructor signature may differ from this script version.");
     console.error(`Constructor error: ${message}`);
     process.exit(1);

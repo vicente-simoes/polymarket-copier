@@ -117,7 +117,9 @@ const insetRowClass =
   'flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-white/[0.02] px-4 py-3 transition-colors hover:bg-white/[0.04]'
 
 export default function OverviewPage() {
-  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<OverviewData>('/api/v1/overview')
+  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<OverviewData>('/api/v1/overview', {
+    refreshIntervalMs: 20_000
+  })
 
   if (isLoading && !data) {
     return <LoadingState title="Loading overview" description="Collecting exposure, PnL, and health metrics." />

@@ -10,8 +10,14 @@ interface QueryState<TData> {
   error: string | null
 }
 
-export function useApiQuery<TData>(url: string, options?: { enabled?: boolean }) {
+interface ApiQueryOptions {
+  enabled?: boolean
+  refreshIntervalMs?: number
+}
+
+export function useApiQuery<TData>(url: string, options?: ApiQueryOptions) {
   const enabled = options?.enabled ?? true
+  const refreshIntervalMs = options?.refreshIntervalMs ?? 0
   const [state, setState] = useState<QueryState<TData>>({
     data: null,
     generatedAt: null,
@@ -58,6 +64,23 @@ export function useApiQuery<TData>(url: string, options?: { enabled?: boolean })
 
     void refresh()
   }, [enabled, refresh])
+
+  useEffect(() => {
+    if (!enabled || refreshIntervalMs <= 0) {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      if (document.hidden) {
+        return
+      }
+      void refresh()
+    }, refreshIntervalMs)
+
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [enabled, refresh, refreshIntervalMs])
 
   return {
     ...state,

@@ -8,6 +8,7 @@ import type {
   TriggerDeduper
 } from "./types.js";
 import { ORDER_FILLED_TOPIC0, ORDERS_MATCHED_TOPIC0 } from "./types.js";
+import { buildCanonicalTradeKey } from "../ingestion/canonical-trade-key.js";
 
 const WS_READY_STATE_OPEN = 1;
 
@@ -172,6 +173,15 @@ export class ChainTriggerPipeline {
 
     if (decoded.removed) {
       this.status.rollbackTriggers += 1;
+      const canonicalKey = buildCanonicalTradeKey({
+        leaderId: decoded.leaderId,
+        walletAddress: decoded.leaderWallet,
+        tokenId: decoded.tokenId,
+        side: decoded.side,
+        shares: decoded.shares,
+        price: decoded.price,
+        leaderFillAtMs: decoded.leaderFillAtMs
+      });
       await this.store.markTriggerRollback({
         triggerId: decoded.triggerId,
         leaderId: decoded.leaderId,
@@ -180,7 +190,8 @@ export class ChainTriggerPipeline {
         payload: {
           event: decoded.event,
           transactionHash: decoded.transactionHash,
-          logIndex: decoded.logIndex
+          logIndex: decoded.logIndex,
+          canonicalKey
         }
       });
 
@@ -202,8 +213,13 @@ export class ChainTriggerPipeline {
       return;
     }
 
-    await this.store.persistChainTrigger(decoded);
-    this.status.persistedTriggers += 1;
+    const persisted = await this.store.persistChainTrigger(decoded);
+    if (persisted.inserted) {
+      this.status.persistedTriggers += 1;
+      return;
+    }
+
+    this.status.duplicateTriggers += 1;
   }
 
   private connect(): void {
@@ -324,7 +340,33 @@ export class ChainTriggerPipeline {
           "logs",
           {
             address: contract,
-            topics: [ORDERS_MATCHED_TOPIC0, null, walletTopics]
+            topics: [ORDER_FILLED_TOPIC0, null, null, walletTopics]
+          }
+        ]
+      });
+
+      this.sendRpc({
+        jsonrpc: "2.0",
+        id: this.nextRpcRequestId++,
+        method: "eth_subscribe",
+        params: [
+          "logs",
+          {
+            address: contract,
+            topics: [ORDERS_MATCHED_TOPIC0, null, walletTopics, null]
+          }
+        ]
+      });
+
+      this.sendRpc({
+        jsonrpc: "2.0",
+        id: this.nextRpcRequestId++,
+        method: "eth_subscribe",
+        params: [
+          "logs",
+          {
+            address: contract,
+            topics: [ORDERS_MATCHED_TOPIC0, null, null, walletTopics]
           }
         ]
       });

@@ -29,6 +29,7 @@ export interface ExecutionEngineDeps {
     negRisk?: boolean;
     isStale: boolean;
     priceSource: "WS" | "REST" | "NONE";
+    wsConnected?: boolean;
   }>;
   fetchOrderBook: (tokenId: string) => Promise<{
     tokenId: string;
@@ -232,9 +233,41 @@ export class ExecutionEngine {
       return "DEFERRED";
     }
 
+    const pendingState = resolvePendingDeltaState(context, attempt);
+    if (pendingState.terminalExpired) {
+      await this.deferAttempt(attempt, "EXPIRED", {
+        nowDate,
+        incrementRetry: false,
+        forceTerminal: "EXPIRED",
+        message: pendingState.message,
+        context: {
+          pendingDeltaStatus: context.pendingDeltaStatus ?? null,
+          pendingDeltaId: context.pendingDeltaId ?? null
+        }
+      });
+      return "DEFERRED";
+    }
+
+    if (pendingState.deferReason) {
+      await this.deferAttempt(attempt, pendingState.deferReason, {
+        nowDate,
+        incrementRetry: false,
+        message: pendingState.message,
+        context: {
+          pendingDeltaStatus: context.pendingDeltaStatus ?? null,
+          pendingDeltaBlockReason: context.pendingDeltaBlockReason ?? null
+        }
+      });
+      this.status.totalControlBlocks += 1;
+      return "DEFERRED";
+    }
+
+    const effectiveDeltaShares = pendingState.deltaShares;
+    const effectiveDeltaNotionalUsd = pendingState.deltaNotionalUsd;
+
     const dailySpent = await this.store.getNotionalTurnoverUsd(attempt.copyProfileId, new Date(nowMs - 86_400_000));
     const hourlySpent = await this.store.getNotionalTurnoverUsd(attempt.copyProfileId, new Date(nowMs - 3_600_000));
-    const baselineNotional = positiveOrZero(attempt.accumulatedDeltaNotionalUsd);
+    const baselineNotional = positiveOrZero(effectiveDeltaNotionalUsd);
 
     if (dailySpent + baselineNotional > this.config.maxDailyNotionalTurnoverUsd) {
       await this.deferAttempt(attempt, "RATE_LIMIT", {
@@ -295,14 +328,18 @@ export class ExecutionEngine {
     }
 
     if (market.isStale || market.midPrice === undefined || market.midPrice <= 0) {
-      const reason = market.priceSource === "NONE" ? "MARKET_WS_DISCONNECTED" : "STALE_PRICE";
+      const reason =
+        market.priceSource === "NONE" && market.wsConnected === false
+          ? "MARKET_WS_DISCONNECTED"
+          : "STALE_PRICE";
       await this.deferAttempt(attempt, reason, {
         nowDate,
         incrementRetry: true,
         message: "stale or missing market prices",
         context: {
           priceSource: market.priceSource,
-          isStale: market.isStale
+          isStale: market.isStale,
+          wsConnected: market.wsConnected
         }
       });
       this.status.totalGuardrailBlocks += 1;
@@ -338,22 +375,32 @@ export class ExecutionEngine {
       return "DEFERRED";
     }
 
-    const leaderPrice = resolveLeaderPrice(context, attempt);
+    const bookBestBid = bestBidPrice(book.bids);
+    const bookBestAsk = bestAskPrice(book.asks);
+    const guardBestBid = bookBestBid ?? market.bestBid;
+    const guardBestAsk = bookBestAsk ?? market.bestAsk;
+    const guardMidPrice =
+      guardBestBid !== undefined && guardBestAsk !== undefined
+        ? (guardBestBid + guardBestAsk) / 2
+        : market.midPrice;
+
+    const leaderPrice = resolveLeaderPrice(context, attempt, effectiveDeltaShares, effectiveDeltaNotionalUsd);
+    const effectiveMaxPricePerShare = resolveMaxPricePerShare(this.config.maxPricePerShare, context);
     const plan = planExecution({
       side: attempt.side,
-      deltaShares: attempt.accumulatedDeltaShares,
+      deltaShares: effectiveDeltaShares,
       minOrderSize: market.minOrderSize,
       minNotionalUsd: this.config.minNotionalUsd,
       leaderPrice,
-      midPrice: market.midPrice,
-      bestBid: market.bestBid,
-      bestAsk: market.bestAsk,
+      midPrice: guardMidPrice,
+      bestBid: guardBestBid,
+      bestAsk: guardBestAsk,
       tickSize: market.tickSize,
       maxWorseningBuyUsd: this.config.maxWorseningBuyUsd,
       maxWorseningSellUsd: this.config.maxWorseningSellUsd,
       maxSlippageBps: this.config.maxSlippageBps,
       maxSpreadUsd: this.config.maxSpreadUsd,
-      maxPricePerShare: this.config.maxPricePerShare,
+      maxPricePerShare: effectiveMaxPricePerShare,
       book: {
         tokenId: attempt.tokenId,
         marketId: market.marketId ?? attempt.marketId,
@@ -517,14 +564,15 @@ export class ExecutionEngine {
       });
       return "PLACED";
     } catch (error) {
+      const message = toErrorMessage(error);
       await this.store.markCopyOrderFailure({
         copyOrderId: orderRecord.id,
         orderStatus: "FAILED",
         attemptTransition: this.transitionFor(attempt, {
-          reason: "UNKNOWN",
+          reason: classifySubmitErrorReason(message),
           attemptedAt: nowDate,
           incrementRetry: true,
-          message: toErrorMessage(error),
+          message,
           context: {
             stage: "submit_order"
           }
@@ -621,7 +669,12 @@ export class ExecutionEngine {
   }
 }
 
-function resolveLeaderPrice(context: ExecutionAttemptContext, attempt: ExecutionAttemptRecord): number | undefined {
+function resolveLeaderPrice(
+  context: ExecutionAttemptContext,
+  attempt: ExecutionAttemptRecord,
+  effectiveDeltaShares: number,
+  effectiveDeltaNotionalUsd: number
+): number | undefined {
   const metadata = context.pendingDeltaMetadata;
   const byTokenPrice = readNumber(metadata.tokenPrice);
   if (byTokenPrice && byTokenPrice > 0) {
@@ -631,6 +684,10 @@ function resolveLeaderPrice(context: ExecutionAttemptContext, attempt: Execution
   const byLeaderPrice = readNumber(metadata.leaderPrice);
   if (byLeaderPrice && byLeaderPrice > 0) {
     return byLeaderPrice;
+  }
+
+  if (effectiveDeltaShares > 0 && effectiveDeltaNotionalUsd > 0) {
+    return effectiveDeltaNotionalUsd / effectiveDeltaShares;
   }
 
   if (attempt.accumulatedDeltaShares > 0 && attempt.accumulatedDeltaNotionalUsd > 0) {
@@ -669,6 +726,16 @@ function resolveLeaderWeights(context: ExecutionAttemptContext, fallbackLeaderId
   return weights;
 }
 
+function resolveMaxPricePerShare(defaultValue: number | undefined, context: ExecutionAttemptContext): number | undefined {
+  if (context.maxPricePerShareOverride === null) {
+    return undefined;
+  }
+  if (context.maxPricePerShareOverride !== undefined) {
+    return context.maxPricePerShareOverride;
+  }
+  return defaultValue;
+}
+
 function normalizePlacedStatus(result: ExecutionOrderResult): "PLACED" | "PARTIALLY_FILLED" | "FILLED" | null {
   if (!result.status || result.status === "PLACED") {
     return "PLACED";
@@ -683,6 +750,32 @@ function normalizePlacedStatus(result: ExecutionOrderResult): "PLACED" | "PARTIA
   }
 
   return null;
+}
+
+function bestBidPrice(levels: ExecutionBookLevel[]): number | undefined {
+  let best: number | undefined;
+  for (const level of levels) {
+    if (level.price <= 0 || level.size <= 0) {
+      continue;
+    }
+    if (best === undefined || level.price > best) {
+      best = level.price;
+    }
+  }
+  return best;
+}
+
+function bestAskPrice(levels: ExecutionBookLevel[]): number | undefined {
+  let best: number | undefined;
+  for (const level of levels) {
+    if (level.price <= 0 || level.size <= 0) {
+      continue;
+    }
+    if (best === undefined || level.price < best) {
+      best = level.price;
+    }
+  }
+  return best;
 }
 
 function isPlacedLike(status: string): boolean {
@@ -729,4 +822,165 @@ function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function classifySubmitErrorReason(message: string): ExecutionSkipReason {
+  const normalized = message.toLowerCase();
+  if (normalized.includes("balance") || normalized.includes("allowance")) {
+    return "RATE_LIMIT";
+  }
+  return "UNKNOWN";
+}
+
+function resolvePendingDeltaState(
+  context: ExecutionAttemptContext,
+  attempt: ExecutionAttemptRecord
+): {
+  deltaShares: number;
+  deltaNotionalUsd: number;
+  deferReason?: ExecutionSkipReason;
+  terminalExpired: boolean;
+  message: string;
+} {
+  const deltaShares = resolveLiveDeltaShares(context, attempt);
+  const deltaNotionalUsd = resolveLiveDeltaNotional(context, attempt, deltaShares);
+
+  if (deltaShares <= 0) {
+    return {
+      deltaShares,
+      deltaNotionalUsd,
+      terminalExpired: true,
+      message: "pending delta is empty"
+    };
+  }
+
+  if (attempt.pendingDeltaId && !context.pendingDeltaStatus) {
+    return {
+      deltaShares,
+      deltaNotionalUsd,
+      terminalExpired: true,
+      message: "pending delta is missing"
+    };
+  }
+
+  if (context.pendingDeltaStatus === "CONVERTED" || context.pendingDeltaStatus === "EXPIRED") {
+    return {
+      deltaShares,
+      deltaNotionalUsd,
+      terminalExpired: true,
+      message: `pending delta is ${context.pendingDeltaStatus.toLowerCase()}`
+    };
+  }
+
+  if (context.pendingDeltaStatus === "BLOCKED" || context.pendingDeltaStatus === "PENDING") {
+    const reason = mapPendingDeltaReason(context.pendingDeltaBlockReason, context.pendingDeltaMetadata);
+    return {
+      deltaShares,
+      deltaNotionalUsd,
+      deferReason: reason,
+      terminalExpired: false,
+      message: `pending delta is ${context.pendingDeltaStatus.toLowerCase()}`
+    };
+  }
+
+  return {
+    deltaShares,
+    deltaNotionalUsd,
+    terminalExpired: false,
+    message: "pending delta is eligible"
+  };
+}
+
+function resolveLiveDeltaShares(context: ExecutionAttemptContext, attempt: ExecutionAttemptRecord): number {
+  const fromPending = positiveOrZero(context.pendingDeltaShares ?? Number.NaN);
+  if (fromPending > 0) {
+    return fromPending;
+  }
+  return positiveOrZero(attempt.accumulatedDeltaShares);
+}
+
+function resolveLiveDeltaNotional(context: ExecutionAttemptContext, attempt: ExecutionAttemptRecord, deltaShares: number): number {
+  const fromPending = positiveOrZero(context.pendingDeltaNotionalUsd ?? Number.NaN);
+  if (fromPending > 0) {
+    return fromPending;
+  }
+
+  const fromAttempt = positiveOrZero(attempt.accumulatedDeltaNotionalUsd);
+  if (fromAttempt > 0) {
+    return fromAttempt;
+  }
+
+  const tokenPrice = readNumber(context.pendingDeltaMetadata.tokenPrice);
+  if (tokenPrice && tokenPrice > 0 && deltaShares > 0) {
+    return deltaShares * tokenPrice;
+  }
+  return 0;
+}
+
+function mapPendingDeltaReason(blockReason: string | undefined, metadata: Record<string, unknown>): ExecutionSkipReason {
+  const fromBlock = normalizeSkipReason(blockReason);
+  if (fromBlock) {
+    return fromBlock;
+  }
+  const thresholdReason = normalizeSkipReason(readString(metadata.thresholdReason));
+  if (thresholdReason) {
+    return thresholdReason;
+  }
+  return "UNKNOWN";
+}
+
+function normalizeSkipReason(value: string | undefined): ExecutionSkipReason | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (value === "MIN_NOTIONAL") {
+    return "MIN_NOTIONAL";
+  }
+  if (value === "MIN_ORDER_SIZE") {
+    return "MIN_ORDER_SIZE";
+  }
+  if (value === "SLIPPAGE") {
+    return "SLIPPAGE";
+  }
+  if (value === "PRICE_GUARD") {
+    return "PRICE_GUARD";
+  }
+  if (value === "SPREAD") {
+    return "SPREAD";
+  }
+  if (value === "THIN_BOOK") {
+    return "THIN_BOOK";
+  }
+  if (value === "STALE_PRICE") {
+    return "STALE_PRICE";
+  }
+  if (value === "MARKET_WS_DISCONNECTED") {
+    return "MARKET_WS_DISCONNECTED";
+  }
+  if (value === "RATE_LIMIT") {
+    return "RATE_LIMIT";
+  }
+  if (value === "KILL_SWITCH") {
+    return "KILL_SWITCH";
+  }
+  if (value === "LEADER_PAUSED") {
+    return "LEADER_PAUSED";
+  }
+  if (value === "EXPIRED") {
+    return "EXPIRED";
+  }
+  if (value === "BOOK_UNAVAILABLE") {
+    return "BOOK_UNAVAILABLE";
+  }
+  if (value === "UNKNOWN") {
+    return "UNKNOWN";
+  }
+  return undefined;
+}
+
+function readString(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value;
+  }
+  return undefined;
 }

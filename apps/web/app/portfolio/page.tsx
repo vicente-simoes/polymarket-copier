@@ -131,7 +131,9 @@ export default function PortfolioPage() {
     })
   }, [range, page])
 
-  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<PortfolioData>(query)
+  const { data, generatedAt, isLoading, error, refresh } = useApiQuery<PortfolioData>(query, {
+    refreshIntervalMs: 20_000
+  })
 
   if (isLoading && !data) {
     return <LoadingState title="Loading portfolio" description="Fetching summary cards and chart series." />

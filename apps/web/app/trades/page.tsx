@@ -1,5 +1,6 @@
 'use client'
 
+import Link from 'next/link'
 import { FormEvent, useMemo, useState } from 'react'
 import { Activity, Clock3, DatabaseZap, Filter, RadioTower } from 'lucide-react'
 import { useApiQuery } from '@/components/dashboard/use-api-query'
@@ -24,9 +25,11 @@ interface TradesData {
     wsReceivedAtMs: string | null
     detectedAtMs: string
     detectLagMs: number
+    isBackfill: boolean
     wsLagMs: number | null
     marketId: string | null
     marketLabel: string | null
+    marketSlug: string | null
     tokenId: string
     outcome: string | null
     side: 'BUY' | 'SELL'
@@ -59,6 +62,49 @@ const inputClass =
 
 const outlineButtonClass = 'rounded-xl border-white/10 bg-white/[0.02] text-[#E7E7E7] hover:bg-white/[0.06] hover:text-white'
 
+function toPolymarketMarketUrl(marketSlug: string | null | undefined): string | null {
+  if (!marketSlug) {
+    return null
+  }
+  const normalized = marketSlug.trim().replace(/^\/+|\/+$/g, '')
+  if (!normalized) {
+    return null
+  }
+  const encodedPath = normalized
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/')
+
+  if (!encodedPath) {
+    return null
+  }
+
+  return `https://polymarket.com/event/${encodedPath}`
+}
+
+function MarketLink({
+  marketSlug,
+  marketLabel,
+  fallback
+}: {
+  marketSlug: string | null | undefined
+  marketLabel: string | null | undefined
+  fallback: string
+}) {
+  const label = marketLabel ?? fallback
+  const href = toPolymarketMarketUrl(marketSlug)
+  if (!href) {
+    return <span className="text-[#E7E7E7]">{label}</span>
+  }
+  return (
+    <Link href={href} target="_blank" rel="noreferrer" className="text-[#E7E7E7] underline-offset-4 hover:underline">
+      {label}
+    </Link>
+  )
+}
+
 export default function TradesPage() {
   const [page, setPage] = useState(1)
   const [leaderFilter, setLeaderFilter] = useState('ALL')
@@ -76,8 +122,10 @@ export default function TradesPage() {
     })
   }, [leaderFilter, sourceFilter, searchFilter, page])
 
-  const tradesState = useApiQuery<TradesData>(query)
-  const leadersState = useApiQuery<LeaderListForFilter>('/api/v1/leaders?page=1&pageSize=200')
+  const tradesState = useApiQuery<TradesData>(query, { refreshIntervalMs: 15_000 })
+  const leadersState = useApiQuery<LeaderListForFilter>('/api/v1/leaders?page=1&pageSize=200', {
+    refreshIntervalMs: 30_000
+  })
 
   if (tradesState.isLoading && !tradesState.data) {
     return <LoadingState title="Loading trades" description="Fetching leader trade log and latency metrics." />
@@ -103,8 +151,10 @@ export default function TradesPage() {
 
   const visibleTrades = tradesState.data.items
   const visibleNotional = visibleTrades.reduce((sum, row) => sum + row.notionalUsd, 0)
+  const realtimeTrades = visibleTrades.filter((row) => !row.isBackfill)
+  const backfillRows = visibleTrades.length - realtimeTrades.length
   const avgDetectLagMs =
-    visibleTrades.length > 0 ? visibleTrades.reduce((sum, row) => sum + row.detectLagMs, 0) / visibleTrades.length : 0
+    realtimeTrades.length > 0 ? realtimeTrades.reduce((sum, row) => sum + row.detectLagMs, 0) / realtimeTrades.length : 0
   const wsRows = visibleTrades.filter((row) => row.source === 'CHAIN').length
   const restRows = visibleTrades.filter((row) => row.source === 'DATA_API').length
 
@@ -147,8 +197,12 @@ export default function TradesPage() {
               <p className="text-xs uppercase tracking-[0.16em] text-[#919191]">Avg Detect Lag</p>
               <Clock3 className="size-4 text-amber-300" />
             </div>
-            <p className="mt-2 text-xl font-semibold text-[#E7E7E7]">{formatLatencyMs(avgDetectLagMs || 0)}</p>
-            <p className="text-xs text-[#919191]">Current page average</p>
+            <p className="mt-2 text-xl font-semibold text-[#E7E7E7]">
+              {realtimeTrades.length > 0 ? formatLatencyMs(avgDetectLagMs) : 'Backfill only'}
+            </p>
+            <p className="text-xs text-[#919191]">
+              Current page average{backfillRows > 0 ? ` (excludes ${formatNumber(backfillRows, 0)} backfill)` : ''}
+            </p>
           </div>
           <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
             <div className="flex items-center justify-between gap-2">
@@ -269,10 +323,14 @@ export default function TradesPage() {
                         <TableCell className="sticky left-0 bg-[#101010] px-3 text-[#CFCFCF]">
                           {formatDateTime(new Date(Number(row.leaderFillAtMs)).toISOString())}
                         </TableCell>
-                        <TableCell className="px-3 text-[#E7E7E7]">{formatLatencyMs(row.detectLagMs)}</TableCell>
+                        <TableCell className="px-3 text-[#E7E7E7]">
+                          {row.isBackfill ? 'Backfill' : formatLatencyMs(row.detectLagMs)}
+                        </TableCell>
                         <TableCell className="px-3 text-[#E7E7E7]">{row.leaderName}</TableCell>
                         <TableCell className="px-3">
-                          <p className="text-[#E7E7E7]">{row.marketLabel ?? row.marketId ?? row.tokenId}</p>
+                          <p>
+                            <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                          </p>
                           <p className="text-xs text-[#CFCFCF]">{row.outcome ?? 'Unknown outcome'}</p>
                         </TableCell>
                         <TableCell className="px-3 text-[#E7E7E7]">{row.side}</TableCell>
@@ -297,16 +355,22 @@ export default function TradesPage() {
                         <StatusPill label={row.sourceLabel} tone={row.source === 'CHAIN' ? 'positive' : 'warning'} />
                       </div>
                       <p className="text-xs text-[#919191]">{formatDateTime(new Date(Number(row.leaderFillAtMs)).toISOString())}</p>
-                      <p className="text-xs text-[#919191]">{row.marketLabel ?? row.marketId ?? row.tokenId}</p>
+                      <p className="text-xs text-[#919191]">
+                        <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                      </p>
                     </summary>
                     <div className="mt-2 space-y-1 text-sm text-[#E7E7E7]">
                       <p>Leader: {row.leaderName}</p>
                       <p>Outcome: {row.outcome ?? 'Unknown outcome'}</p>
+                      <p>
+                        Market:{' '}
+                        <MarketLink marketSlug={row.marketSlug} marketLabel={row.marketLabel} fallback={row.marketId ?? row.tokenId} />
+                      </p>
                       <p className="break-all text-[#CFCFCF]">Market ID: {row.marketId ?? 'n/a'}</p>
                       <p className="break-all text-[#CFCFCF]">Token ID: {row.tokenId}</p>
                       <p>Shares: {formatNumber(row.shares)}</p>
                       <p>Price/share: {formatNumber(row.price, 4)}</p>
-                      <p>Detect lag: {formatLatencyMs(row.detectLagMs)}</p>
+                      <p>Detect lag: {row.isBackfill ? 'Backfill' : formatLatencyMs(row.detectLagMs)}</p>
                     </div>
                   </details>
                 ))}

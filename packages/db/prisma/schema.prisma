@@ -233,6 +233,7 @@ model LeaderTradeEvent {
   leaderId        String
   source          LeaderTradeSource
   triggerId       String?
+  canonicalKey    String
   transactionHash String?
   logIndex        Int?
   leaderFillAtMs  BigInt
@@ -251,6 +252,7 @@ model LeaderTradeEvent {
   leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
 
   @@unique([triggerId])
+  @@unique([leaderId, canonicalKey])
   @@unique([transactionHash, logIndex])
   @@index([leaderId, leaderFillAtMs])
   @@index([tokenId, leaderFillAtMs])

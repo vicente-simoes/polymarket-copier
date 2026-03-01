@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -70,6 +70,7 @@ if (!DATABASE_URL) {
           leaderId: leader.id,
           source: "CHAIN",
           triggerId: `${runId}:0`,
+          canonicalKey: `legacy:${runId}:0`,
           transactionHash: `0x${runId.padEnd(64, "a").slice(0, 64)}`,
           logIndex: 0,
           leaderFillAtMs: BigInt(Date.now() - 1000),
@@ -85,6 +86,33 @@ if (!DATABASE_URL) {
           payload: { source: "integration-test" }
         }
       });
+
+      await assert.rejects(
+        () =>
+          prisma.leaderTradeEvent.create({
+            data: {
+              leaderId: leader.id,
+              source: "DATA_API",
+              triggerId: `${runId}:duplicate-canonical`,
+              canonicalKey: `legacy:${runId}:0`,
+              transactionHash: `0x${runId.padEnd(64, "b").slice(0, 64)}`,
+              logIndex: 1,
+              leaderFillAtMs: BigInt(Date.now() - 900),
+              wsReceivedAtMs: null,
+              detectedAtMs: BigInt(Date.now()),
+              marketId: `market-${runId}`,
+              tokenId: `token-${runId}`,
+              outcome: "YES",
+              side: "BUY",
+              shares: "10",
+              price: "0.57",
+              notionalUsd: "5.70",
+              payload: { source: "integration-test-duplicate" }
+            }
+          }),
+        (error: unknown) =>
+          error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002"
+      );
 
       await prisma.leaderPositionSnapshot.create({
         data: {
