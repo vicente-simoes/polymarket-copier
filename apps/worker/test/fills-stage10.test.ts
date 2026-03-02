@@ -34,6 +34,14 @@ class FakeWs extends EventEmitter implements WsLike {
   message(payload: unknown): void {
     this.emit("message", JSON.stringify(payload));
   }
+
+  messageRaw(payload: string): void {
+    this.emit("message", payload);
+  }
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 test("Stage 10 user-channel WS client subscribes and parses trade/order messages", async () => {
@@ -93,6 +101,7 @@ test("Stage 10 user-channel WS client subscribes and parses trade/order messages
 
   assert.deepEqual(seenTrades, ["trade-1"]);
   assert.deepEqual(seenOrders, ["order-1"]);
+  client.disconnect();
 });
 
 test("Stage 10 parsed trade/order payloads expose canonical fields", () => {
@@ -129,6 +138,137 @@ test("Stage 10 parsed trade/order payloads expose canonical fields", () => {
   });
   assert.ok(order);
   assert.equal(order?.orderStatus, "FILLED");
+});
+
+test("Stage 10 user-channel WS sends heartbeat and ignores control frames", async () => {
+  const socket = new FakeWs();
+  const errors: string[] = [];
+
+  const client = new UserChannelWsClient({
+    url: "wss://user.example/ws",
+    apiKey: "key",
+    apiSecret: "secret",
+    passphrase: "pass",
+    createSocket: () => socket,
+    heartbeatIntervalMs: 5,
+    reconnectDelayMs: 50,
+    onError: (message) => {
+      errors.push(message);
+    }
+  });
+
+  client.connect();
+  socket.open();
+  socket.messageRaw("PONG");
+  await wait(25);
+
+  assert.ok(socket.sent.includes("PING"));
+  assert.equal(errors.length, 0);
+
+  const sentCount = socket.sent.length;
+  client.disconnect();
+  await wait(20);
+  assert.equal(socket.sent.length, sentCount);
+});
+
+test("Stage 10 user-channel WS reconnects on close and stays disconnected after manual stop", async () => {
+  const sockets: FakeWs[] = [];
+  const client = new UserChannelWsClient({
+    url: "wss://user.example/ws",
+    apiKey: "key",
+    apiSecret: "secret",
+    passphrase: "pass",
+    createSocket: () => {
+      const socket = new FakeWs();
+      sockets.push(socket);
+      return socket;
+    },
+    reconnectDelayMs: 5,
+    heartbeatIntervalMs: 1_000
+  });
+
+  client.connect();
+  assert.equal(sockets.length, 1);
+  sockets[0]?.open();
+  sockets[0]?.close();
+
+  await wait(20);
+  assert.equal(client.getMetrics().reconnectCount, 1);
+  assert.equal(sockets.length, 2);
+  sockets[1]?.open();
+
+  client.disconnect();
+  const socketCountAfterDisconnect = sockets.length;
+  await wait(20);
+  assert.equal(sockets.length, socketCountAfterDisconnect);
+});
+
+test("Stage 10 timestamp normalization handles seconds, milliseconds, and out-of-range values", () => {
+  const tradeSeconds = parseTradeEvent({
+    event_type: "trade",
+    id: "trade-seconds",
+    asset_id: "token-seconds",
+    side: "BUY",
+    size: "1",
+    price: "0.6",
+    timestamp: "1700000000"
+  });
+  assert.equal(tradeSeconds?.filledAt.getTime(), 1_700_000_000_000);
+
+  const tradeMillis = parseTradeEvent({
+    event_type: "trade",
+    id: "trade-millis",
+    asset_id: "token-millis",
+    side: "BUY",
+    size: "1",
+    price: "0.6",
+    timestamp: "1700000000123"
+  });
+  assert.equal(tradeMillis?.filledAt.getTime(), 1_700_000_000_123);
+
+  const orderSeconds = parseOrderEvent({
+    event_type: "order",
+    id: "order-seconds",
+    original_size: "10",
+    size_matched: "0",
+    timestamp: "1700000200"
+  });
+  assert.equal(orderSeconds?.updatedAt.getTime(), 1_700_000_200_000);
+
+  const orderMillis = parseOrderEvent({
+    event_type: "order",
+    id: "order-millis",
+    original_size: "10",
+    size_matched: "0",
+    timestamp: "1700000200456"
+  });
+  assert.equal(orderMillis?.updatedAt.getTime(), 1_700_000_200_456);
+
+  const originalNow = Date.now;
+  Date.now = () => 1_800_000_000_000;
+  try {
+    const tradeOutOfRange = parseTradeEvent({
+      event_type: "trade",
+      id: "trade-overflow",
+      asset_id: "token-overflow",
+      side: "BUY",
+      size: "1",
+      price: "0.7",
+      timestamp: "999999999999999999999"
+    });
+    assert.equal(tradeOutOfRange?.filledAt.getTime(), 1_800_000_000_000);
+
+    const orderOutOfRange = parseOrderEvent({
+      event_type: "order",
+      id: "order-overflow",
+      original_size: "10",
+      size_matched: "0",
+      timestamp: "999999999999999999999"
+    });
+    assert.equal(orderOutOfRange?.updatedAt.getTime(), 1_800_000_000_000);
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test("Stage 10 allocations reconcile and leader PnL can be derived from allocations", () => {

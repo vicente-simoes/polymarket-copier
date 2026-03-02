@@ -1,6 +1,9 @@
 import type { FillSide, NormalizedOrderCandidate, NormalizedTradeCandidate } from "./types.js";
 
 const WS_READY_STATE_OPEN = 1;
+const CONTROL_FRAME_VALUES = new Set(["PING", "PONG"]);
+const TIMESTAMP_SECONDS_THRESHOLD = 2_000_000_000;
+const MAX_ACCEPTABLE_TIMESTAMP_MS = 4_102_444_800_000;
 
 export interface WsLike {
   readyState: number;
@@ -23,6 +26,8 @@ export interface UserChannelWsClientOptions {
   onOrder?: (event: NormalizedOrderCandidate) => void | Promise<void>;
   onMessage?: () => void;
   onError?: (message: string) => void;
+  heartbeatIntervalMs?: number;
+  reconnectDelayMs?: number;
 }
 
 export interface UserChannelWsMetrics {
@@ -38,6 +43,7 @@ export interface UserChannelWsMetrics {
 }
 
 export class UserChannelWsClient {
+  private static readonly HEARTBEAT_INTERVAL_MS = 10_000;
   private static readonly RECONNECT_DELAY_MS = 3000;
   private readonly url: string;
   private readonly apiKey: string;
@@ -49,8 +55,11 @@ export class UserChannelWsClient {
   private readonly onOrder?: (event: NormalizedOrderCandidate) => void | Promise<void>;
   private readonly onMessage?: () => void;
   private readonly onError?: (message: string) => void;
+  private readonly heartbeatIntervalMs: number;
+  private readonly reconnectDelayMs: number;
   private socket?: WsLike;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
   private closedByUser = false;
   private readonly metrics: UserChannelWsMetrics = {
     connected: false,
@@ -80,6 +89,11 @@ export class UserChannelWsClient {
     this.onOrder = options.onOrder;
     this.onMessage = options.onMessage;
     this.onError = options.onError;
+    this.heartbeatIntervalMs = normalizePositiveInteger(
+      options.heartbeatIntervalMs,
+      UserChannelWsClient.HEARTBEAT_INTERVAL_MS
+    );
+    this.reconnectDelayMs = normalizePositiveInteger(options.reconnectDelayMs, UserChannelWsClient.RECONNECT_DELAY_MS);
   }
 
   connect(): void {
@@ -99,6 +113,7 @@ export class UserChannelWsClient {
       this.metrics.connected = true;
       this.metrics.lastError = undefined;
       this.sendSubscribe();
+      this.startHeartbeat();
     });
 
     socket.on("message", (data) => {
@@ -110,6 +125,7 @@ export class UserChannelWsClient {
 
     socket.on("close", () => {
       this.metrics.connected = false;
+      this.stopHeartbeat();
       this.socket = undefined;
       if (!this.closedByUser) {
         this.scheduleReconnect();
@@ -128,6 +144,7 @@ export class UserChannelWsClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
+    this.stopHeartbeat();
     if (this.socket) {
       this.socket.close();
       this.socket = undefined;
@@ -168,15 +185,30 @@ export class UserChannelWsClient {
     if (!raw) {
       return;
     }
+    const normalized = raw.trim();
+    if (normalized.length === 0 || isControlFrame(normalized)) {
+      return;
+    }
 
     let payload: unknown;
     try {
-      payload = JSON.parse(raw);
+      payload = JSON.parse(normalized);
     } catch {
       this.captureError("Failed to parse user-channel WS message");
       return;
     }
 
+    if (Array.isArray(payload)) {
+      for (const entry of payload) {
+        await this.handleParsedMessage(entry);
+      }
+      return;
+    }
+
+    await this.handleParsedMessage(payload);
+  }
+
+  private async handleParsedMessage(payload: unknown): Promise<void> {
     const trade = parseTradeEvent(payload);
     if (trade) {
       this.metrics.tradeMessages += 1;
@@ -203,8 +235,26 @@ export class UserChannelWsClient {
     this.onError?.(message);
   }
 
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.socket || this.socket.readyState !== WS_READY_STATE_OPEN) {
+        return;
+      }
+      this.socket.send("PING");
+    }, this.heartbeatIntervalMs);
+  }
+
+  private stopHeartbeat(): void {
+    if (!this.heartbeatTimer) {
+      return;
+    }
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+  }
+
   private scheduleReconnect(): void {
-    if (this.reconnectTimer || this.socket) {
+    if (this.closedByUser || this.reconnectTimer || this.socket) {
       return;
     }
 
@@ -220,7 +270,7 @@ export class UserChannelWsClient {
         this.captureError(error instanceof Error ? error.message : String(error));
         this.scheduleReconnect();
       }
-    }, UserChannelWsClient.RECONNECT_DELAY_MS);
+    }, this.reconnectDelayMs);
   }
 }
 
@@ -251,12 +301,14 @@ export function parseTradeEvent(payload: unknown) {
     readNumber(record, "fee_paid") ??
     0;
   const filledUsdcGross = readNumber(record, "filled_usdc") ?? readNumber(record, "usdc") ?? size * price;
-  const timestampSeconds =
+  const fallbackNowMs = Date.now();
+  const timestampMs = normalizeTimestampMs(
     readNumber(record, "timestamp") ??
     readNumber(record, "matchtime") ??
-    readNumber(record, "last_update") ??
-    Math.floor(Date.now() / 1000);
-  const filledAt = new Date(timestampSeconds * 1000);
+    readNumber(record, "last_update"),
+    fallbackNowMs
+  );
+  const filledAt = new Date(timestampMs);
 
   const externalOrderIds = new Set<string>();
   const takerOrderId = readString(record, "taker_order_id");
@@ -308,8 +360,10 @@ export function parseOrderEvent(payload: unknown) {
     return null;
   }
 
-  const updatedAtSeconds =
-    readNumber(record, "timestamp") ?? readNumber(record, "last_update") ?? Math.floor(Date.now() / 1000);
+  const updatedAtMs = normalizeTimestampMs(
+    readNumber(record, "timestamp") ?? readNumber(record, "last_update"),
+    Date.now()
+  );
 
   const originalShares = readNumber(record, "original_size");
   const matchedShares = readNumber(record, "size_matched");
@@ -338,7 +392,7 @@ export function parseOrderEvent(payload: unknown) {
     orderStatus,
     matchedShares,
     originalShares,
-    updatedAt: new Date(updatedAtSeconds * 1000),
+    updatedAt: new Date(updatedAtMs),
     payload: toRecord(record)
   };
 }
@@ -395,6 +449,30 @@ function readNumber(record: Record<string, unknown>, key: string): number | unde
 
 function toRecord(value: Record<string, unknown>): Record<string, unknown> {
   return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+}
+
+function normalizeTimestampMs(rawValue: number | undefined, fallbackMs: number): number {
+  if (rawValue === undefined || !Number.isFinite(rawValue) || rawValue <= 0) {
+    return fallbackMs;
+  }
+
+  const candidateMs = rawValue < TIMESTAMP_SECONDS_THRESHOLD ? rawValue * 1000 : rawValue;
+  if (!Number.isFinite(candidateMs) || candidateMs <= 0 || candidateMs > MAX_ACCEPTABLE_TIMESTAMP_MS) {
+    return fallbackMs;
+  }
+
+  return Math.trunc(candidateMs);
+}
+
+function isControlFrame(value: string): boolean {
+  return CONTROL_FRAME_VALUES.has(value.toUpperCase());
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+  return Math.trunc(value);
 }
 
 interface DomSocketLike {

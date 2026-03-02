@@ -473,6 +473,8 @@ async function ensureActiveCopyProfile(
   tx: Prisma.TransactionClient,
   requestedRatio?: number
 ): Promise<{ id: string; defaultRatio: Prisma.Decimal } | null> {
+  const fallbackFollowerAddress = resolveFallbackFollowerAddress()
+
   const active = await tx.copyProfile.findFirst({
     where: {
       status: 'ACTIVE'
@@ -482,11 +484,24 @@ async function ensureActiveCopyProfile(
     },
     select: {
       id: true,
-      defaultRatio: true
+      defaultRatio: true,
+      followerAddress: true
     }
   })
 
   if (active) {
+    if (fallbackFollowerAddress && normalizeAddress(active.followerAddress) !== fallbackFollowerAddress) {
+      await tx.copyProfile
+        .update({
+          where: {
+            id: active.id
+          },
+          data: {
+            followerAddress: fallbackFollowerAddress
+          }
+        })
+        .catch(() => undefined)
+    }
     return active
   }
 
@@ -496,17 +511,20 @@ async function ensureActiveCopyProfile(
     },
     select: {
       id: true,
-      defaultRatio: true
+      defaultRatio: true,
+      followerAddress: true
     }
   })
 
   if (existing) {
+    const nextFollowerAddress = fallbackFollowerAddress ?? existing.followerAddress
     return tx.copyProfile.update({
       where: {
         id: existing.id
       },
       data: {
-        status: 'ACTIVE'
+        status: 'ACTIVE',
+        followerAddress: nextFollowerAddress
       },
       select: {
         id: true,
@@ -518,7 +536,7 @@ async function ensureActiveCopyProfile(
   return tx.copyProfile.create({
     data: {
       name: 'default',
-      followerAddress: '0x0000000000000000000000000000000000000000',
+      followerAddress: fallbackFollowerAddress ?? '0x0000000000000000000000000000000000000000',
       status: 'ACTIVE',
       defaultRatio: String(requestedRatio ?? 0.05),
       config: {
@@ -538,6 +556,25 @@ function asObject(value: unknown): Record<string, unknown> {
     return {}
   }
   return value as Record<string, unknown>
+}
+
+function resolveFallbackFollowerAddress(): string | null {
+  return normalizeAddress(process.env.POLYMARKET_FUNDER_ADDRESS ?? '')
+}
+
+function normalizeAddress(value: string | null | undefined): string | null {
+  if (!value) {
+    return null
+  }
+
+  const normalized = value.trim().toLowerCase()
+  if (!/^0x[a-f0-9]{40}$/.test(normalized)) {
+    return null
+  }
+  if (normalized === '0x0000000000000000000000000000000000000000') {
+    return null
+  }
+  return normalized
 }
 
 function toStringArray(value: unknown): string[] {

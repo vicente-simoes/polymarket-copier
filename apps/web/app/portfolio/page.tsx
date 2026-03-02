@@ -62,6 +62,7 @@ interface PortfolioData {
     byOutcomeTop: Array<{
       tokenId: string
       marketId: string | null
+      marketName: string | null
       outcome: string | null
       exposureUsd: number
       isOther: boolean
@@ -71,6 +72,7 @@ interface PortfolioData {
     items: Array<{
       tokenId: string
       marketId: string | null
+      marketName: string | null
       outcome: string | null
       shares: number
       currentPrice: number
@@ -107,11 +109,15 @@ function chartLabel(timestamp: string): string {
 
 function outcomeLabel(row: {
   tokenId: string
+  marketName: string | null
   outcome: string | null
   isOther: boolean
 }): string {
   if (row.isOther) {
     return 'Other'
+  }
+  if (row.marketName) {
+    return row.marketName
   }
   if (row.outcome) {
     return row.outcome
@@ -389,10 +395,13 @@ export default function PortfolioPage() {
                     <Tooltip
                       formatter={(value: number) => formatCurrency(value)}
                       labelFormatter={(_, payload) => {
-                        const point = payload?.[0]?.payload as { marketId?: string | null; tokenId?: string; label?: string } | undefined
-                        const market = point?.marketId ?? point?.tokenId ?? 'n/a'
-                        const label = point?.label ?? 'Outcome'
-                        return `${label} (${market})`
+                        const point = payload?.[0]?.payload as { marketName?: string | null; outcome?: string | null; marketId?: string | null; tokenId?: string; label?: string } | undefined
+                        const market = point?.marketName ?? point?.marketId ?? point?.tokenId ?? 'n/a'
+                        const outcome = point?.outcome ?? null
+                        if (outcome) {
+                          return `${market} · ${outcome}`
+                        }
+                        return point?.label ?? market
                       }}
                       contentStyle={{
                         borderRadius: 12,
@@ -438,7 +447,7 @@ export default function PortfolioPage() {
                       <TableRow key={position.tokenId} className="hover:bg-white/[0.03]">
                         <TableCell className="sticky left-0 bg-[#101010] px-3">
                           <Link href={`/portfolio/positions/${position.tokenId}`} className="text-[#E7E7E7] hover:text-white hover:underline">
-                            {position.marketId ?? position.tokenId}
+                            {position.marketName ?? position.marketId ?? position.tokenId}
                           </Link>
                           <p className="text-xs text-[#919191]">{position.outcome ?? 'Unknown outcome'}</p>
                         </TableCell>
@@ -458,7 +467,7 @@ export default function PortfolioPage() {
                   <details key={position.tokenId} className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
                     <summary className="cursor-pointer list-none">
                       <p className="font-medium text-[#E7E7E7]">{position.outcome ?? 'Unknown outcome'}</p>
-                      <p className="text-xs text-[#919191]">{position.marketId ?? position.tokenId}</p>
+                      <p className="text-xs text-[#919191]">{position.marketName ?? position.marketId ?? position.tokenId}</p>
                       <p className="text-sm text-[#E7E7E7]">{formatCurrency(position.currentValueUsd)}</p>
                     </summary>
                     <div className="mt-3 space-y-1 text-sm text-[#E7E7E7]">

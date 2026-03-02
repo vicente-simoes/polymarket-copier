@@ -1,6 +1,7 @@
 import type { MarketWsMetrics } from "./types.js";
 
 const WS_READY_STATE_OPEN = 1;
+const CONTROL_FRAME_VALUES = new Set(["PING", "PONG"]);
 
 export interface MarketPriceUpdate {
   tokenId: string;
@@ -31,17 +32,27 @@ export interface MarketWsClientOptions {
   createSocket?: (url: string) => WsLike;
   onPriceUpdate?: (update: MarketPriceUpdate) => void | Promise<void>;
   onTickSizeUpdate?: (update: TickSizeUpdate) => void | Promise<void>;
+  heartbeatIntervalMs?: number;
+  reconnectDelayMs?: number;
 }
 
 export class MarketWsClient {
+  private static readonly HEARTBEAT_INTERVAL_MS = 10_000;
+  private static readonly RECONNECT_DELAY_MS = 3_000;
   private readonly url: string;
   private readonly now: () => number;
   private readonly createSocket: (url: string) => WsLike;
   private readonly onPriceUpdate?: (update: MarketPriceUpdate) => void | Promise<void>;
   private readonly onTickSizeUpdate?: (update: TickSizeUpdate) => void | Promise<void>;
+  private readonly heartbeatIntervalMs: number;
+  private readonly reconnectDelayMs: number;
   private readonly watchedTokenIds = new Set<string>();
   private readonly subscribedTokenIds = new Set<string>();
   private socket?: WsLike;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private closedByUser = false;
+  private reconnectCount = 0;
   private connected = false;
   private connectedAtMs?: number;
   private disconnectedAtMs?: number;
@@ -63,12 +74,16 @@ export class MarketWsClient {
       });
     this.onPriceUpdate = options.onPriceUpdate;
     this.onTickSizeUpdate = options.onTickSizeUpdate;
+    this.heartbeatIntervalMs = normalizePositiveInteger(options.heartbeatIntervalMs, MarketWsClient.HEARTBEAT_INTERVAL_MS);
+    this.reconnectDelayMs = normalizePositiveInteger(options.reconnectDelayMs, MarketWsClient.RECONNECT_DELAY_MS);
   }
 
   connect(): void {
     if (this.socket) {
       return;
     }
+    this.closedByUser = false;
+    this.clearReconnectTimer();
 
     const socket = this.createSocket(this.url);
     this.socket = socket;
@@ -78,6 +93,7 @@ export class MarketWsClient {
       this.connectedAtMs = this.now();
       this.disconnectedAtMs = undefined;
       this.lastError = undefined;
+      this.startHeartbeat();
       this.resubscribeAll();
     });
 
@@ -95,7 +111,11 @@ export class MarketWsClient {
       this.connected = false;
       this.disconnectedAtMs = this.now();
       this.subscribedTokenIds.clear();
+      this.stopHeartbeat();
       this.socket = undefined;
+      if (!this.closedByUser) {
+        this.scheduleReconnect();
+      }
     });
 
     socket.on("error", (error) => {
@@ -104,13 +124,22 @@ export class MarketWsClient {
   }
 
   disconnect(): void {
+    this.closedByUser = true;
+    this.clearReconnectTimer();
+    this.stopHeartbeat();
+
     if (!this.socket) {
       this.connected = false;
+      this.subscribedTokenIds.clear();
       return;
     }
 
-    this.socket.close();
+    const socket = this.socket;
+    this.socket = undefined;
+    socket.close();
     this.connected = false;
+    this.subscribedTokenIds.clear();
+    this.disconnectedAtMs = this.now();
   }
 
   setWatchedTokenIds(tokenIds: Iterable<string>): void {
@@ -140,22 +169,14 @@ export class MarketWsClient {
     }
 
     if (toUnsubscribe.length > 0) {
-      this.send({
-        type: "unsubscribe",
-        channel: "market",
-        asset_ids: toUnsubscribe
-      });
+      this.sendMarketOperation(toUnsubscribe, "unsubscribe");
       for (const tokenId of toUnsubscribe) {
         this.subscribedTokenIds.delete(tokenId);
       }
     }
 
     if (toSubscribe.length > 0) {
-      this.send({
-        type: "subscribe",
-        channel: "market",
-        asset_ids: toSubscribe
-      });
+      this.sendMarketOperation(toSubscribe, "subscribe");
       for (const tokenId of toSubscribe) {
         this.subscribedTokenIds.add(tokenId);
       }
@@ -167,6 +188,7 @@ export class MarketWsClient {
       connected: this.connected,
       watchedTokenCount: this.watchedTokenIds.size,
       subscribedTokenCount: this.subscribedTokenIds.size,
+      reconnectCount: this.reconnectCount,
       connectedAtMs: this.connectedAtMs,
       disconnectedAtMs: this.disconnectedAtMs,
       lastMessageAtMs: this.lastMessageAtMs,
@@ -184,11 +206,7 @@ export class MarketWsClient {
       return;
     }
 
-    this.send({
-      type: "subscribe",
-      channel: "market",
-      asset_ids: tokenIds
-    });
+    this.sendMarketSubscription(tokenIds);
     this.subscribedTokenIds.clear();
     for (const tokenId of tokenIds) {
       this.subscribedTokenIds.add(tokenId);
@@ -208,15 +226,31 @@ export class MarketWsClient {
   }
 
   private processMessage(raw: string): void {
+    const normalized = raw.trim();
+    if (normalized.length === 0 || isControlFrame(normalized)) {
+      return;
+    }
+
     let payload: unknown;
     try {
-      payload = JSON.parse(raw);
+      payload = JSON.parse(normalized);
     } catch {
       this.lastError = "Failed to parse market WS message";
       return;
     }
 
-    if (!payload || typeof payload !== "object") {
+    if (Array.isArray(payload)) {
+      for (const entry of payload) {
+        this.processPayload(entry);
+      }
+      return;
+    }
+
+    this.processPayload(payload);
+  }
+
+  private processPayload(payload: unknown): void {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
       return;
     }
 
@@ -243,6 +277,68 @@ export class MarketWsClient {
         }
       }
     }
+  }
+
+  private sendMarketSubscription(tokenIds: string[]): void {
+    this.send({
+      type: "market",
+      assets_ids: tokenIds
+    });
+  }
+
+  private sendMarketOperation(tokenIds: string[], operation: "subscribe" | "unsubscribe"): void {
+    this.send({
+      type: "market",
+      assets_ids: tokenIds,
+      operation
+    });
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.isSocketOpen()) {
+        return;
+      }
+      this.socket?.send("PING");
+    }, this.heartbeatIntervalMs);
+  }
+
+  private stopHeartbeat(): void {
+    if (!this.heartbeatTimer) {
+      return;
+    }
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+  }
+
+  private clearReconnectTimer(): void {
+    if (!this.reconnectTimer) {
+      return;
+    }
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closedByUser || this.reconnectTimer || this.socket) {
+      return;
+    }
+
+    this.reconnectCount += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (this.closedByUser || this.socket) {
+        return;
+      }
+
+      try {
+        this.connect();
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : String(error);
+        this.scheduleReconnect();
+      }
+    }, this.reconnectDelayMs);
   }
 
   private rawToString(data: unknown): string | null {
@@ -454,4 +550,20 @@ function readTimestampMs(payload: object, key: string): number | undefined {
   }
 
   return parsed < 2_000_000_000 ? parsed * 1000 : parsed;
+}
+
+function isControlFrame(value: string): boolean {
+  return CONTROL_FRAME_VALUES.has(value.toUpperCase());
+}
+
+function normalizePositiveInteger(value: number | undefined, fallback: number): number {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  return Math.trunc(value);
 }

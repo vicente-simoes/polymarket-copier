@@ -54,9 +54,17 @@ class FakeWs extends EventEmitter implements WsLike {
     this.emit("message", JSON.stringify(payload));
   }
 
+  messageRaw(payload: string): void {
+    this.emit("message", payload);
+  }
+
   error(message: string): void {
     this.emit("error", new Error(message));
   }
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 test("ClobRestClient supports /book and /books response parsing", async () => {
@@ -426,13 +434,19 @@ test("MarketWsClient subscribes by watched set and processes price/tick updates"
   socket.open();
 
   assert.equal(socket.sentMessages.length, 1);
-  assert.match(socket.sentMessages[0] ?? "", /"type":"subscribe"/);
-  assert.match(socket.sentMessages[0] ?? "", /"asset_ids":\["a","b"\]/);
+  assert.match(socket.sentMessages[0] ?? "", /"type":"market"/);
+  assert.match(socket.sentMessages[0] ?? "", /"assets_ids":\["a","b"\]/);
 
   client.setWatchedTokenIds(["b", "c"]);
   assert.equal(socket.sentMessages.length, 3);
-  assert.match(socket.sentMessages[1] ?? "", /"type":"unsubscribe"/);
-  assert.match(socket.sentMessages[2] ?? "", /"type":"subscribe"/);
+  assert.match(socket.sentMessages[1] ?? "", /"type":"market"/);
+  assert.match(socket.sentMessages[1] ?? "", /"assets_ids":\["a"\]/);
+  assert.match(socket.sentMessages[1] ?? "", /"operation":"unsubscribe"/);
+  assert.match(socket.sentMessages[2] ?? "", /"type":"market"/);
+  assert.match(socket.sentMessages[2] ?? "", /"assets_ids":\["c"\]/);
+  assert.match(socket.sentMessages[2] ?? "", /"operation":"subscribe"/);
+
+  socket.messageRaw("PONG");
 
   nowMs += 1_000;
   socket.message({
@@ -453,13 +467,88 @@ test("MarketWsClient subscribes by watched set and processes price/tick updates"
   assert.equal(seenTicks[0]?.tokenId, "c");
   assert.equal(seenTicks[0]?.tickSize, 0.01);
 
+  socket.messageRaw(
+    JSON.stringify([
+      {
+        event_type: "price_change",
+        timestamp: "1690000001000",
+        price_changes: [{ asset_id: "c", best_bid: "0.49", best_ask: "0.53" }]
+      },
+      {
+        event_type: "tick_size_change",
+        timestamp: "1690000001000",
+        tick_size_changes: [{ asset_id: "c", tick_size: "0.02" }]
+      }
+    ])
+  );
+  assert.equal(seenPrices.length, 2);
+  assert.equal(seenTicks.length, 2);
+
   const metricsWhileOpen = client.getMetrics();
   assert.equal(metricsWhileOpen.connected, true);
   assert.equal(metricsWhileOpen.watchedTokenCount, 2);
   assert.equal(metricsWhileOpen.subscribedTokenCount, 2);
+  assert.equal(metricsWhileOpen.reconnectCount, 0);
   assert.ok(metricsWhileOpen.lastMessageAtMs);
+  assert.equal(metricsWhileOpen.lastError, undefined);
 
-  socket.close();
+  client.disconnect();
   const metricsAfterClose = client.getMetrics();
   assert.equal(metricsAfterClose.connected, false);
+});
+
+test("MarketWsClient reconnects and resubscribes after unexpected close", async () => {
+  const sockets: FakeWs[] = [];
+  const client = new MarketWsClient({
+    url: "wss://market.example/ws",
+    createSocket: () => {
+      const socket = new FakeWs();
+      sockets.push(socket);
+      return socket;
+    },
+    reconnectDelayMs: 5,
+    heartbeatIntervalMs: 1_000
+  });
+
+  client.setWatchedTokenIds(["token-r1", "token-r2"]);
+  client.connect();
+  assert.equal(sockets.length, 1);
+
+  sockets[0]?.open();
+  assert.equal(sockets[0]?.sentMessages.length, 1);
+  assert.match(sockets[0]?.sentMessages[0] ?? "", /"type":"market"/);
+  assert.match(sockets[0]?.sentMessages[0] ?? "", /"assets_ids":\["token-r1","token-r2"\]/);
+
+  sockets[0]?.close();
+  await wait(20);
+
+  assert.equal(client.getMetrics().reconnectCount, 1);
+  assert.equal(sockets.length, 2);
+  sockets[1]?.open();
+  assert.equal(sockets[1]?.sentMessages.length, 1);
+  assert.match(sockets[1]?.sentMessages[0] ?? "", /"type":"market"/);
+  assert.match(sockets[1]?.sentMessages[0] ?? "", /"assets_ids":\["token-r1","token-r2"\]/);
+
+  client.disconnect();
+});
+
+test("MarketWsClient sends heartbeat pings and stops after disconnect", async () => {
+  const socket = new FakeWs();
+  const client = new MarketWsClient({
+    url: "wss://market.example/ws",
+    createSocket: () => socket,
+    heartbeatIntervalMs: 5,
+    reconnectDelayMs: 50
+  });
+
+  client.connect();
+  socket.open();
+  await wait(25);
+
+  assert.ok(socket.sentMessages.includes("PING"));
+  const sentCount = socket.sentMessages.length;
+
+  client.disconnect();
+  await wait(20);
+  assert.equal(socket.sentMessages.length, sentCount);
 });

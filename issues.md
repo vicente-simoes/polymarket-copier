@@ -1,0 +1,1 @@
+1. after a potential copy is executed we seemingly still remain with some delta in the potential copies table for this same position (doesn't seem like the leader really bought more after we did)

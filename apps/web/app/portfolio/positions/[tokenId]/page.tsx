@@ -18,6 +18,7 @@ interface PortfolioPositionPayload {
     items: Array<{
       tokenId: string
       marketId: string | null
+      marketName: string | null
       outcome: string | null
       shares: number
       currentPrice: number
@@ -215,7 +216,7 @@ export default function PositionDetailPage() {
             <CardHeader className="px-5 pb-0 md:px-6">
               <CardDescription className="uppercase tracking-[0.18em] text-[#919191]">Asset</CardDescription>
               <CardTitle className="text-[#E7E7E7]">{position.outcome ?? 'Unknown outcome'}</CardTitle>
-              <CardDescription className="truncate text-[#919191]">{position.marketId ?? tokenId}</CardDescription>
+              <CardDescription className="truncate text-[#919191]">{position.marketName ?? position.marketId ?? tokenId}</CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3 px-5 md:px-6 sm:grid-cols-2 xl:grid-cols-4">
               <div className={`${insetClass} p-3`}>

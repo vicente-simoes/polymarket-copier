@@ -1,11 +1,38 @@
 import { Prisma, PrismaClient } from "@copybot/db";
+import type { DataApiPosition } from "@copybot/shared";
+import type { LeaderDataApiClient } from "../leader/types.js";
 import type { ReconcileAuditRecord, ReconcileStore } from "./types.js";
+
+interface PrismaReconcileStoreOptions {
+  prisma: PrismaClient;
+  dataApi?: LeaderDataApiClient;
+  dataApiPageLimit?: number;
+  dataApiMaxPages?: number;
+  followerAddressFallback?: string;
+}
 
 export class PrismaReconcileStore implements ReconcileStore {
   private readonly prisma: PrismaClient;
+  private readonly dataApi?: LeaderDataApiClient;
+  private readonly dataApiPageLimit: number;
+  private readonly dataApiMaxPages: number;
+  private readonly followerAddressFallback?: string;
 
-  constructor(prisma: PrismaClient) {
-    this.prisma = prisma;
+  constructor(prismaOrOptions: PrismaClient | PrismaReconcileStoreOptions) {
+    if ("$connect" in prismaOrOptions) {
+      this.prisma = prismaOrOptions;
+      this.dataApi = undefined;
+      this.dataApiPageLimit = 100;
+      this.dataApiMaxPages = 20;
+      this.followerAddressFallback = undefined;
+      return;
+    }
+
+    this.prisma = prismaOrOptions.prisma;
+    this.dataApi = prismaOrOptions.dataApi;
+    this.dataApiPageLimit = Math.max(1, prismaOrOptions.dataApiPageLimit ?? 100);
+    this.dataApiMaxPages = Math.max(1, prismaOrOptions.dataApiMaxPages ?? 20);
+    this.followerAddressFallback = normalizeAddress(prismaOrOptions.followerAddressFallback ?? undefined) ?? undefined;
   }
 
   async listActiveCopyProfileIds(): Promise<string[]> {
@@ -25,6 +52,116 @@ export class PrismaReconcileStore implements ReconcileStore {
   }
 
   async rebuildFollowerSnapshot(copyProfileId: string, snapshotAt: Date, snapshotAtMs: number): Promise<{
+    tokensSnapshotted: number;
+    absoluteSharesSum: number;
+  }> {
+    const profile = await this.prisma.copyProfile.findUnique({
+      where: {
+        id: copyProfileId
+      },
+      select: {
+        followerAddress: true
+      }
+    });
+
+    const resolvedFollowerAddress =
+      normalizeAddress(profile?.followerAddress) ??
+      this.followerAddressFallback;
+
+    if (resolvedFollowerAddress && resolvedFollowerAddress !== profile?.followerAddress?.toLowerCase()) {
+      await this.prisma.copyProfile
+        .update({
+          where: {
+            id: copyProfileId
+          },
+          data: {
+            followerAddress: resolvedFollowerAddress
+          }
+        })
+        .catch(() => undefined);
+    }
+
+    if (this.dataApi && resolvedFollowerAddress) {
+      try {
+        return await this.rebuildFromDataApi({
+          copyProfileId,
+          followerAddress: resolvedFollowerAddress,
+          snapshotAt,
+          snapshotAtMs
+        });
+      } catch (error) {
+        return this.rebuildFromFills(copyProfileId, snapshotAt, snapshotAtMs, {
+          source: "RECONCILE_FILLS_FALLBACK",
+          followerAddress: resolvedFollowerAddress,
+          fallbackReason: "DATA_API_ERROR",
+          fallbackError: toErrorMessage(error)
+        });
+      }
+    }
+
+    return this.rebuildFromFills(copyProfileId, snapshotAt, snapshotAtMs, {
+      source: "RECONCILE_FILLS",
+      followerAddress: resolvedFollowerAddress ?? null,
+      fallbackReason: resolvedFollowerAddress ? "DATA_API_DISABLED" : "FOLLOWER_ADDRESS_UNAVAILABLE"
+    });
+  }
+
+  private async rebuildFromDataApi(args: {
+    copyProfileId: string;
+    followerAddress: string;
+    snapshotAt: Date;
+    snapshotAtMs: number;
+  }): Promise<{
+    tokensSnapshotted: number;
+    absoluteSharesSum: number;
+  }> {
+    if (!this.dataApi) {
+      throw new Error("Data API client is not configured");
+    }
+
+    const positions: DataApiPosition[] = [];
+    for (let page = 0; page < this.dataApiMaxPages; page += 1) {
+      const pageRows = await this.dataApi.fetchPositionsPage({
+        user: args.followerAddress,
+        limit: this.dataApiPageLimit,
+        offset: page * this.dataApiPageLimit,
+        sizeThreshold: 0
+      });
+
+      positions.push(...pageRows);
+      if (pageRows.length < this.dataApiPageLimit) {
+        break;
+      }
+    }
+
+    const rows = buildFollowerSnapshotRowsFromDataApiPositions(positions);
+    const absoluteSharesSum = rows.reduce((sum, row) => sum + Math.abs(row.shares), 0);
+
+    await this.persistFollowerSnapshot({
+      copyProfileId: args.copyProfileId,
+      snapshotAt: args.snapshotAt,
+      snapshotAtMs: args.snapshotAtMs,
+      rows,
+      sourcePayload: {
+        source: "RECONCILE_DATA_API",
+        followerAddress: args.followerAddress,
+        positionsSeen: positions.length,
+        rebuiltAtMs: args.snapshotAtMs
+      }
+    });
+
+    return {
+      tokensSnapshotted: rows.length,
+      absoluteSharesSum
+    };
+  }
+
+  private async rebuildFromFills(
+    copyProfileId: string,
+    snapshotAt: Date,
+    snapshotAtMs: number,
+    payload: Record<string, unknown>
+  ): Promise<{
     tokensSnapshotted: number;
     absoluteSharesSum: number;
   }> {
@@ -62,19 +199,55 @@ export class PrismaReconcileStore implements ReconcileStore {
     const rows = [...byToken.values()].filter((row) => Math.abs(row.shares) >= 1e-12);
     const absoluteSharesSum = rows.reduce((sum, row) => sum + Math.abs(row.shares), 0);
 
+    await this.persistFollowerSnapshot({
+      copyProfileId,
+      snapshotAt,
+      snapshotAtMs,
+      rows: rows.map((row) => ({
+        tokenId: row.tokenId,
+        marketId: row.marketId,
+        shares: row.shares
+      })),
+      sourcePayload: {
+        ...payload,
+        rebuiltAtMs: snapshotAtMs
+      }
+    });
+
+    return {
+      tokensSnapshotted: rows.length,
+      absoluteSharesSum
+    };
+  }
+
+  private async persistFollowerSnapshot(args: {
+    copyProfileId: string;
+    snapshotAt: Date;
+    snapshotAtMs: number;
+    rows: FollowerSnapshotRow[];
+    sourcePayload: Record<string, unknown>;
+  }): Promise<void> {
+    const absoluteSharesSum = args.rows.reduce((sum, row) => sum + Math.abs(row.shares), 0);
+
     await this.prisma.$transaction(async (tx) => {
-      if (rows.length > 0) {
+      if (args.rows.length > 0) {
         await tx.followerPositionSnapshot.createMany({
-          data: rows.map((row) => ({
-            copyProfileId,
-            snapshotAt,
-            snapshotAtMs: BigInt(snapshotAtMs),
+          data: args.rows.map((row) => ({
+            copyProfileId: args.copyProfileId,
+            snapshotAt: args.snapshotAt,
+            snapshotAtMs: BigInt(args.snapshotAtMs),
             tokenId: row.tokenId,
             marketId: row.marketId ?? null,
+            outcome: row.outcome ?? null,
             shares: String(row.shares),
+            avgCostUsd: finiteNumberToString(row.avgCostUsd),
+            currentPrice: finiteNumberToString(row.currentPrice),
+            costBasisUsd: finiteNumberToString(row.costBasisUsd),
+            currentValueUsd: finiteNumberToString(row.currentValueUsd),
+            unrealizedPnlUsd: finiteNumberToString(row.unrealizedPnlUsd),
             payload: toInputJsonValue({
-              source: "RECONCILE_FILLS",
-              rebuiltAtMs: snapshotAtMs
+              ...args.sourcePayload,
+              marketTitle: row.marketName ?? null
             })
           }))
         });
@@ -85,23 +258,19 @@ export class PrismaReconcileStore implements ReconcileStore {
           component: "WORKER",
           instanceId: "reconcile-engine",
           status: "OK",
-          observedAt: snapshotAt,
+          observedAt: args.snapshotAt,
           payload: toInputJsonValue({
             kind: "FOLLOWER_RECONCILE",
-            copyProfileId,
-            snapshotAt: snapshotAt.toISOString(),
-            snapshotAtMs,
-            tokensSnapshotted: rows.length,
-            absoluteSharesSum
+            copyProfileId: args.copyProfileId,
+            snapshotAt: args.snapshotAt.toISOString(),
+            snapshotAtMs: args.snapshotAtMs,
+            tokensSnapshotted: args.rows.length,
+            absoluteSharesSum,
+            source: args.sourcePayload.source ?? "UNKNOWN"
           })
         }
       });
     });
-
-    return {
-      tokensSnapshotted: rows.length,
-      absoluteSharesSum
-    };
   }
 
   async getLatestLeaderSnapshotAt(): Promise<Date | null> {
@@ -267,9 +436,154 @@ function toInputJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
 
+interface FollowerSnapshotRow {
+  tokenId: string;
+  marketId?: string;
+  marketName?: string;
+  outcome?: string;
+  shares: number;
+  avgCostUsd?: number;
+  currentPrice?: number;
+  costBasisUsd?: number;
+  currentValueUsd?: number;
+  unrealizedPnlUsd?: number;
+}
+
+function buildFollowerSnapshotRowsFromDataApiPositions(positions: DataApiPosition[]): FollowerSnapshotRow[] {
+  const byToken = new Map<string, FollowerSnapshotRow>();
+
+  for (const position of positions) {
+    const tokenId = position.asset;
+    const shares = finiteOrZero(position.size);
+    if (!tokenId || Math.abs(shares) < 1e-12) {
+      continue;
+    }
+
+    const currentPrice = finiteOrUndefined(position.curPrice) ?? finiteOrUndefined(position.avgPrice);
+    const currentValueUsd = finiteOrUndefined(position.currentValue) ?? (currentPrice !== undefined ? shares * currentPrice : undefined);
+    const costBasisUsd = finiteOrUndefined(position.initialValue) ?? (finiteOrUndefined(position.avgPrice) !== undefined ? shares * (position.avgPrice as number) : undefined);
+    const avgCostUsd =
+      costBasisUsd !== undefined && Math.abs(shares) >= 1e-12 ? costBasisUsd / shares : finiteOrUndefined(position.avgPrice);
+    const unrealizedPnlUsd =
+      currentValueUsd !== undefined && costBasisUsd !== undefined ? currentValueUsd - costBasisUsd : undefined;
+
+    const existing = byToken.get(tokenId);
+    if (!existing) {
+      byToken.set(tokenId, {
+        tokenId,
+        marketId: position.conditionId,
+        marketName: readNonEmptyString(position.title) ?? readNonEmptyString(position.slug) ?? undefined,
+        outcome: position.outcome,
+        shares,
+        avgCostUsd,
+        currentPrice,
+        costBasisUsd,
+        currentValueUsd,
+        unrealizedPnlUsd
+      });
+      continue;
+    }
+
+    existing.shares += shares;
+    existing.costBasisUsd = sumDefined(existing.costBasisUsd, costBasisUsd);
+    existing.currentValueUsd = sumDefined(existing.currentValueUsd, currentValueUsd);
+    if (!existing.marketId && position.conditionId) {
+      existing.marketId = position.conditionId;
+    }
+    if (!existing.outcome && position.outcome) {
+      existing.outcome = position.outcome;
+    }
+    if (!existing.marketName) {
+      existing.marketName = readNonEmptyString(position.title) ?? readNonEmptyString(position.slug) ?? undefined;
+    }
+  }
+
+  return [...byToken.values()]
+    .map((row) => {
+      const currentPrice =
+        row.currentPrice ??
+        (row.currentValueUsd !== undefined && Math.abs(row.shares) >= 1e-12 ? row.currentValueUsd / row.shares : undefined);
+      const avgCostUsd =
+        row.avgCostUsd ??
+        (row.costBasisUsd !== undefined && Math.abs(row.shares) >= 1e-12 ? row.costBasisUsd / row.shares : undefined);
+      const unrealizedPnlUsd =
+        row.unrealizedPnlUsd ??
+        (row.currentValueUsd !== undefined && row.costBasisUsd !== undefined ? row.currentValueUsd - row.costBasisUsd : undefined);
+
+      return {
+        ...row,
+        currentPrice,
+        avgCostUsd,
+        unrealizedPnlUsd
+      };
+    })
+    .filter((row) => Math.abs(row.shares) >= 1e-12);
+}
+
+function normalizeAddress(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!/^0x[a-f0-9]{40}$/.test(normalized)) {
+    return null;
+  }
+  if (normalized === "0x0000000000000000000000000000000000000000") {
+    return null;
+  }
+  return normalized;
+}
+
+function finiteOrZero(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return 0;
+}
+
+function finiteOrUndefined(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return undefined;
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function sumDefined(left: number | undefined, right: number | undefined): number | undefined {
+  if (left === undefined) {
+    return right;
+  }
+  if (right === undefined) {
+    return left;
+  }
+  return left + right;
+}
+
+function finiteNumberToString(value: number | undefined): string | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return String(value);
+}
+
 function asLatency(value: unknown): number | null {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     return null;
   }
   return Math.round(value);
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
 }

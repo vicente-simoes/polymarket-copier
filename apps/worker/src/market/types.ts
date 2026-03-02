@@ -41,6 +41,7 @@ export interface MarketWsMetrics {
   connected: boolean;
   watchedTokenCount: number;
   subscribedTokenCount: number;
+  reconnectCount: number;
   connectedAtMs?: number;
   disconnectedAtMs?: number;
   lastMessageAtMs?: number;

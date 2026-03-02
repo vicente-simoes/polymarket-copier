@@ -189,10 +189,12 @@ async function bootstrap(): Promise<void> {
     });
   }, dynamicMarketWatchRefreshIntervalMs);
 
+  const dataApiClient = new DataApiClient({
+    baseUrl: env.DATA_API_BASE_URL
+  });
+
   const leaderPoller = new LeaderPoller({
-    dataApi: new DataApiClient({
-      baseUrl: env.DATA_API_BASE_URL
-    }),
+    dataApi: dataApiClient,
     store: new PrismaLeaderIngestionStore(prisma),
     config: {
       positionsIntervalMs: env.RECONCILE_INTERVAL_SECONDS * 1000,
@@ -335,7 +337,13 @@ async function bootstrap(): Promise<void> {
   fillAttribution.start();
 
   const reconcileEngine = new ReconcileEngine({
-    store: new PrismaReconcileStore(prisma),
+    store: new PrismaReconcileStore({
+      prisma,
+      dataApi: dataApiClient,
+      dataApiPageLimit: env.LEADER_POLL_PAGE_LIMIT,
+      dataApiMaxPages: env.LEADER_POLL_MAX_PAGES_PER_LEADER,
+      followerAddressFallback: signingConfig?.funderAddress ?? polymarketSignerAddress ?? undefined
+    }),
     config: {
       enabled: env.RECONCILE_ENGINE_ENABLED,
       intervalMs: env.RECONCILE_INTERVAL_SECONDS * 1000,

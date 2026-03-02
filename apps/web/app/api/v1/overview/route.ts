@@ -30,6 +30,7 @@ const OverviewDataSchema = z.object({
       z.object({
         tokenId: z.string(),
         marketId: z.string().nullable(),
+        marketLabel: z.string().nullable(),
         outcome: z.string().nullable(),
         pnlUsd: z.number()
       })
@@ -50,6 +51,8 @@ const OverviewDataSchema = z.object({
         id: z.string(),
         tokenId: z.string(),
         marketId: z.string().nullable(),
+        marketLabel: z.string().nullable(),
+        outcome: z.string().nullable(),
         side: z.enum(['BUY', 'SELL']),
         notionalUsd: z.number(),
         shares: z.number(),
@@ -64,6 +67,8 @@ const OverviewDataSchema = z.object({
         id: z.string(),
         tokenId: z.string(),
         marketId: z.string().nullable(),
+        marketLabel: z.string().nullable(),
+        outcome: z.string().nullable(),
         side: z.enum(['BUY', 'SELL']),
         reason: z.string().nullable(),
         createdAt: z.string(),
@@ -404,7 +409,29 @@ export async function GET(request: NextRequest) {
       .sort((a, b) => b.totalPnlUsd - a.totalPnlUsd)
       .slice(0, 5)
 
-    const byMarketTop = pnlByMarketRows.sort((a, b) => b.pnlUsd - a.pnlUsd).slice(0, 5)
+    const metadataTokenIds = new Set<string>()
+    for (const row of pnlByMarketRows) {
+      metadataTokenIds.add(row.tokenId)
+    }
+    for (const row of recentExecutions) {
+      metadataTokenIds.add(row.tokenId)
+    }
+    for (const row of recentSkips) {
+      metadataTokenIds.add(row.tokenId)
+    }
+
+    const tokenMetadata = await resolveOverviewTokenMetadata([...metadataTokenIds])
+
+    const byMarketTop = pnlByMarketRows
+      .sort((a, b) => b.pnlUsd - a.pnlUsd)
+      .slice(0, 5)
+      .map((row) => ({
+        tokenId: row.tokenId,
+        marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+        marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+        outcome: row.outcome ?? tokenMetadata.get(row.tokenId)?.outcome ?? null,
+        pnlUsd: row.pnlUsd
+      }))
     const realizedPnlUsd = leaderPnl.reduce((sum, row) => sum + toNumber(row.realizedPnlUsd), 0)
     const totalPnlUsd = realizedPnlUsd + unrealizedPnlUsd
 
@@ -465,7 +492,9 @@ export async function GET(request: NextRequest) {
           executions: recentExecutions.map((row) => ({
             id: row.id,
             tokenId: row.tokenId,
-            marketId: row.marketId,
+            marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+            marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+            outcome: tokenMetadata.get(row.tokenId)?.outcome ?? null,
             side: row.side,
             notionalUsd: toNumber(row.intendedNotionalUsd),
             shares: toNumber(row.intendedShares),
@@ -477,7 +506,9 @@ export async function GET(request: NextRequest) {
           skips: recentSkips.map((row) => ({
             id: row.id,
             tokenId: row.tokenId,
-            marketId: row.marketId,
+            marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
+            marketLabel: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+            outcome: tokenMetadata.get(row.tokenId)?.outcome ?? null,
             side: row.side,
             reason: row.reason,
             createdAt: row.createdAt.toISOString(),
@@ -526,6 +557,123 @@ function asObject(value: unknown): Record<string, unknown> {
     return {}
   }
   return value as Record<string, unknown>
+}
+
+type TokenMetadata = {
+  marketId: string | null
+  marketLabel: string | null
+  outcome: string | null
+}
+
+async function resolveOverviewTokenMetadata(tokenIds: string[]): Promise<Map<string, TokenMetadata>> {
+  const uniqueTokenIds = [...new Set(tokenIds.filter((value) => value.length > 0))]
+  if (uniqueTokenIds.length === 0) {
+    return new Map()
+  }
+
+  const metadata = new Map<string, TokenMetadata>()
+  const lookupTake = Math.max(200, uniqueTokenIds.length * 8)
+
+  const [tradeRows, leaderPositionRows, followerPositionRows] = await Promise.all([
+    prisma.leaderTradeEvent.findMany({
+      where: {
+        tokenId: { in: uniqueTokenIds }
+      },
+      orderBy: {
+        detectedAtMs: 'desc'
+      },
+      select: {
+        tokenId: true,
+        marketId: true,
+        outcome: true,
+        payload: true
+      },
+      take: lookupTake
+    }),
+    prisma.leaderPositionSnapshot.findMany({
+      where: {
+        tokenId: { in: uniqueTokenIds }
+      },
+      orderBy: {
+        snapshotAt: 'desc'
+      },
+      select: {
+        tokenId: true,
+        marketId: true,
+        outcome: true,
+        payload: true
+      },
+      take: lookupTake
+    }),
+    prisma.followerPositionSnapshot.findMany({
+      where: {
+        tokenId: { in: uniqueTokenIds }
+      },
+      orderBy: {
+        snapshotAt: 'desc'
+      },
+      select: {
+        tokenId: true,
+        marketId: true,
+        outcome: true,
+        payload: true
+      },
+      take: lookupTake
+    })
+  ])
+
+  const applyRow = (row: { tokenId: string; marketId: string | null; outcome: string | null; payload: unknown }) => {
+    const current = metadata.get(row.tokenId) ?? {
+      marketId: null,
+      marketLabel: null,
+      outcome: null
+    }
+    const payloadInfo = extractOverviewMarketMetadataFromPayload(row.payload)
+    const next: TokenMetadata = {
+      marketId: current.marketId ?? row.marketId ?? payloadInfo.marketId ?? null,
+      marketLabel: current.marketLabel ?? payloadInfo.marketLabel ?? null,
+      outcome: current.outcome ?? row.outcome ?? payloadInfo.outcome ?? null
+    }
+
+    if (next.marketId || next.marketLabel || next.outcome) {
+      metadata.set(row.tokenId, next)
+    }
+  }
+
+  for (const row of tradeRows) {
+    applyRow(row)
+  }
+  for (const row of leaderPositionRows) {
+    applyRow(row)
+  }
+  for (const row of followerPositionRows) {
+    applyRow(row)
+  }
+
+  return metadata
+}
+
+function extractOverviewMarketMetadataFromPayload(payload: unknown): Partial<TokenMetadata> {
+  const root = asObject(payload)
+  const raw = asObject(root.raw)
+  const record = Object.keys(raw).length > 0 ? raw : root
+
+  const marketId = readString(record, 'conditionId') ?? readString(record, 'market')
+  const title = readString(record, 'title')
+  const slug = readString(record, 'slug')
+  const eventSlug = readString(record, 'eventSlug')
+  const outcome = readString(record, 'outcome')
+
+  return {
+    marketId: marketId ?? null,
+    marketLabel: title ?? slug ?? eventSlug ?? null,
+    outcome: outcome ?? null
+  }
+}
+
+function readString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
 }
 
 function toBoolean(value: unknown): boolean | null {

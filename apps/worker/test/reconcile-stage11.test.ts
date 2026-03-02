@@ -282,6 +282,7 @@ function makeMarketStatus(overrides: Partial<MarketDataStatus["freshness"]>): Ma
       connected: true,
       watchedTokenCount: 1,
       subscribedTokenCount: 1,
+      reconnectCount: 0,
       connectedAtMs: 1,
       disconnectedAtMs: undefined,
       lastMessageAtMs: 1,

@@ -35,6 +35,7 @@ interface OverviewData {
     byMarketTop: Array<{
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
       outcome: string | null
       pnlUsd: number
     }>
@@ -51,6 +52,8 @@ interface OverviewData {
       id: string
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      outcome: string | null
       side: 'BUY' | 'SELL'
       notionalUsd: number
       shares: number
@@ -63,6 +66,8 @@ interface OverviewData {
       id: string
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      outcome: string | null
       side: 'BUY' | 'SELL'
       reason: string | null
       createdAt: string
@@ -101,13 +106,35 @@ function statusTone(value: boolean | null): 'positive' | 'warning' | 'negative' 
 }
 
 function workerTone(status: string): 'positive' | 'warning' | 'negative' | 'neutral' {
-  if (status === 'OK') {
+  const normalized = status.trim().toUpperCase()
+
+  if (normalized === 'OK') {
     return 'positive'
   }
-  if (status === 'DOWN') {
+  if (normalized === 'DOWN') {
     return 'negative'
   }
   return 'neutral'
+}
+
+function executionStatusPillTone(status: OverviewData['recentActivity']['executions'][number]['status']): 'positive' | 'warning' | 'negative' | 'neutral' {
+  if (status === 'PLACED' || status === 'PARTIALLY_FILLED' || status === 'FILLED') {
+    return 'positive'
+  }
+  if (status === 'FAILED') {
+    return 'negative'
+  }
+  if (status === 'CANCELLED' || status === 'RETRYING') {
+    return 'warning'
+  }
+  return 'neutral'
+}
+
+function skipSidePillTone(side: OverviewData['recentActivity']['skips'][number]['side']): 'positive' | 'warning' | 'negative' | 'neutral' {
+  if (side === 'BUY') {
+    return 'positive'
+  }
+  return 'warning'
 }
 
 const panelClass =
@@ -115,6 +142,14 @@ const panelClass =
 
 const insetRowClass =
   'flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-white/[0.02] px-4 py-3 transition-colors hover:bg-white/[0.04]'
+
+function marketPrimaryLabel(value: { marketLabel: string | null; marketId: string | null; tokenId: string }): string {
+  return value.marketLabel ?? value.marketId ?? value.tokenId
+}
+
+function marketSecondaryLabel(value: { outcome: string | null; tokenId: string }): string {
+  return value.outcome ?? value.tokenId
+}
 
 export default function OverviewPage() {
   const { data, generatedAt, isLoading, error, refresh } = useApiQuery<OverviewData>('/api/v1/overview', {
@@ -147,10 +182,10 @@ export default function OverviewPage() {
             <h2 className="text-2xl font-semibold text-[#E7E7E7] md:text-3xl">System snapshot</h2>
             <p className="max-w-2xl text-sm text-[#919191]">Exposure, PnL, activity, and health in one view.</p>
             <div className="flex flex-wrap items-center gap-2 pt-1">
-              <div className="rounded-full border border-white/10 bg-white/[0.02] px-3 py-1.5 text-xs text-[#919191]">
+              <div className="rounded-full border border-cyan-400/30 bg-cyan-500/10 px-3 py-1.5 text-xs text-cyan-100">
                 Profile {data.copyProfileId ?? 'not configured'}
               </div>
-              <div className="rounded-full border border-white/10 bg-white/[0.02] px-3 py-1.5 text-xs text-[#919191]">
+              <div className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-100">
                 Worker {data.health.workerStatus}
               </div>
             </div>
@@ -257,8 +292,8 @@ export default function OverviewPage() {
               data.pnl.byMarketTop.map((market) => (
                 <div key={`${market.tokenId}-${market.marketId ?? 'none'}`} className={insetRowClass}>
                   <div>
-                    <p className="text-sm font-medium text-[#E7E7E7]">{market.marketId ?? market.tokenId}</p>
-                    <p className="text-xs text-[#919191]">{market.outcome ?? 'Unknown outcome'}</p>
+                    <p className="text-sm font-medium text-[#E7E7E7]">{marketPrimaryLabel(market)}</p>
+                    <p className="text-xs text-[#919191]">{marketSecondaryLabel(market)}</p>
                   </div>
                   <span className="text-sm text-[#CFCFCF]">{formatSignedCurrency(market.pnlUsd)}</span>
                 </div>
@@ -285,7 +320,7 @@ export default function OverviewPage() {
                       <TableRow className="hover:bg-transparent">
                         <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Time</TableHead>
                         <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Leader</TableHead>
-                        <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Token</TableHead>
+                        <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Market</TableHead>
                         <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Side</TableHead>
                         <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Notional</TableHead>
                         <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Status</TableHead>
@@ -296,11 +331,14 @@ export default function OverviewPage() {
                         <TableRow key={row.id} className="hover:bg-white/[0.03]">
                           <TableCell className="px-3 text-[#CFCFCF]">{formatDateTime(row.attemptedAt)}</TableCell>
                           <TableCell className="px-3 text-[#E7E7E7]">{row.leaderName ?? 'n/a'}</TableCell>
-                          <TableCell className="px-3 font-mono text-xs text-[#919191]">{row.tokenId}</TableCell>
+                          <TableCell className="px-3">
+                            <p className="text-sm text-[#E7E7E7]">{marketPrimaryLabel(row)}</p>
+                            <p className="text-xs text-[#919191]">{marketSecondaryLabel(row)}</p>
+                          </TableCell>
                           <TableCell className="px-3 text-[#E7E7E7]">{row.side}</TableCell>
                           <TableCell className="px-3 text-[#E7E7E7]">{formatCurrency(row.notionalUsd)}</TableCell>
                           <TableCell className="px-3">
-                            <StatusPill label={row.status} tone={row.status === 'FILLED' ? 'positive' : row.status === 'FAILED' ? 'negative' : 'neutral'} />
+                            <StatusPill label={row.status} tone={executionStatusPillTone(row.status)} />
                           </TableCell>
                         </TableRow>
                       ))}
@@ -313,12 +351,13 @@ export default function OverviewPage() {
                     <div key={row.id} className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
                       <div className="flex items-center justify-between gap-2">
                         <p className="text-xs text-[#919191]">{formatDateTime(row.attemptedAt)}</p>
-                        <StatusPill label={row.status} tone={row.status === 'FILLED' ? 'positive' : row.status === 'FAILED' ? 'negative' : 'neutral'} />
+                        <StatusPill label={row.status} tone={executionStatusPillTone(row.status)} />
                       </div>
                       <p className="mt-1 font-medium text-[#E7E7E7]">
                         {row.side} {formatCurrency(row.notionalUsd)}
                       </p>
-                      <p className="text-xs text-[#919191]">{row.leaderName ?? 'n/a'} · {row.tokenId}</p>
+                      <p className="text-xs text-[#919191]">{row.leaderName ?? 'n/a'} · {marketPrimaryLabel(row)}</p>
+                      <p className="text-xs text-[#919191]">{marketSecondaryLabel(row)}</p>
                     </div>
                   ))}
                 </div>
@@ -340,9 +379,10 @@ export default function OverviewPage() {
                 <div key={row.id} className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-xs text-[#919191]">{formatDateTime(row.createdAt)}</p>
-                    <StatusPill label={row.side} tone="neutral" />
+                    <StatusPill label={row.side} tone={skipSidePillTone(row.side)} />
                   </div>
-                  <p className="mt-1 font-medium text-[#E7E7E7]">{row.leaderName ?? 'n/a'} · {row.tokenId}</p>
+                  <p className="mt-1 font-medium text-[#E7E7E7]">{row.leaderName ?? 'n/a'} · {marketPrimaryLabel(row)}</p>
+                  <p className="mt-1 text-xs text-[#919191]">{marketSecondaryLabel(row)}</p>
                   <p className="mt-1 text-sm text-[#919191]">{row.reason ?? 'No reason provided'}</p>
                 </div>
               ))
