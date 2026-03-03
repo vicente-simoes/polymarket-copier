@@ -8,7 +8,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
     "lint": "echo \"no lint config yet\"",
-    "test": "node --import tsx --test test/**/*.test.ts"
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "fills:backfill": "node --import tsx src/scripts/fills-backfill.ts"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.2.4",

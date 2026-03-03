@@ -4,6 +4,9 @@ const WS_READY_STATE_OPEN = 1;
 const CONTROL_FRAME_VALUES = new Set(["PING", "PONG"]);
 const TIMESTAMP_SECONDS_THRESHOLD = 2_000_000_000;
 const MAX_ACCEPTABLE_TIMESTAMP_MS = 4_102_444_800_000;
+const TRADE_EVENT_TYPES = new Set(["TRADE", "TRADE_UPDATE", "MATCHED", "MATCH", "TRADE_MATCHED"]);
+const ORDER_EVENT_TYPES = new Set(["ORDER", "PLACEMENT", "CANCEL", "CANCELLED", "CANCELLATION", "UPDATE", "ORDER_UPDATE"]);
+const NESTED_EVENT_KEYS = ["payload", "data", "event", "message", "msg"] as const;
 
 export interface WsLike {
   readyState: number;
@@ -35,10 +38,16 @@ export interface UserChannelWsMetrics {
   lastMessageAtMs?: number;
   lastTradeAtMs?: number;
   lastOrderAtMs?: number;
+  lastRecognizedEventAtMs?: number;
+  lastUnknownSampleAtMs?: number;
+  lastUnknownSampleType?: string;
   lastError?: string;
   receivedMessages: number;
   tradeMessages: number;
   orderMessages: number;
+  unknownMessages: number;
+  parseErrors: number;
+  recognizedEventMessages: number;
   reconnectCount: number;
 }
 
@@ -66,6 +75,9 @@ export class UserChannelWsClient {
     receivedMessages: 0,
     tradeMessages: 0,
     orderMessages: 0,
+    unknownMessages: 0,
+    parseErrors: 0,
+    recognizedEventMessages: 0,
     reconnectCount: 0
   };
 
@@ -194,6 +206,7 @@ export class UserChannelWsClient {
     try {
       payload = JSON.parse(normalized);
     } catch {
+      this.metrics.parseErrors += 1;
       this.captureError("Failed to parse user-channel WS message");
       return;
     }
@@ -209,25 +222,36 @@ export class UserChannelWsClient {
   }
 
   private async handleParsedMessage(payload: unknown): Promise<void> {
-    const trade = parseTradeEvent(payload);
-    if (trade) {
-      this.metrics.tradeMessages += 1;
-      this.metrics.lastTradeAtMs = this.now();
-      if (this.onTrade) {
-        await Promise.resolve(this.onTrade({ event: trade }));
+    const candidates = extractCandidateRecords(payload);
+    for (const candidate of candidates) {
+      const trade = parseTradeEventRecord(candidate);
+      if (trade) {
+        this.metrics.tradeMessages += 1;
+        this.metrics.recognizedEventMessages += 1;
+        this.metrics.lastTradeAtMs = this.now();
+        this.metrics.lastRecognizedEventAtMs = this.now();
+        if (this.onTrade) {
+          await Promise.resolve(this.onTrade({ event: trade }));
+        }
+        return;
       }
-      return;
+
+      const order = parseOrderEventRecord(candidate);
+      if (order) {
+        this.metrics.orderMessages += 1;
+        this.metrics.recognizedEventMessages += 1;
+        this.metrics.lastOrderAtMs = this.now();
+        this.metrics.lastRecognizedEventAtMs = this.now();
+        if (this.onOrder) {
+          await Promise.resolve(this.onOrder({ event: order }));
+        }
+        return;
+      }
     }
 
-    const order = parseOrderEvent(payload);
-    if (order) {
-      this.metrics.orderMessages += 1;
-      this.metrics.lastOrderAtMs = this.now();
-      if (this.onOrder) {
-        await Promise.resolve(this.onOrder({ event: order }));
-      }
-      return;
-    }
+    this.metrics.unknownMessages += 1;
+    this.metrics.lastUnknownSampleAtMs = this.now();
+    this.metrics.lastUnknownSampleType = resolveUnknownSampleType(payload);
   }
 
   private captureError(message: string): void {
@@ -275,13 +299,33 @@ export class UserChannelWsClient {
 }
 
 export function parseTradeEvent(payload: unknown) {
-  if (!payload || typeof payload !== "object") {
-    return null;
+  for (const candidate of extractCandidateRecords(payload)) {
+    const parsed = parseTradeEventRecord(candidate);
+    if (parsed) {
+      return parsed;
+    }
   }
+  return null;
+}
 
-  const record = payload as Record<string, unknown>;
-  const eventType = readString(record, "event_type");
-  if (eventType !== "trade") {
+export function parseOrderEvent(payload: unknown) {
+  for (const candidate of extractCandidateRecords(payload)) {
+    const parsed = parseOrderEventRecord(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function parseTradeEventRecord(record: Record<string, unknown>) {
+  const eventType = resolveEventType(record);
+  const hasTradeShape =
+    readString(record, "asset_id") !== undefined &&
+    readNumber(record, "size") !== undefined &&
+    readNumber(record, "price") !== undefined &&
+    normalizeSide(readString(record, "side")) !== null;
+  if (eventType !== "TRADE" && !hasTradeShape) {
     return null;
   }
 
@@ -344,14 +388,14 @@ export function parseTradeEvent(payload: unknown) {
   };
 }
 
-export function parseOrderEvent(payload: unknown) {
-  if (!payload || typeof payload !== "object") {
-    return null;
-  }
-
-  const record = payload as Record<string, unknown>;
-  const eventType = readString(record, "event_type");
-  if (eventType !== "order") {
+function parseOrderEventRecord(record: Record<string, unknown>) {
+  const eventType = resolveEventType(record);
+  const typeValue = readString(record, "type")?.toUpperCase();
+  const hasOrderShape =
+    (readString(record, "id") ?? readString(record, "order_id")) !== undefined &&
+    (readString(record, "asset_id") !== undefined || readString(record, "market") !== undefined);
+  const isOrderTypeValue = typeValue ? ORDER_EVENT_TYPES.has(typeValue) : false;
+  if (eventType !== "ORDER" && !hasOrderShape && !isOrderTypeValue) {
     return null;
   }
 
@@ -367,7 +411,7 @@ export function parseOrderEvent(payload: unknown) {
 
   const originalShares = readNumber(record, "original_size");
   const matchedShares = readNumber(record, "size_matched");
-  const type = readString(record, "type")?.toUpperCase();
+  const type = typeValue;
   let orderStatus: "PLACED" | "PARTIALLY_FILLED" | "FILLED" | "CANCELLED" | undefined;
 
   if (type === "CANCELLATION" || type === "CANCELLED" || type === "CANCEL") {
@@ -395,6 +439,96 @@ export function parseOrderEvent(payload: unknown) {
     updatedAt: new Date(updatedAtMs),
     payload: toRecord(record)
   };
+}
+
+function resolveEventType(record: Record<string, unknown>): "TRADE" | "ORDER" | undefined {
+  const rawEventType = readString(record, "event_type") ?? readString(record, "type");
+  if (!rawEventType) {
+    return undefined;
+  }
+  const normalized = rawEventType.toUpperCase();
+  if (TRADE_EVENT_TYPES.has(normalized)) {
+    return "TRADE";
+  }
+  if (ORDER_EVENT_TYPES.has(normalized)) {
+    return "ORDER";
+  }
+  return undefined;
+}
+
+function extractCandidateRecords(payload: unknown): Record<string, unknown>[] {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+
+  const queue: Array<{ value: unknown; depth: number }> = [{ value: payload, depth: 0 }];
+  const seen = new Set<unknown>();
+  const output: Record<string, unknown>[] = [];
+
+  while (queue.length > 0) {
+    const next = queue.shift();
+    if (!next) {
+      continue;
+    }
+    if (seen.has(next.value)) {
+      continue;
+    }
+    seen.add(next.value);
+
+    if (Array.isArray(next.value)) {
+      if (next.depth >= 2) {
+        continue;
+      }
+      for (const item of next.value) {
+        queue.push({ value: item, depth: next.depth + 1 });
+      }
+      continue;
+    }
+
+    if (typeof next.value !== "object" || next.value === null) {
+      continue;
+    }
+
+    const record = next.value as Record<string, unknown>;
+    output.push(record);
+    if (next.depth >= 2) {
+      continue;
+    }
+
+    for (const key of NESTED_EVENT_KEYS) {
+      const nested = record[key];
+      if (!nested) {
+        continue;
+      }
+      if (typeof nested === "object") {
+        queue.push({ value: nested, depth: next.depth + 1 });
+      }
+    }
+  }
+
+  return output;
+}
+
+function resolveUnknownSampleType(payload: unknown): string {
+  for (const candidate of extractCandidateRecords(payload)) {
+    const kind = resolveEventType(candidate);
+    if (kind) {
+      return kind;
+    }
+
+    const explicitType = readString(candidate, "type") ?? readString(candidate, "event_type");
+    if (explicitType) {
+      return explicitType.slice(0, 128);
+    }
+  }
+
+  if (Array.isArray(payload)) {
+    return "ARRAY";
+  }
+  if (payload && typeof payload === "object") {
+    return "OBJECT";
+  }
+  return typeof payload;
 }
 
 function normalizeSide(value: string | undefined): FillSide | null {

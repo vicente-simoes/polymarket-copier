@@ -78,6 +78,11 @@ export const WorkerEnvSchema = z.object({
   COPY_SYSTEM_ENABLED: booleanFromEnv.default(false),
   TRADE_DETECTION_ENABLED: booleanFromEnv.default(true),
   USER_CHANNEL_WS_ENABLED: booleanFromEnv.default(true),
+  FILL_RECONCILE_ENABLED: booleanFromEnv.default(true),
+  FILL_RECONCILE_INTERVAL_SECONDS: z.coerce.number().int().positive().default(30),
+  FILL_BACKFILL_DEFAULT_LOOKBACK_DAYS: z.coerce.number().int().positive().default(30),
+  FILL_PARSE_STARVATION_WINDOW_SECONDS: z.coerce.number().int().positive().default(300),
+  FILL_PARSE_STARVATION_MIN_MESSAGES: z.coerce.number().int().positive().default(20),
   CHAIN_TRIGGER_WS_ENABLED: booleanFromEnv.default(true),
   POLYMARKET_EXCHANGE_CONTRACTS: z
     .string()

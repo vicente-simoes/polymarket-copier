@@ -135,6 +135,11 @@ export interface ExecutionTransitionInput {
   attemptedAt: Date;
 }
 
+export interface ExecutionInvariantRepairResult {
+  pendingDeltasConverted: number;
+  attemptsClosed: number;
+}
+
 export interface ExecutionStore {
   listOpenAttempts(limit: number): Promise<ExecutionAttemptRecord[]>;
   getAttemptContext(attemptId: string): Promise<ExecutionAttemptContext | null>;
@@ -156,6 +161,7 @@ export interface ExecutionStore {
     orderStatus?: Extract<ExecutionCopyOrderStatus, "FAILED" | "CANCELLED" | "RETRYING">;
   }): Promise<void>;
   deferAttempt(input: ExecutionTransitionInput): Promise<void>;
+  repairExecutionInvariants(now: Date): Promise<ExecutionInvariantRepairResult>;
 }
 
 export interface ExecutionVenueClient {

@@ -293,8 +293,7 @@ export async function GET(request: NextRequest) {
           none: {
             status: {
               in: ['PENDING', 'RETRYING', 'EXECUTING']
-            },
-            decision: 'PENDING'
+            }
           }
         },
         OR: [

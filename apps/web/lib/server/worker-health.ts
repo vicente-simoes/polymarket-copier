@@ -9,6 +9,7 @@ export interface WorkerHealthSnapshot {
   targetNetting?: Record<string, unknown>
   execution?: Record<string, unknown>
   userChannel?: Record<string, unknown>
+  fillReconcile?: Record<string, unknown>
   reconcile?: Record<string, unknown>
 }
 

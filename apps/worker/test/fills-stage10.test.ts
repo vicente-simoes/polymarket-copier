@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
 import { applyBuyAllocation, applySellAllocation } from "@copybot/shared";
-import { allocateAndNormalizeFill, capSellAllocationsByAvailableShares } from "../src/fills/store.js";
+import { allocateAndNormalizeFill, capSellAllocationsByAvailableShares, selectFallbackOrderCandidate } from "../src/fills/store.js";
 import { UserChannelWsClient, parseOrderEvent, parseTradeEvent, type WsLike } from "../src/fills/user-ws.js";
 
 class FakeWs extends EventEmitter implements WsLike {
@@ -138,6 +138,81 @@ test("Stage 10 parsed trade/order payloads expose canonical fields", () => {
   });
   assert.ok(order);
   assert.equal(order?.orderStatus, "FILLED");
+});
+
+test("Stage 10 parser accepts uppercase type, missing event_type, and wrapped envelope payloads", () => {
+  const upperTypeTrade = parseTradeEvent({
+    type: "TRADE",
+    id: "trade-upper",
+    asset_id: "token-upper",
+    side: "BUY",
+    size: "1.25",
+    price: "0.61",
+    timestamp: "1700000300"
+  });
+  assert.ok(upperTypeTrade);
+  assert.equal(upperTypeTrade?.externalTradeId, "trade-upper");
+
+  const missingEventTypeOrder = parseOrderEvent({
+    type: "PLACEMENT",
+    id: "order-placement",
+    asset_id: "token-upper",
+    side: "BUY",
+    original_size: "5",
+    size_matched: "0",
+    timestamp: "1700000400"
+  });
+  assert.ok(missingEventTypeOrder);
+  assert.equal(missingEventTypeOrder?.orderStatus, "PLACED");
+
+  const wrappedTrade = parseTradeEvent({
+    channel: "user",
+    message: {
+      payload: {
+        event_type: "trade",
+        id: "trade-wrapped",
+        asset_id: "token-wrapped",
+        side: "SELL",
+        size: "2",
+        price: "0.33",
+        timestamp: "1700000500"
+      }
+    }
+  });
+  assert.ok(wrappedTrade);
+  assert.equal(wrappedTrade?.externalTradeId, "trade-wrapped");
+});
+
+test("Stage 10 user-channel WS unknown payloads and parse failures are accounted in metrics", async () => {
+  const socket = new FakeWs();
+  const client = new UserChannelWsClient({
+    url: "wss://user.example/ws",
+    apiKey: "key",
+    apiSecret: "secret",
+    passphrase: "pass",
+    createSocket: () => socket,
+    heartbeatIntervalMs: 1_000,
+    reconnectDelayMs: 1_000
+  });
+
+  client.connect();
+  socket.open();
+
+  socket.message({
+    type: "mystery_event",
+    foo: "bar"
+  });
+  socket.messageRaw("{not valid json");
+  await wait(0);
+
+  const metrics = client.getMetrics();
+  assert.equal(metrics.unknownMessages, 1);
+  assert.equal(metrics.parseErrors, 1);
+  assert.equal(metrics.recognizedEventMessages, 0);
+  assert.equal(metrics.lastUnknownSampleType, "mystery_event");
+  assert.ok(typeof metrics.lastUnknownSampleAtMs === "number");
+
+  client.disconnect();
 });
 
 test("Stage 10 user-channel WS sends heartbeat and ignores control frames", async () => {
@@ -338,4 +413,37 @@ test("Stage 10 allocations reconcile and leader PnL can be derived from allocati
   }
 
   assert.ok(combinedRealized > 0);
+});
+
+test("Stage 10 fallback candidate selector picks safe single candidate and rejects ambiguous windows", () => {
+  const newest = {
+    id: "order-newest",
+    copyProfileId: "profile-1",
+    tokenId: "token-1",
+    marketId: "market-1",
+    side: "BUY",
+    externalOrderId: "ext-newest",
+    leaderWeights: {},
+    unattributedWeight: null,
+    attemptedAt: new Date("2026-03-01T12:00:00.000Z")
+  };
+  const olderFar = {
+    ...newest,
+    id: "order-older-far",
+    attemptedAt: new Date("2026-03-01T11:45:00.000Z")
+  };
+  const olderClose = {
+    ...newest,
+    id: "order-older-close",
+    attemptedAt: new Date("2026-03-01T11:58:45.000Z")
+  };
+
+  const safe = selectFallbackOrderCandidate([newest, olderFar]);
+  assert.equal(safe.order?.id, "order-newest");
+  assert.equal(safe.reason, undefined);
+
+  const ambiguous = selectFallbackOrderCandidate([newest, olderClose]);
+  assert.equal(ambiguous.order, undefined);
+  assert.equal(ambiguous.reason, "AMBIGUOUS_FALLBACK");
+  assert.deepEqual(ambiguous.ambiguousCandidateOrderIds, ["order-newest", "order-older-close"]);
 });

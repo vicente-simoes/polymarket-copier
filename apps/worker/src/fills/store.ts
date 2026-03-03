@@ -4,12 +4,25 @@ import type {
   FillAllocationResultRow,
   FillAttributionCopyOrder,
   FillAttributionStore,
+  FillIssueInput,
+  FillReconcileCheckpoint,
   IngestTradeFillResult,
+  TradeOrderMatchResult,
+  TradeOrderUnmatchedReason,
   UserOrderUpdateEvent,
   UserTradeFillEvent
 } from "./types.js";
 
 type TxClient = Prisma.TransactionClient;
+const FALLBACK_WINDOW_MS = 30 * 60 * 1000;
+const FALLBACK_FUTURE_SKEW_MS = 2 * 60 * 1000;
+const AMBIGUOUS_FALLBACK_GAP_MS = 90 * 1000;
+const FALLBACK_ORDER_STATUSES: Array<"PLACED" | "PARTIALLY_FILLED" | "FILLED" | "RETRYING"> = [
+  "PLACED",
+  "PARTIALLY_FILLED",
+  "FILLED",
+  "RETRYING"
+];
 
 export class PrismaFillAttributionStore implements FillAttributionStore {
   private readonly prisma: PrismaClient;
@@ -18,7 +31,7 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
     this.prisma = prisma;
   }
 
-  async findCopyOrderForTrade(event: UserTradeFillEvent): Promise<FillAttributionCopyOrder | null> {
+  async matchCopyOrderForTrade(event: UserTradeFillEvent): Promise<TradeOrderMatchResult> {
     const orderIds = [...new Set(event.externalOrderIds.map((id) => id.trim()).filter((id) => id.length > 0))];
     if (orderIds.length > 0) {
       const direct = await this.prisma.copyOrder.findFirst({
@@ -34,30 +47,67 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
       });
 
       if (direct) {
-        return mapCopyOrder(direct);
+        return {
+          order: mapCopyOrder(direct),
+          strategy: "EXTERNAL_ORDER_ID"
+        };
       }
     }
 
-    const fallbackWindowStart = new Date(event.filledAt.getTime() - 6 * 60 * 60 * 1000);
-    const fallback = await this.prisma.copyOrder.findFirst({
+    const fallbackWindowStart = new Date(event.filledAt.getTime() - FALLBACK_WINDOW_MS);
+    const fallbackWindowEnd = new Date(event.filledAt.getTime() + FALLBACK_FUTURE_SKEW_MS);
+    const fallbackCandidates = await this.prisma.copyOrder.findMany({
       where: {
         tokenId: event.tokenId,
         side: event.side,
         status: {
-          in: ["PLACED", "PARTIALLY_FILLED", "RETRYING"]
+          in: FALLBACK_ORDER_STATUSES
         },
         attemptedAt: {
           gte: fallbackWindowStart,
-          lte: event.filledAt
+          lte: fallbackWindowEnd
         }
       },
       orderBy: {
         attemptedAt: "desc"
       },
+      take: 10,
       select: copyOrderSelect
     });
 
-    return fallback ? mapCopyOrder(fallback) : null;
+    const fallbackSelection = selectFallbackOrderCandidate(fallbackCandidates);
+    if (fallbackSelection.order) {
+      return {
+        order: mapCopyOrder(fallbackSelection.order),
+        strategy: "FALLBACK_WINDOW"
+      };
+    }
+
+    if (fallbackSelection.reason === "AMBIGUOUS_FALLBACK") {
+      await this.reportFillIssue({
+        code: "USER_CHANNEL_AMBIGUOUS_ORDER_MATCH",
+        severity: "WARN",
+        message: "Trade fill could not be matched due to multiple nearby copy orders in fallback window",
+        context: {
+          externalTradeId: event.externalTradeId,
+          tokenId: event.tokenId,
+          side: event.side,
+          filledAt: event.filledAt.toISOString(),
+          candidateOrderIds: fallbackSelection.ambiguousCandidateOrderIds ?? [],
+          fallbackWindowStart: fallbackWindowStart.toISOString(),
+          fallbackWindowEnd: fallbackWindowEnd.toISOString()
+        }
+      });
+    }
+
+    const unmatchedReason: TradeOrderUnmatchedReason =
+      fallbackSelection.reason ?? (orderIds.length > 0 ? "NO_ORDER_ID_MATCH" : "NO_FALLBACK_CANDIDATE");
+    return {
+      order: null,
+      strategy: "NONE",
+      unmatchedReason,
+      ambiguousCandidateOrderIds: fallbackSelection.ambiguousCandidateOrderIds
+    };
   }
 
   async ingestTradeFill(args: { order: FillAttributionCopyOrder; event: UserTradeFillEvent }): Promise<IngestTradeFillResult> {
@@ -215,6 +265,122 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
     });
 
     return result.count > 0;
+  }
+
+  async hasCopyFillByExternalTradeId(externalTradeId: string): Promise<boolean> {
+    if (!externalTradeId.trim()) {
+      return false;
+    }
+
+    const row = await this.prisma.copyFill.findUnique({
+      where: {
+        externalTradeId
+      },
+      select: {
+        id: true
+      }
+    });
+    return Boolean(row?.id);
+  }
+
+  async listFollowerAddresses(copyProfileId?: string): Promise<string[]> {
+    const profiles = await this.prisma.copyProfile.findMany({
+      where: {
+        status: "ACTIVE",
+        ...(copyProfileId ? { id: copyProfileId } : {})
+      },
+      select: {
+        followerAddress: true
+      }
+    });
+
+    const addresses = profiles
+      .map((profile) => normalizeAddress(profile.followerAddress))
+      .filter((value): value is string => value !== null);
+    return [...new Set(addresses)];
+  }
+
+  async readFillReconcileCheckpoint(key: string): Promise<FillReconcileCheckpoint | null> {
+    const row = await this.prisma.systemStatus.findUnique({
+      where: {
+        component: "WORKER"
+      },
+      select: {
+        details: true
+      }
+    });
+
+    const details = asObject(row?.details);
+    const fillReconcile = asObject(details.fillReconcile);
+    const checkpoints = asObject(fillReconcile.checkpoints);
+    const raw = asObject(checkpoints[key]);
+    const cursorAtMs = readNumber(raw.cursorAtMs);
+    const updatedAtMs = readNumber(raw.updatedAtMs);
+    if (cursorAtMs === undefined || updatedAtMs === undefined) {
+      return null;
+    }
+
+    return {
+      cursorAtMs: Math.trunc(cursorAtMs),
+      updatedAtMs: Math.trunc(updatedAtMs)
+    };
+  }
+
+  async writeFillReconcileCheckpoint(key: string, checkpoint: FillReconcileCheckpoint): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.systemStatus.findUnique({
+        where: {
+          component: "WORKER"
+        },
+        select: {
+          details: true,
+          status: true
+        }
+      });
+
+      const currentDetails = asObject(existing?.details);
+      const fillReconcile = asObject(currentDetails.fillReconcile);
+      const checkpoints = asObject(fillReconcile.checkpoints);
+
+      checkpoints[key] = {
+        cursorAtMs: Math.trunc(checkpoint.cursorAtMs),
+        updatedAtMs: Math.trunc(checkpoint.updatedAtMs)
+      };
+
+      const nextDetails = {
+        ...currentDetails,
+        fillReconcile: {
+          ...fillReconcile,
+          checkpoints
+        }
+      };
+
+      await tx.systemStatus.upsert({
+        where: {
+          component: "WORKER"
+        },
+        create: {
+          component: "WORKER",
+          status: existing?.status ?? "OK",
+          details: toJsonValue(nextDetails)
+        },
+        update: {
+          details: toJsonValue(nextDetails)
+        }
+      });
+    });
+  }
+
+  async reportFillIssue(input: FillIssueInput): Promise<void> {
+    await this.prisma.errorEvent.create({
+      data: {
+        component: "WORKER",
+        severity: input.severity,
+        code: input.code,
+        message: input.message,
+        context: input.context ? toJsonValue(input.context) : undefined
+      }
+    });
   }
 
   private async loadLeaderSharesByToken(
@@ -399,12 +565,13 @@ const copyOrderSelect = {
   tokenId: true,
   marketId: true,
   side: true,
+  attemptedAt: true,
   externalOrderId: true,
   leaderWeights: true,
   unattributedWeight: true
 } satisfies Prisma.CopyOrderSelect;
 
-function mapCopyOrder(order: {
+type CopyOrderSelectRow = {
   id: string;
   copyProfileId: string;
   tokenId: string;
@@ -413,7 +580,10 @@ function mapCopyOrder(order: {
   externalOrderId: string | null;
   leaderWeights: Prisma.JsonValue;
   unattributedWeight: Prisma.Decimal | null;
-}): FillAttributionCopyOrder {
+  attemptedAt?: Date | null;
+};
+
+function mapCopyOrder(order: CopyOrderSelectRow): FillAttributionCopyOrder {
   return {
     id: order.id,
     copyProfileId: order.copyProfileId,
@@ -423,6 +593,53 @@ function mapCopyOrder(order: {
     externalOrderId: order.externalOrderId ?? undefined,
     leaderWeights: normalizeLeaderWeights(asObject(order.leaderWeights), order.unattributedWeight ? Number(order.unattributedWeight) : undefined),
     unattributedWeight: order.unattributedWeight ? Number(order.unattributedWeight) : undefined
+  };
+}
+
+export function selectFallbackOrderCandidate(
+  candidates: Array<CopyOrderSelectRow>
+): {
+  order?: CopyOrderSelectRow;
+  reason?: TradeOrderUnmatchedReason;
+  ambiguousCandidateOrderIds?: string[];
+} {
+  if (candidates.length === 0) {
+    return {
+      reason: "NO_FALLBACK_CANDIDATE"
+    };
+  }
+
+  if (candidates.length === 1) {
+    return {
+      order: candidates[0]
+    };
+  }
+
+  const newest = candidates[0];
+  if (!newest?.attemptedAt) {
+    return {
+      reason: "AMBIGUOUS_FALLBACK",
+      ambiguousCandidateOrderIds: candidates.map((candidate) => candidate.id)
+    };
+  }
+
+  const newestAtMs = newest.attemptedAt.getTime();
+  const closeCompetitors = candidates.filter((candidate) => {
+    if (!candidate.attemptedAt) {
+      return true;
+    }
+    return Math.abs(newestAtMs - candidate.attemptedAt.getTime()) <= AMBIGUOUS_FALLBACK_GAP_MS;
+  });
+
+  if (closeCompetitors.length > 1) {
+    return {
+      reason: "AMBIGUOUS_FALLBACK",
+      ambiguousCandidateOrderIds: closeCompetitors.map((candidate) => candidate.id)
+    };
+  }
+
+  return {
+    order: newest
   };
 }
 
@@ -595,6 +812,20 @@ function asObject(value: unknown): Record<string, unknown> {
     return {};
   }
   return value as Record<string, unknown>;
+}
+
+function normalizeAddress(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!/^0x[a-f0-9]{40}$/.test(normalized)) {
+    return null;
+  }
+  if (normalized === "0x0000000000000000000000000000000000000000") {
+    return null;
+  }
+  return normalized;
 }
 
 function toJsonValue(value: Record<string, unknown>): Prisma.InputJsonValue {

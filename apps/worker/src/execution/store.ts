@@ -245,7 +245,7 @@ export class PrismaExecutionStore implements ExecutionStore {
           id: input.attemptId
         },
         data: {
-          status: "EXECUTING",
+          status: "EXECUTED",
           decision: "EXECUTED",
           reason: null,
           attemptedAt: input.attemptedAt,
@@ -296,6 +296,89 @@ export class PrismaExecutionStore implements ExecutionStore {
     });
   }
 
+  async repairExecutionInvariants(now: Date): Promise<{ pendingDeltasConverted: number; attemptsClosed: number }> {
+    const activePendingStatuses: Array<"PENDING" | "ELIGIBLE" | "BLOCKED"> = ["PENDING", "ELIGIBLE", "BLOCKED"];
+    const placedLikeStatuses: Array<"PLACED" | "PARTIALLY_FILLED" | "FILLED"> = ["PLACED", "PARTIALLY_FILLED", "FILLED"];
+
+    return this.prisma.$transaction(async (tx) => {
+      const drifted = await tx.copyAttempt.findMany({
+        where: {
+          status: "EXECUTING",
+          decision: "EXECUTED",
+          copyOrders: {
+            some: {
+              status: {
+                in: placedLikeStatuses
+              }
+            }
+          }
+        },
+        select: {
+          id: true,
+          pendingDeltaId: true
+        }
+      });
+
+      const pendingDeltaIds = [...new Set(drifted.map((row) => row.pendingDeltaId).filter((value): value is string => Boolean(value)))];
+      const pendingConverted =
+        pendingDeltaIds.length > 0
+          ? await tx.pendingDelta.updateMany({
+              where: {
+                id: {
+                  in: pendingDeltaIds
+                },
+                status: {
+                  in: activePendingStatuses
+                }
+              },
+              data: {
+                status: "CONVERTED",
+                blockReason: null
+              }
+            })
+          : { count: 0 };
+
+      const attemptsClosed =
+        drifted.length > 0
+          ? await tx.copyAttempt.updateMany({
+              where: {
+                id: {
+                  in: drifted.map((row) => row.id)
+                },
+                status: "EXECUTING",
+                decision: "EXECUTED"
+              },
+              data: {
+                status: "EXECUTED"
+              }
+            })
+          : { count: 0 };
+
+      if (pendingConverted.count > 0 || attemptsClosed.count > 0) {
+        await tx.errorEvent.create({
+          data: {
+            component: "WORKER",
+            severity: "WARN",
+            code: "EXECUTION_INVARIANT_REPAIRED",
+            message:
+              "Repaired execution invariants for executing/executed attempts with placed-like orders by converting pending deltas and closing attempts",
+            context: toJsonValue({
+              pendingDeltasConverted: pendingConverted.count,
+              attemptsClosed: attemptsClosed.count,
+              repairedAttemptIds: drifted.map((row) => row.id).slice(0, 50),
+              repairedAt: now.toISOString()
+            })
+          }
+        });
+      }
+
+      return {
+        pendingDeltasConverted: pendingConverted.count,
+        attemptsClosed: attemptsClosed.count
+      };
+    });
+  }
+
   private async applyAttemptTransitionTx(tx: TxClient, input: ExecutionTransitionInput): Promise<void> {
     const status =
       input.terminalStatus === "FAILED"
@@ -322,7 +405,7 @@ export class PrismaExecutionStore implements ExecutionStore {
     });
 
     if (input.pendingDeltaId) {
-      const activeStatuses = ["PENDING", "ELIGIBLE", "BLOCKED"] as const;
+      const activeStatuses: Array<"PENDING" | "ELIGIBLE" | "BLOCKED"> = ["PENDING", "ELIGIBLE", "BLOCKED"];
       if (input.terminalStatus === "EXPIRED") {
         await tx.pendingDelta.updateMany({
           where: {

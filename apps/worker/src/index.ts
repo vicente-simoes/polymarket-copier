@@ -19,7 +19,7 @@ import {
   RedisMarketMetadataStore,
   type MarketMetadataRedisStore
 } from "./market/index.js";
-import { FillAttributionService, PrismaFillAttributionStore } from "./fills/index.js";
+import { ClobFillTradeHistoryClient, FillAttributionService, FillReconcileService, PrismaFillAttributionStore } from "./fills/index.js";
 import {
   ClobExecutionClient,
   ExecutionEngine,
@@ -324,17 +324,53 @@ async function bootstrap(): Promise<void> {
   });
   executionEngine.start();
 
+  const fillStore = new PrismaFillAttributionStore(prisma);
+  const parseStarvationCheckIntervalMs = Math.max(
+    5_000,
+    Math.min(30_000, Math.trunc((env.FILL_PARSE_STARVATION_WINDOW_SECONDS * 1000) / 5))
+  );
+
   const fillAttribution = new FillAttributionService({
-    store: new PrismaFillAttributionStore(prisma),
+    store: fillStore,
     config: {
       enabled: env.USER_CHANNEL_WS_ENABLED,
       url: env.CLOB_USER_WS_URL,
       apiKey: env.POLYMARKET_API_KEY,
       apiSecret: env.POLYMARKET_API_SECRET,
-      passphrase: env.POLYMARKET_PASSPHRASE
+      passphrase: env.POLYMARKET_PASSPHRASE,
+      parseStarvationWindowMs: env.FILL_PARSE_STARVATION_WINDOW_SECONDS * 1000,
+      parseStarvationMinMessages: env.FILL_PARSE_STARVATION_MIN_MESSAGES,
+      parseStarvationCheckIntervalMs
     }
   });
   fillAttribution.start();
+
+  const fillReconcile = new FillReconcileService({
+    store: fillStore,
+    tradeClient: new ClobFillTradeHistoryClient({
+      baseUrl: env.CLOB_REST_BASE_URL,
+      chainId: toSupportedChainId(env.POLYMARKET_CHAIN_ID),
+      creds: {
+        key: env.POLYMARKET_API_KEY,
+        secret: env.POLYMARKET_API_SECRET,
+        passphrase: env.POLYMARKET_PASSPHRASE
+      },
+      privateKey: signingConfig?.privateKey,
+      signatureType: signingConfig?.signatureType,
+      funderAddress: signingConfig?.funderAddress
+    }),
+    config: {
+      enabled: env.FILL_RECONCILE_ENABLED,
+      intervalMs: env.FILL_RECONCILE_INTERVAL_SECONDS * 1000,
+      defaultLookbackDays: env.FILL_BACKFILL_DEFAULT_LOOKBACK_DAYS,
+      maxPagesPerAddress: env.LEADER_POLL_MAX_PAGES_PER_LEADER
+    },
+    preferredMakerAddresses: [
+      env.POLYMARKET_FUNDER_ADDRESS ?? "",
+      polymarketSignerAddress ?? ""
+    ]
+  });
+  fillReconcile.start();
 
   const reconcileEngine = new ReconcileEngine({
     store: new PrismaReconcileStore({
@@ -390,6 +426,7 @@ async function bootstrap(): Promise<void> {
           targetNetting: targetNetting.getStatus(),
           execution: executionEngine.getStatus(),
           userChannel: fillAttribution.getStatus(),
+          fillReconcile: fillReconcile.getStatus(),
           reconcile: reconcileEngine.getStatus()
         })
       );
@@ -463,6 +500,17 @@ async function bootstrap(): Promise<void> {
       return;
     }
 
+    if (url.pathname === "/fill-reconcile/status") {
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          fillReconcile: fillReconcile.getStatus()
+        })
+      );
+      return;
+    }
+
     if (url.pathname === "/reconcile/status") {
       res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
       res.end(
@@ -506,6 +554,11 @@ async function bootstrap(): Promise<void> {
     copySystemEnabled: env.COPY_SYSTEM_ENABLED,
     tradeDetectionEnabled: env.TRADE_DETECTION_ENABLED,
     userChannelWsEnabled: env.USER_CHANNEL_WS_ENABLED,
+    fillReconcileEnabled: env.FILL_RECONCILE_ENABLED,
+    fillReconcileIntervalSeconds: env.FILL_RECONCILE_INTERVAL_SECONDS,
+    fillBackfillDefaultLookbackDays: env.FILL_BACKFILL_DEFAULT_LOOKBACK_DAYS,
+    fillParseStarvationWindowSeconds: env.FILL_PARSE_STARVATION_WINDOW_SECONDS,
+    fillParseStarvationMinMessages: env.FILL_PARSE_STARVATION_MIN_MESSAGES,
     reconcileIntervalSeconds: env.RECONCILE_INTERVAL_SECONDS,
     minNotionalPerOrderUsd: env.MIN_NOTIONAL_PER_ORDER_USD,
     maxExposurePerLeaderUsd: env.MAX_EXPOSURE_PER_LEADER_USD,
@@ -573,6 +626,7 @@ async function bootstrap(): Promise<void> {
       "DOWN"
     );
     reconcileEngine.stop();
+    fillReconcile.stop();
     fillAttribution.stop();
     executionEngine.stop();
     targetNetting.stop();
@@ -602,6 +656,13 @@ function toTargetPriceSource(priceSource: "WS" | "REST" | "NONE"): "MARKET_WS" |
     return "MARKET_REST";
   }
   return "UNKNOWN";
+}
+
+function toSupportedChainId(value: number): 137 | 80002 {
+  if (value === 137 || value === 80002) {
+    return value;
+  }
+  return 137;
 }
 
 function deriveSignerAddress(privateKey: string | undefined): string | null {

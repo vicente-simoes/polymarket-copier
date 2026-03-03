@@ -929,6 +929,10 @@ Lifecycle:
   - an order row is created/placed (→ visible in **Executions**), or
   - the linked pending delta is converted/expired/net-zero and the attempt is terminally expired/failed/skipped (→ visible in **Skipped attempts**)
 
+State contract after placement:
+- On successful order placement, the attempt must be finalized as `decision=EXECUTED` and `status=EXECUTED` (terminal).
+- `EXECUTING` is transient only while placement is in progress and must not persist after placement is acknowledged.
+
 #### C) Executions (orders placed / attempted)
 
 This table is the audit log of **venue-submitted execution attempts** (typically **FAK** orders) that received an exchange order id.

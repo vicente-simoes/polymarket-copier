@@ -125,6 +125,14 @@ export class ExecutionEngine {
     let backoffSkips = 0;
 
     try {
+      const repairOutcome = await this.store.repairExecutionInvariants(new Date(startedAtMs));
+      if (repairOutcome.pendingDeltasConverted > 0 || repairOutcome.attemptsClosed > 0) {
+        workerLogger.warn("execution.invariant_repaired", {
+          pendingDeltasConverted: repairOutcome.pendingDeltasConverted,
+          attemptsClosed: repairOutcome.attemptsClosed
+        });
+      }
+
       const attempts = await this.store.listOpenAttempts(this.config.maxAttemptsPerRun);
       for (const attempt of attempts) {
         if (!this.isRetryDue(attempt)) {

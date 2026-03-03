@@ -30,6 +30,9 @@ class FakeExecutionStore implements ExecutionStore {
   placed: Array<{ copyOrderId: string; status: string }> = [];
   failures: Array<{ copyOrderId: string; transition: ExecutionTransitionInput }> = [];
   deferred: ExecutionTransitionInput[] = [];
+  invariantRepairCalls = 0;
+  pendingDeltasConvertedByInvariantRepair = 0;
+  attemptsClosedByInvariantRepair = 0;
   private orderSeq = 0;
   private readonly lastOrderAtByKey = new Map<string, Date>();
 
@@ -137,6 +140,14 @@ class FakeExecutionStore implements ExecutionStore {
   async deferAttempt(input: ExecutionTransitionInput): Promise<void> {
     this.deferred.push(input);
     this.applyTransition(input);
+  }
+
+  async repairExecutionInvariants(): Promise<{ pendingDeltasConverted: number; attemptsClosed: number }> {
+    this.invariantRepairCalls += 1;
+    return {
+      pendingDeltasConverted: this.pendingDeltasConvertedByInvariantRepair,
+      attemptsClosed: this.attemptsClosedByInvariantRepair
+    };
   }
 
   private applyTransition(input: ExecutionTransitionInput): void {
@@ -274,6 +285,58 @@ test("Stage 9 execution engine places valid BUY and SELL FAK orders", async () =
   assert.equal(buyRequest?.amountKind, "USD");
   assert.equal(sellRequest?.amountKind, "SHARES");
   assert.equal(store.placed.length, 2);
+  assert.equal(store.invariantRepairCalls, 1);
+});
+
+test("Stage 9 runs invariant repair before processing open attempts", async () => {
+  const store = new FakeExecutionStore();
+  let nowMs = 1_050_000;
+
+  store.attempts.set("attempt-invariant", makeAttempt({
+    id: "attempt-invariant",
+    tokenId: "token-invariant",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-invariant", makeContext("attempt-invariant", {
+    tokenPrice: 0.5
+  }));
+  store.pendingDeltasConvertedByInvariantRepair = 2;
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-invariant" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-invariant",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-invariant",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(store.invariantRepairCalls, 1);
+  assert.equal(store.placed.length, 1);
+
+  nowMs += 10_000;
+  await engine.run();
+  assert.equal(store.invariantRepairCalls, 2);
 });
 
 test("Stage 9 guardrail failures stay pending and do not place orders", async () => {
