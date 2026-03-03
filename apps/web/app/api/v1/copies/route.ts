@@ -507,7 +507,7 @@ export async function GET(request: NextRequest) {
                 maxRetries: row.maxRetries,
                 status: toAttemptingStatus(row.status),
                 reason: row.reason,
-                message: extractAttemptMessage(row.errorPayload),
+                message: extractAttemptMessage(row.errorPayload, row.reason),
                 lastOrderStatus: latestOrder?.status ?? null,
                 lastOrderError: normalizeOrderErrorMessage(latestOrder?.errorMessage),
                 pendingStatus: row.pendingDelta?.status ?? null,
@@ -953,6 +953,20 @@ function readString(record: Record<string, unknown>, key: string): string | unde
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined
 }
 
+function readNumber(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key]
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) {
+      return parsed
+    }
+  }
+  return undefined
+}
+
 async function resolveOpenLeaderNames(rows: OpenRowLeaderMetaInput[]): Promise<Map<string, string[]>> {
   const leaderIds = new Set<string>()
   const contributorIdsByRow = new Map<string, string[]>()
@@ -1090,7 +1104,7 @@ async function resolveCurrentSpreadsByToken(
   return spreads
 }
 
-function extractAttemptMessage(payload: unknown): string | null {
+function extractAttemptMessage(payload: unknown, reason?: string | null): string | null {
   if (typeof payload === 'string') {
     return normalizeOrderErrorMessage(payload)
   }
@@ -1112,7 +1126,32 @@ function extractAttemptMessage(payload: unknown): string | null {
     readString(nestedError, 'detail') ??
     readString(nestedError, 'reason') ??
     readString(nestedError, 'cause')
-  return normalizeOrderErrorMessage(nested)
+  if (nested) {
+    return normalizeOrderErrorMessage(nested)
+  }
+
+  return inferAttemptMessageFromContext(root, reason)
+}
+
+function inferAttemptMessageFromContext(payload: Record<string, unknown>, reason?: string | null): string | null {
+  const stage = readString(payload, 'stage')
+  if (reason === 'RATE_LIMIT' && stage === 'submit_order') {
+    return 'not enough balance / allowance'
+  }
+
+  if (readNumber(payload, 'maxDailyNotionalTurnoverUsd') !== undefined) {
+    return 'daily notional turnover cap exceeded'
+  }
+
+  if (readNumber(payload, 'maxHourlyNotionalTurnoverUsd') !== undefined) {
+    return 'hourly notional turnover cap exceeded'
+  }
+
+  if (readNumber(payload, 'cooldownPerMarketSeconds') !== undefined) {
+    return 'market cooldown is active'
+  }
+
+  return null
 }
 
 function normalizeOrderErrorMessage(errorMessage: string | null | undefined): string | null {

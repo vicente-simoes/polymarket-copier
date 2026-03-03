@@ -669,6 +669,7 @@ export class ExecutionEngine {
       message: args.message,
       context: {
         ...(args.context ?? {}),
+        ...(args.message ? { message: args.message } : {}),
         backoffMs: this.computeBackoffMs(nextRetries),
         retries: nextRetries
       },
