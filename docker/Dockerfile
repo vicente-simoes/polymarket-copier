@@ -20,3 +20,16 @@ COPY packages/db/package.json packages/db/package.json
 RUN pnpm install --frozen-lockfile
 
 COPY . .
+
+# Prisma client must exist for runtime imports in worker/web.
+RUN pnpm --filter @copybot/db generate
+
+# Build Next.js for production runtime (web service uses `next start`).
+RUN AUTH_SECRET=build-secret \
+  AUTH_GITHUB_ID=build-id \
+  AUTH_GITHUB_SECRET=build-secret \
+  AUTH_GITHUB_ALLOWED_USERS=build-user \
+  AUTH_URL=http://localhost:3000 \
+  DATABASE_URL=postgresql://postgres:postgres@localhost:5432/polymarket_copier \
+  REDIS_URL=redis://localhost:6379 \
+  pnpm --filter @copybot/web build

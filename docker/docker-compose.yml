@@ -56,7 +56,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
-    command: ["pnpm", "--filter", "@copybot/web", "dev", "--hostname", "0.0.0.0", "--port", "3000"]
+    command: ["pnpm", "--filter", "@copybot/web", "start", "--hostname", "0.0.0.0", "--port", "3000"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,7 +65,7 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      NODE_ENV: development
+      NODE_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-polymarket_copier}
       REDIS_URL: redis://redis:6379
       AUTH_SECRET: ${AUTH_SECRET:-replace-with-long-random-secret}
@@ -97,7 +97,7 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      NODE_ENV: development
+      NODE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-polymarket_copier}
       REDIS_URL: redis://redis:6379

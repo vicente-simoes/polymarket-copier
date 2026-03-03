@@ -156,35 +156,29 @@ Notes:
 
 ## Deployment Guide (DigitalOcean Droplet + `polymarketspy.live`)
 
-ssh polybot@165.22.205.182
-
-This section is a production-style step-by-step guide for deploying the full stack on a DigitalOcean droplet and serving the dashboard at:
+This is a production-style guide for deploying on a droplet and serving the dashboard at:
 
 - `https://polymarketspy.live`
 
 Assumptions:
-- Ubuntu droplet.
-- You can SSH into the droplet.
-- Repo is already cloned at `~/apps/polymarket-copier`.
-- Domain DNS is managed by you.
+- Ubuntu droplet
+- SSH access (example: `ssh polybot@165.22.205.182`)
+- Repo already cloned at `~/apps/polymarket-copier`
+- Domain DNS is under your control
 
 ### 1) Point DNS to the droplet
 
-In your DNS provider:
+Create DNS records:
 
-1. Create an `A` record for root:
-   - host/name: `@`
-   - value: `165.22.205.182`
-2. Optional `www` alias:
-   - host/name: `www`
-   - value: `165.22.205.182`
+1. `A` record `@` -> `165.22.205.182`
+2. Optional `A` record `www` -> `165.22.205.182`
 
-Verify DNS propagation:
+Verify:
 
 - `dig +short polymarketspy.live`
 - `dig +short www.polymarketspy.live`
 
-### 2) Install system dependencies on droplet
+### 2) Install system dependencies
 
 ```bash
 sudo apt update
@@ -199,37 +193,31 @@ Verify:
 - `docker compose version`
 - `nginx -v`
 
-### 3) Prepare application env
+### 3) Prepare `.env` with production values
 
 ```bash
 cd ~/apps/polymarket-copier
 cp .env.example .env
 ```
 
-Edit `.env` and set at least:
+Set at least:
 
 ```dotenv
-# Web auth + public URL
 AUTH_SECRET=<long-random-secret>
 AUTH_GITHUB_ID=<github-oauth-client-id>
 AUTH_GITHUB_SECRET=<github-oauth-client-secret>
-AUTH_GITHUB_ALLOWED_USERS=<your-github-username[,other-usernames...]>
+AUTH_GITHUB_ALLOWED_USERS=<your-github-login[,other-logins...]>
 AUTH_URL=https://polymarketspy.live
 AUTH_TRUST_HOST=true
 
-# Datastores (use strong random passwords in production)
 POSTGRES_DB=polymarket_copier
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=<64-hex-random-string>
-# Host-side DB URL for local scripts/tools on droplet
 DATABASE_URL=postgresql://postgres:<same-password>@localhost:5432/polymarket_copier
 
-# Optional Redis auth hardening (see Step 4 for compose wiring)
 REDIS_PASSWORD=<64-hex-random-string>
-# Host-side Redis URL for local scripts/tools on droplet
 REDIS_URL=redis://:<same-password>@localhost:6379
 
-# Polymarket credentials
 POLYMARKET_FOLLOWER_PRIVATE_KEY=0x...
 POLYMARKET_API_KEY=...
 POLYMARKET_API_SECRET=...
@@ -237,23 +225,21 @@ POLYMARKET_PASSPHRASE=...
 POLYMARKET_SIGNATURE_TYPE=EOA
 POLYMARKET_FUNDER_ADDRESS=
 
-# On-chain trigger source
 ALCHEMY_WS_URL=wss://polygon-mainnet.g.alchemy.com/v2/<your-key>
 
-# Safety defaults (recommended first boot)
 COPY_SYSTEM_ENABLED=false
 DRY_RUN_MODE=false
 ```
 
-Generate strong secrets/passwords:
+Generate secrets:
 
-- `openssl rand -hex 32` (good for `AUTH_SECRET`)
-- `openssl rand -hex 32` (good for `POSTGRES_PASSWORD`)
-- `openssl rand -hex 32` (good for `REDIS_PASSWORD`)
+- `openssl rand -hex 32` for `AUTH_SECRET`
+- `openssl rand -hex 32` for `POSTGRES_PASSWORD`
+- `openssl rand -hex 32` for `REDIS_PASSWORD`
 
-### 4) Ensure worker receives signing/env vars in Compose
+### 4) Ensure Compose receives required worker vars
 
-Open `docker/docker-compose.yml` and confirm `worker.environment` includes:
+In `docker/docker-compose.yml`, under `worker.environment`, ensure:
 
 - `POLYMARKET_FOLLOWER_PRIVATE_KEY`
 - `POLYMARKET_CHAIN_ID`
@@ -261,13 +247,8 @@ Open `docker/docker-compose.yml` and confirm `worker.environment` includes:
 - `POLYMARKET_FUNDER_ADDRESS`
 - `EXECUTION_ENGINE_ENABLED`
 - `DRY_RUN_MODE`
-- `POSTGRES_PASSWORD` (already used by DB URL interpolation)
 
-Optional Redis password hardening:
-- If you set `REDIS_PASSWORD`, update compose so Redis starts with `--requirepass` and web/worker use `redis://:${REDIS_PASSWORD}@redis:6379`.
-- If you do not enable Redis auth, keep Redis private (no public port mapping + firewall closed for `6379`).
-
-If your file is missing them, add:
+Example:
 
 ```yaml
       POLYMARKET_FOLLOWER_PRIVATE_KEY: ${POLYMARKET_FOLLOWER_PRIVATE_KEY:-}
@@ -278,25 +259,37 @@ If your file is missing them, add:
       DRY_RUN_MODE: ${DRY_RUN_MODE:-false}
 ```
 
-### 5) Start the full Docker stack
+### 5) Bring up stack with explicit env file
+
+Always pass `--env-file .env` to avoid shell-variable overrides:
 
 ```bash
 cd ~/apps/polymarket-copier
-docker compose -f docker/docker-compose.yml up -d --build
-docker compose -f docker/docker-compose.yml ps
+docker compose --env-file .env -f docker/docker-compose.yml up -d --build
+docker compose --env-file .env -f docker/docker-compose.yml ps
 ```
 
-Quick health checks:
+Verify resolved env values inside Compose:
+
+```bash
+docker compose --env-file .env -f docker/docker-compose.yml config | rg -n 'AUTH_GITHUB_ALLOWED_USERS|AUTH_URL|POLYMARKET_FOLLOWER_PRIVATE_KEY|POLYMARKET_SIGNATURE_TYPE|POLYMARKET_FUNDER_ADDRESS'
+```
+
+Health checks:
 
 - `curl -sS http://127.0.0.1:8080/health`
 - `curl -sS http://127.0.0.1:8080/api/health`
-- `docker compose -f docker/docker-compose.yml logs --tail=200 worker`
+- `docker compose --env-file .env -f docker/docker-compose.yml logs --tail=200 worker`
 
-### 6) Put host Nginx in front of Docker app
+Important DB note:
+- If you change `POSTGRES_PASSWORD` after Postgres volume initialization, auth may fail.
+- Either restore old password or reset volumes:
+  - `docker compose --env-file .env -f docker/docker-compose.yml down -v`
+  - then `up -d --build` again.
 
-Use host Nginx for public 80/443 and proxy to dockerized app on `127.0.0.1:8080`.
+### 6) Configure host Nginx reverse proxy
 
-Create site config:
+Proxy public 80/443 to the Docker nginx on `127.0.0.1:8080` (not `:3000`):
 
 ```bash
 sudo tee /etc/nginx/sites-available/polymarketspy.live >/dev/null <<'EOF'
@@ -314,94 +307,90 @@ server {
   }
 }
 EOF
+
+sudo ln -sf /etc/nginx/sites-available/polymarketspy.live /etc/nginx/sites-enabled/polymarketspy.live
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl enable --now nginx
+sudo systemctl reload nginx
 ```
 
-Enable and reload:
+### 7) Issue/attach TLS cert
 
 ```bash
-sudo ln -sf /etc/nginx/sites-available/polymarketspy.live /etc/nginx/sites-enabled/polymarketspy.live
+sudo certbot --nginx -d polymarketspy.live -d www.polymarketspy.live
+sudo certbot renew --dry-run
+```
+
+### 8) Remove duplicate vhosts if conflicts appear
+
+If nginx warns about conflicting server names, keep only one active domain config:
+
+```bash
+sudo grep -RIn "polymarketspy.live\|www.polymarketspy.live" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d
+```
+
+Remove duplicate symlink(s), then reload:
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/<duplicate-file>
 sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-### 7) Issue TLS certificate (Let’s Encrypt)
-
-```bash
-sudo certbot --nginx -d polymarketspy.live -d www.polymarketspy.live
-```
-
-Auto-renew test:
-
-- `sudo certbot renew --dry-run`
-
-### 8) Configure firewall
+### 9) Configure firewall
 
 ```bash
 sudo ufw allow OpenSSH
 sudo ufw allow 'Nginx Full'
+sudo ufw deny 8080/tcp
+sudo ufw deny 5432/tcp
+sudo ufw deny 6379/tcp
 sudo ufw enable
-sudo ufw status
+sudo ufw status verbose
 ```
 
-### 9) Configure GitHub OAuth app for production URL
+### 10) Configure GitHub OAuth app
 
-In GitHub OAuth App settings:
+Set in GitHub OAuth app:
 
 - Homepage URL: `https://polymarketspy.live`
-- Authorization callback URL: `https://polymarketspy.live/api/auth/callback/github`
+- Callback URL: `https://polymarketspy.live/api/auth/callback/github`
 
-Important:
-- Callback URL must match exactly (scheme, host, path).
-- After changing OAuth or env vars, restart web container:
-  - `docker compose -f docker/docker-compose.yml restart web`
+After auth env updates:
 
-### 10) First boot safety checklist
+- `docker compose --env-file .env -f docker/docker-compose.yml restart web`
 
-1. Keep trading disabled initially:
-   - `COPY_SYSTEM_ENABLED=false`
-2. Start stack and sign in to dashboard.
-3. Verify leader ingestion, status, and health pages.
-4. Confirm worker logs have no auth/signing errors.
-5. Only then enable live copy from Config page (or env + restart).
+### 11) Final validation
 
-### 11) Day-2 operations
+```bash
+curl -I https://polymarketspy.live/
+curl -I https://polymarketspy.live/login
+curl -sS https://polymarketspy.live/api/health
+```
 
-Update to latest code:
+Expected:
+- `/` redirects to `/login` when not authenticated
+- `/login` returns `200`
+- `/api/health` returns JSON status `ok`
+
+### 12) Day-2 operations
 
 ```bash
 cd ~/apps/polymarket-copier
 git pull
-docker compose -f docker/docker-compose.yml up -d --build
-docker compose -f docker/docker-compose.yml ps
+docker compose --env-file .env -f docker/docker-compose.yml up -d --build
+docker compose --env-file .env -f docker/docker-compose.yml ps
 ```
 
 Logs:
 
-- `docker compose -f docker/docker-compose.yml logs -f --tail=200`
-- `docker compose -f docker/docker-compose.yml logs -f --tail=200 worker`
-- `docker compose -f docker/docker-compose.yml logs -f --tail=200 web`
+- `docker compose --env-file .env -f docker/docker-compose.yml logs -f --tail=200`
+- `docker compose --env-file .env -f docker/docker-compose.yml logs -f --tail=200 worker`
+- `docker compose --env-file .env -f docker/docker-compose.yml logs -f --tail=200 web`
 
-Restart a single service:
+### 13) Security notes
 
-- `docker compose -f docker/docker-compose.yml restart worker`
-- `docker compose -f docker/docker-compose.yml restart web`
-
-Stop/start:
-
-- `docker compose -f docker/docker-compose.yml down`
-- `docker compose -f docker/docker-compose.yml up -d`
-
-### 12) Troubleshooting quick checks
-
-1. App not reachable:
-   - `sudo systemctl status nginx`
-   - `curl -I http://127.0.0.1:8080/health`
-2. Worker unhealthy:
-   - `docker compose -f docker/docker-compose.yml logs --tail=200 worker`
-   - check Polymarket creds + follower signing env.
-3. OAuth login fails:
-   - verify `AUTH_GITHUB_*` env vars
-   - verify GitHub callback URL exactly matches `https://polymarketspy.live/api/auth/callback/github`
-4. Cert issues:
-   - `sudo certbot certificates`
-   - `sudo certbot renew --dry-run`
+- Never paste private keys in terminal screenshots/chat.
+- If a key was exposed, rotate immediately and regenerate Polymarket API credentials.
+- Keep `COPY_SYSTEM_ENABLED=false` until login, leader setup, and health checks are confirmed.
