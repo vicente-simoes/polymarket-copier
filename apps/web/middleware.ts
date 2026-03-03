@@ -80,5 +80,5 @@ export default auth((req) => {
 })
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|_next/webpack-hmr).*)']
+  matcher: ['/((?!api/health|api/auth|_next/static|_next/image|_next/webpack-hmr).*)']
 }

@@ -171,7 +171,7 @@ function statusTone(status: string): 'positive' | 'warning' | 'negative' | 'neut
   if (status === 'ERROR' || status === 'DISCONNECTED' || status === 'FAILED') {
     return 'negative'
   }
-  if (status === 'RETRYING' || status === 'BLOCKED') {
+  if (status === 'RETRYING' || status === 'BLOCKED' || status === 'PARTIALLY_FILLED') {
     return 'warning'
   }
   return 'neutral'
