@@ -1,5 +1,57 @@
 import { Prisma, PrismaClient } from '@prisma/client'
-import { DEFAULT_SYSTEM_CONFIG, resolveSystemConfig } from '../../../apps/web/lib/server/config'
+import webConfigModule from '../../../apps/web/lib/server/config.ts'
+
+const { DEFAULT_SYSTEM_CONFIG, resolveSystemConfig } = webConfigModule as {
+  DEFAULT_SYSTEM_CONFIG: {
+    masterSwitches: {
+      tradeDetectionEnabled: boolean
+      userChannelWsEnabled: boolean
+    }
+    reconcile: {
+      intervalSeconds: number
+    }
+  }
+  resolveSystemConfig: (
+    rawConfig: unknown,
+    fallbackRatio: number
+  ) => {
+    masterSwitches: {
+      tradeDetectionEnabled: boolean
+      userChannelWsEnabled: boolean
+    }
+    reconcile: {
+      intervalSeconds: number
+    }
+  }
+  DEFAULT_RUNTIME_OPS_CONFIG: Record<string, unknown>
+  toGlobalRuntimeConfigValueWithOps: (
+    config: {
+      masterSwitches: {
+        tradeDetectionEnabled: boolean
+        userChannelWsEnabled: boolean
+      }
+      reconcile: {
+        intervalSeconds: number
+      }
+    },
+    runtimeOps: Record<string, unknown>
+  ) => Record<string, unknown>
+}
+const { DEFAULT_RUNTIME_OPS_CONFIG, toGlobalRuntimeConfigValueWithOps } = webConfigModule as {
+  DEFAULT_RUNTIME_OPS_CONFIG: Record<string, unknown>
+  toGlobalRuntimeConfigValueWithOps: (
+    config: {
+      masterSwitches: {
+        tradeDetectionEnabled: boolean
+        userChannelWsEnabled: boolean
+      }
+      reconcile: {
+        intervalSeconds: number
+      }
+    },
+    runtimeOps: Record<string, unknown>
+  ) => Record<string, unknown>
+}
 
 const GLOBAL_RUNTIME_CONFIG_ID = 'global'
 
@@ -41,15 +93,7 @@ async function main(): Promise<void> {
       ? resolveSystemConfig(copyProfile.config, Number(copyProfile.defaultRatio))
       : DEFAULT_SYSTEM_CONFIG
 
-    const runtimeConfig = {
-      masterSwitches: {
-        tradeDetectionEnabled: resolved.masterSwitches.tradeDetectionEnabled,
-        userChannelWsEnabled: resolved.masterSwitches.userChannelWsEnabled
-      },
-      reconcile: {
-        intervalSeconds: resolved.reconcile.intervalSeconds
-      }
-    }
+    const runtimeConfig = toGlobalRuntimeConfigValueWithOps(resolved, DEFAULT_RUNTIME_OPS_CONFIG)
 
     const payload = JSON.stringify(runtimeConfig)
     await prisma.$executeRaw(

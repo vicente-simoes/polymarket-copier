@@ -56,6 +56,7 @@ export class ReconcileEngine {
   }
 
   start(): void {
+    this.status.enabled = this.config.enabled;
     if (!this.config.enabled) {
       return;
     }
@@ -65,6 +66,22 @@ export class ReconcileEngine {
     }
 
     void this.run();
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (this.config.enabled === enabled) {
+      this.status.enabled = enabled;
+      return;
+    }
+
+    this.config.enabled = enabled;
+    this.status.enabled = enabled;
+    if (enabled) {
+      this.start();
+      return;
+    }
+
+    this.stop();
   }
 
   setIntervalMs(intervalMs: number): void {
@@ -82,11 +99,23 @@ export class ReconcileEngine {
     this.startInterval();
   }
 
+  setStaleThresholds(input: { leaderSeconds: number; followerSeconds: number }): void {
+    const leaderMs = Math.max(1000, Math.trunc(input.leaderSeconds * 1000));
+    const followerMs = Math.max(1000, Math.trunc(input.followerSeconds * 1000));
+    this.config.staleLeaderSyncMs = leaderMs;
+    this.config.staleFollowerSyncMs = followerMs;
+  }
+
+  setGuardrailFailureCycleThreshold(threshold: number): void {
+    this.config.guardrailFailureCycleThreshold = Math.max(1, Math.trunc(threshold));
+  }
+
   stop(): void {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = undefined;
     }
+    this.status.running = false;
   }
 
   getStatus(): ReconcileEngineStatus {

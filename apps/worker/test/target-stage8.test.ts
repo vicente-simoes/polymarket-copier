@@ -679,6 +679,35 @@ test("Stage 8 clears stale pending deltas when token disappears from leader and 
   assert.equal(store.attempts.size, 0);
 });
 
+test("Stage 8 runtime setters update target netting config", () => {
+  const store = new FakeTargetStore();
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 1,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    resolvePriceSnapshot: async () => null
+  });
+
+  engine.setEnabled(false);
+  engine.setIntervalMs(7_500);
+  engine.setTrackingErrorBps(15);
+
+  const internals = engine as unknown as {
+    config: { enabled: boolean; intervalMs: number; trackingErrorBps: number };
+    status: { enabled: boolean };
+  };
+  assert.equal(internals.config.enabled, false);
+  assert.equal(internals.status.enabled, false);
+  assert.equal(internals.config.intervalMs, 7_500);
+  assert.equal(internals.config.trackingErrorBps, 15);
+});
+
 function pendingKey(copyProfileId: string, tokenId: string, side: PendingDeltaSide): string {
   return `${copyProfileId}|${tokenId}|${side}`;
 }

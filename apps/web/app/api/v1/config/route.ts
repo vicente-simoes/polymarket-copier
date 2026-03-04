@@ -3,15 +3,20 @@ import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { jsonContract, jsonError, toNumber } from '@/lib/server/api'
 import {
-  applyGlobalRuntimeOverrides,
+  DEFAULT_RUNTIME_OPS_CONFIG,
   DEFAULT_SYSTEM_CONFIG,
+  RuntimeOpsConfigSchema,
   SystemConfigPatchSchema,
   SystemConfigSchema,
+  applyGlobalRuntimeOverrides,
+  applyRuntimeOpsPatch,
   applySystemConfigPatch,
   equalGlobalRuntimeConfig,
-  resolveSystemConfig,
+  resolveEffectiveRuntimeOpsConfig,
   resolveGlobalRuntimeConfig,
-  toGlobalRuntimeConfigValue
+  resolveSystemConfig,
+  toGlobalRuntimeConfigValueWithOps,
+  toRuntimeOpsConfigRecord
 } from '@/lib/server/config'
 import { prisma } from '@/lib/server/db'
 
@@ -28,7 +33,9 @@ const ConfigDataSchema = z.object({
   copyProfileId: z.string().nullable(),
   updatedAt: z.string().nullable(),
   config: SystemConfigSchema,
-  defaults: SystemConfigSchema
+  defaults: SystemConfigSchema,
+  runtimeOps: RuntimeOpsConfigSchema,
+  runtimeOpsDefaults: RuntimeOpsConfigSchema
 })
 
 export async function GET(request: NextRequest) {
@@ -68,13 +75,16 @@ export async function GET(request: NextRequest) {
       readGlobalRuntimeConfigRow(prisma)
     ])
     const globalRuntimeOverrides = resolveGlobalRuntimeConfig(globalRuntimeRow?.config)
+    const runtimeOps = resolveEffectiveRuntimeOpsConfig(globalRuntimeOverrides.runtimeOps)
 
     if (!copyProfile) {
       return jsonContract(ConfigDataSchema, {
         copyProfileId: null,
         updatedAt: globalRuntimeRow?.updatedAt.toISOString() ?? null,
         config: applyGlobalRuntimeOverrides(DEFAULT_SYSTEM_CONFIG, globalRuntimeOverrides),
-        defaults: DEFAULT_SYSTEM_CONFIG
+        defaults: DEFAULT_SYSTEM_CONFIG,
+        runtimeOps,
+        runtimeOpsDefaults: DEFAULT_RUNTIME_OPS_CONFIG
       })
     }
 
@@ -87,7 +97,9 @@ export async function GET(request: NextRequest) {
         copyProfileId: copyProfile.id,
         updatedAt: maxUpdatedAt(copyProfile.updatedAt, globalRuntimeRow?.updatedAt),
         config: resolvedConfig,
-        defaults: DEFAULT_SYSTEM_CONFIG
+        defaults: DEFAULT_SYSTEM_CONFIG,
+        runtimeOps,
+        runtimeOpsDefaults: DEFAULT_RUNTIME_OPS_CONFIG
       },
       {
         cacheSeconds: 5
@@ -143,13 +155,16 @@ export async function PATCH(request: NextRequest) {
 
     const previousConfig = resolveSystemConfig(profile.config, toNumber(profile.defaultRatio))
     const nextConfig = applySystemConfigPatch(previousConfig, body)
-    const nextGlobalRuntimeConfig = toGlobalRuntimeConfigValue(nextConfig)
 
     await prisma.$transaction(async (tx) => {
       const previousGlobalRuntimeRow = await readGlobalRuntimeConfigRow(tx as unknown as SqlClient)
       const previousGlobalRuntime = previousGlobalRuntimeRow?.config
         ? resolveGlobalRuntimeConfig(previousGlobalRuntimeRow.config)
-        : resolveGlobalRuntimeConfig(toGlobalRuntimeConfigValue(previousConfig))
+        : resolveGlobalRuntimeConfig(toGlobalRuntimeConfigValueWithOps(previousConfig, DEFAULT_RUNTIME_OPS_CONFIG))
+
+      const previousRuntimeOps = resolveEffectiveRuntimeOpsConfig(previousGlobalRuntime.runtimeOps)
+      const nextRuntimeOps = applyRuntimeOpsPatch(previousRuntimeOps, body.runtimeOps ?? {})
+      const nextGlobalRuntimeConfig = toGlobalRuntimeConfigValueWithOps(nextConfig, nextRuntimeOps)
       const nextGlobalRuntime = resolveGlobalRuntimeConfig(nextGlobalRuntimeConfig)
 
       await tx.copyProfile.update({
@@ -199,8 +214,22 @@ export async function PATCH(request: NextRequest) {
             copyProfileId: null,
             changedBy: body.changedBy ?? request.headers.get('x-user') ?? null,
             changeType: 'UPDATED',
-            previousValue: toJsonValue(toGlobalRuntimeConfigRecord(previousGlobalRuntime)),
-            nextValue: toJsonValue(toGlobalRuntimeConfigRecord(nextGlobalRuntime)),
+            previousValue: toJsonValue(
+              toGlobalRuntimeConfigRecord({
+                tradeDetectionEnabled: previousGlobalRuntime.tradeDetectionEnabled,
+                userChannelWsEnabled: previousGlobalRuntime.userChannelWsEnabled,
+                reconcileIntervalSeconds: previousGlobalRuntime.reconcileIntervalSeconds,
+                runtimeOps: resolveEffectiveRuntimeOpsConfig(previousGlobalRuntime.runtimeOps)
+              })
+            ),
+            nextValue: toJsonValue(
+              toGlobalRuntimeConfigRecord({
+                tradeDetectionEnabled: nextGlobalRuntime.tradeDetectionEnabled,
+                userChannelWsEnabled: nextGlobalRuntime.userChannelWsEnabled,
+                reconcileIntervalSeconds: nextGlobalRuntime.reconcileIntervalSeconds,
+                runtimeOps: resolveEffectiveRuntimeOpsConfig(nextGlobalRuntime.runtimeOps)
+              })
+            ),
             reason: body.reason ?? null
           }
         })
@@ -225,13 +254,16 @@ export async function PATCH(request: NextRequest) {
     const profileConfig = updatedProfile
       ? resolveSystemConfig(updatedProfile.config, toNumber(updatedProfile.defaultRatio))
       : nextConfig
-    const resolvedConfig = applyGlobalRuntimeOverrides(profileConfig, resolveGlobalRuntimeConfig(globalRuntimeRow?.config))
+    const globalRuntimeOverrides = resolveGlobalRuntimeConfig(globalRuntimeRow?.config)
+    const resolvedConfig = applyGlobalRuntimeOverrides(profileConfig, globalRuntimeOverrides)
 
     return jsonContract(ConfigDataSchema, {
       copyProfileId: updatedProfile?.id ?? profile.id,
       updatedAt: maxUpdatedAt(updatedProfile?.updatedAt, globalRuntimeRow?.updatedAt),
       config: resolvedConfig,
-      defaults: DEFAULT_SYSTEM_CONFIG
+      defaults: DEFAULT_SYSTEM_CONFIG,
+      runtimeOps: resolveEffectiveRuntimeOpsConfig(globalRuntimeOverrides.runtimeOps),
+      runtimeOpsDefaults: DEFAULT_RUNTIME_OPS_CONFIG
     })
   } catch (error) {
     if (error instanceof z.ZodError) {
@@ -254,6 +286,7 @@ function toGlobalRuntimeConfigRecord(config: {
   tradeDetectionEnabled?: boolean
   userChannelWsEnabled?: boolean
   reconcileIntervalSeconds?: number
+  runtimeOps: ReturnType<typeof resolveEffectiveRuntimeOpsConfig>
 }): Record<string, unknown> {
   return {
     masterSwitches: {
@@ -262,7 +295,8 @@ function toGlobalRuntimeConfigRecord(config: {
     },
     reconcile: {
       ...(config.reconcileIntervalSeconds !== undefined ? { intervalSeconds: config.reconcileIntervalSeconds } : {})
-    }
+    },
+    ...toRuntimeOpsConfigRecord(config.runtimeOps)
   }
 }
 

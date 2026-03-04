@@ -365,6 +365,68 @@ test("fill attribution runtime enable toggle delegates to start/stop", () => {
   assert.equal(service.getStatus().enabled, false);
 });
 
+test("fill attribution parse starvation config can be updated at runtime", () => {
+  const store = new FakeFillStore();
+  const service = new FillAttributionService({
+    store,
+    config: {
+      enabled: true,
+      url: "wss://ws.example",
+      apiKey: "key",
+      apiSecret: "secret",
+      passphrase: "pass",
+      parseStarvationWindowMs: 5_000,
+      parseStarvationMinMessages: 3,
+      parseStarvationCheckIntervalMs: 1_000
+    },
+    now: () => 1_000
+  });
+
+  service.setParseStarvationConfig({
+    windowSeconds: 120,
+    minMessages: 17
+  });
+
+  const internals = service as unknown as {
+    config: {
+      parseStarvationWindowMs: number;
+      parseStarvationMinMessages: number;
+      parseStarvationCheckIntervalMs: number;
+    };
+  };
+  assert.equal(internals.config.parseStarvationWindowMs, 120_000);
+  assert.equal(internals.config.parseStarvationMinMessages, 17);
+  assert.equal(internals.config.parseStarvationCheckIntervalMs, 24_000);
+});
+
+test("fill reconcile runtime enable and interval updates apply", () => {
+  const store = new FakeFillStore();
+  const reconcile = new FillReconcileService({
+    store,
+    tradeClient: new FakeTradeHistoryClient({}),
+    config: {
+      enabled: false,
+      intervalMs: 30_000,
+      defaultLookbackDays: 30,
+      maxPagesPerAddress: 2
+    },
+    preferredMakerAddresses: []
+  });
+
+  reconcile.setEnabled(true);
+  reconcile.setEnabled(true);
+  reconcile.setIntervalMs(4_500);
+  reconcile.setEnabled(false);
+
+  const internals = reconcile as unknown as {
+    config: { enabled: boolean; intervalMs: number };
+    status: { enabled: boolean };
+  };
+  assert.equal(internals.config.enabled, false);
+  assert.equal(internals.status.enabled, false);
+  assert.equal(internals.config.intervalMs, 4_500);
+});
+
 function makeTradeEvent(overrides: Partial<UserTradeFillEvent>): UserTradeFillEvent {
   return {
     externalTradeId: overrides.externalTradeId ?? "trade-1",

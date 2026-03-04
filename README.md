@@ -247,6 +247,7 @@ In `docker/docker-compose.yml`, under `worker.environment`, ensure:
 - `POLYMARKET_FUNDER_ADDRESS`
 - `EXECUTION_ENGINE_ENABLED`
 - `DRY_RUN_MODE`
+- `WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS` (optional, default `5000`)
 
 Example:
 
@@ -257,6 +258,7 @@ Example:
       POLYMARKET_FUNDER_ADDRESS: ${POLYMARKET_FUNDER_ADDRESS:-}
       EXECUTION_ENGINE_ENABLED: ${EXECUTION_ENGINE_ENABLED:-true}
       DRY_RUN_MODE: ${DRY_RUN_MODE:-false}
+      WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS: ${WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS:-5000}
 ```
 
 ### 5) Bring up stack with explicit env file
@@ -266,8 +268,16 @@ Always pass `--env-file .env` to avoid shell-variable overrides:
 ```bash
 cd ~/apps/polymarket-copier
 docker compose --env-file .env -f docker/docker-compose.yml up -d --build
+docker compose --env-file .env -f docker/docker-compose.yml run --rm migrate pnpm --filter @copybot/db seed:global-runtime
+docker compose --env-file .env -f docker/docker-compose.yml up -d worker web
 docker compose --env-file .env -f docker/docker-compose.yml ps
 ```
+
+Notes:
+
+- `migrate` runs Prisma migrations automatically as part of `up -d --build`.
+- `seed:global-runtime` is idempotent and initializes/updates the singleton runtime-config row used for dynamic DB-driven runtime controls.
+- Running `up -d worker web` after seeding ensures both services are definitely on latest code/config state.
 
 Verify resolved env values inside Compose:
 
@@ -374,14 +384,69 @@ Expected:
 - `/login` returns `200`
 - `/api/health` returns JSON status `ok`
 
-### 12) Day-2 operations
+### 12) Runtime config ownership (Config page vs env)
+
+Config-page changes now split into two DB-driven buckets:
+
+- Profile-scoped (`copyProfile.config`): guardrails + sizing values per profile.
+- Global runtime ops (`GlobalRuntimeConfig.config.ops`): operations-safe toggles/intervals shared by all profiles.
+
+Runtime precedence:
+
+- Profile execution/netting behavior: per-leader override (where supported) -> profile config -> env fallback.
+- Global runtime ops: `GlobalRuntimeConfig.config.ops` -> env fallback.
+
+These global runtime ops are live-editable without worker restart:
+
+- `chainTriggerWsEnabled`
+- `fillReconcileEnabled`
+- `fillReconcileIntervalSeconds`
+- `fillParseStarvationWindowSeconds`
+- `fillParseStarvationMinMessages`
+- `targetNettingEnabled`
+- `targetNettingIntervalMs`
+- `targetNettingTrackingErrorBps`
+- `reconcileEngineEnabled`
+- `reconcileStaleLeaderSyncSeconds`
+- `reconcileStaleFollowerSyncSeconds`
+- `reconcileGuardrailFailureCycleThreshold`
+- `leaderTradesPollIntervalSeconds`
+- `leaderTradesTakerOnly`
+- `executionEngineEnabled`
+- `panicMode`
+
+These remain env-only by design:
+
+- `DRY_RUN_MODE`
+- credentials/URLs/signing identity fields
+- low-level polling/backoff/cache/process internals
+
+Quick verification after changing runtime ops:
+
+```bash
+curl -sS http://127.0.0.1:8080/api/v1/config
+docker compose --env-file .env -f docker/docker-compose.yml logs --tail=200 worker
+```
+
+Look for:
+
+- `runtimeOps` values matching your change in `/api/v1/config`
+- `runtime_config.applied` log entries in worker logs within refresh cadence
+
+### 13) Day-2 updates (recommended sequence)
 
 ```bash
 cd ~/apps/polymarket-copier
-git pull
+git fetch --all --prune
+git pull --ff-only
 docker compose --env-file .env -f docker/docker-compose.yml up -d --build
+docker compose --env-file .env -f docker/docker-compose.yml run --rm migrate pnpm --filter @copybot/db seed:global-runtime
+docker compose --env-file .env -f docker/docker-compose.yml up -d worker web
 docker compose --env-file .env -f docker/docker-compose.yml ps
+curl -sS http://127.0.0.1:8080/api/v1/config
 ```
+
+If your update does not change runtime-config schema/behavior, keeping the seed command is still safe because it is idempotent.
 
 Logs:
 
@@ -389,7 +454,7 @@ Logs:
 - `docker compose --env-file .env -f docker/docker-compose.yml logs -f --tail=200 worker`
 - `docker compose --env-file .env -f docker/docker-compose.yml logs -f --tail=200 web`
 
-### 13) Security notes
+### 14) Security notes
 
 - Never paste private keys in terminal screenshots/chat.
 - If a key was exposed, rotate immediately and regenerate Polymarket API credentials.

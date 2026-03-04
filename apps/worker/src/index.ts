@@ -31,6 +31,7 @@ import { PrismaReconcileStore, ReconcileEngine } from "./reconcile/index.js";
 import { workerLogger } from "./logger.js";
 import {
   readGlobalRuntimeConfigOverrides,
+  resolveEffectiveChainTriggerEnabled,
   resolveEffectiveGlobalRuntimeConfig,
   type EffectiveGlobalRuntimeConfig
 } from "./config/global-runtime-config.js";
@@ -414,15 +415,34 @@ async function bootstrap(): Promise<void> {
   const runtimeConfigBaseline: EffectiveGlobalRuntimeConfig = {
     tradeDetectionEnabled: env.TRADE_DETECTION_ENABLED,
     userChannelWsEnabled: env.USER_CHANNEL_WS_ENABLED,
-    reconcileIntervalSeconds: env.RECONCILE_INTERVAL_SECONDS
+    reconcileIntervalSeconds: env.RECONCILE_INTERVAL_SECONDS,
+    runtimeOps: {
+      chainTriggerWsEnabled: env.CHAIN_TRIGGER_WS_ENABLED,
+      fillReconcileEnabled: env.FILL_RECONCILE_ENABLED,
+      fillReconcileIntervalSeconds: env.FILL_RECONCILE_INTERVAL_SECONDS,
+      fillParseStarvationWindowSeconds: env.FILL_PARSE_STARVATION_WINDOW_SECONDS,
+      fillParseStarvationMinMessages: env.FILL_PARSE_STARVATION_MIN_MESSAGES,
+      targetNettingEnabled: env.TARGET_NETTING_ENABLED,
+      targetNettingIntervalMs: env.TARGET_NETTING_INTERVAL_MS,
+      targetNettingTrackingErrorBps: env.TARGET_NETTING_TRACKING_ERROR_BPS,
+      reconcileEngineEnabled: env.RECONCILE_ENGINE_ENABLED,
+      reconcileStaleLeaderSyncSeconds: env.RECONCILE_STALE_LEADER_SYNC_SECONDS,
+      reconcileStaleFollowerSyncSeconds: env.RECONCILE_STALE_FOLLOWER_SYNC_SECONDS,
+      reconcileGuardrailFailureCycleThreshold: env.RECONCILE_GUARDRAIL_FAILURE_CYCLE_THRESHOLD,
+      leaderTradesPollIntervalSeconds: env.LEADER_TRADES_POLL_INTERVAL_SECONDS,
+      leaderTradesTakerOnly: env.LEADER_TRADES_TAKER_ONLY,
+      executionEngineEnabled: env.EXECUTION_ENGINE_ENABLED,
+      panicMode: env.PANIC_MODE
+    }
   };
   let runtimeConfig = { ...runtimeConfigBaseline };
 
   async function applyRuntimeConfig(next: EffectiveGlobalRuntimeConfig, source: "bootstrap" | "refresh"): Promise<void> {
     const changed: Record<string, { from: number | boolean; to: number | boolean }> = {};
+    const previousChainTriggerEnabled = resolveEffectiveChainTriggerEnabled(runtimeConfig);
+    const nextChainTriggerEnabled = resolveEffectiveChainTriggerEnabled(next);
 
     if (next.tradeDetectionEnabled !== runtimeConfig.tradeDetectionEnabled) {
-      await chainPipeline.setEnabled(env.CHAIN_TRIGGER_WS_ENABLED && next.tradeDetectionEnabled);
       changed.tradeDetectionEnabled = {
         from: runtimeConfig.tradeDetectionEnabled,
         to: next.tradeDetectionEnabled
@@ -447,6 +467,152 @@ async function bootstrap(): Promise<void> {
       };
     }
 
+    if (next.runtimeOps.chainTriggerWsEnabled !== runtimeConfig.runtimeOps.chainTriggerWsEnabled) {
+      changed.opsChainTriggerWsEnabled = {
+        from: runtimeConfig.runtimeOps.chainTriggerWsEnabled,
+        to: next.runtimeOps.chainTriggerWsEnabled
+      };
+    }
+
+    if (nextChainTriggerEnabled !== previousChainTriggerEnabled) {
+      await chainPipeline.setEnabled(nextChainTriggerEnabled);
+    }
+
+    if (next.runtimeOps.fillReconcileEnabled !== runtimeConfig.runtimeOps.fillReconcileEnabled) {
+      fillReconcile.setEnabled(next.runtimeOps.fillReconcileEnabled);
+      changed.opsFillReconcileEnabled = {
+        from: runtimeConfig.runtimeOps.fillReconcileEnabled,
+        to: next.runtimeOps.fillReconcileEnabled
+      };
+    }
+
+    if (next.runtimeOps.fillReconcileIntervalSeconds !== runtimeConfig.runtimeOps.fillReconcileIntervalSeconds) {
+      fillReconcile.setIntervalMs(next.runtimeOps.fillReconcileIntervalSeconds * 1000);
+      changed.opsFillReconcileIntervalSeconds = {
+        from: runtimeConfig.runtimeOps.fillReconcileIntervalSeconds,
+        to: next.runtimeOps.fillReconcileIntervalSeconds
+      };
+    }
+
+    if (
+      next.runtimeOps.fillParseStarvationWindowSeconds !== runtimeConfig.runtimeOps.fillParseStarvationWindowSeconds ||
+      next.runtimeOps.fillParseStarvationMinMessages !== runtimeConfig.runtimeOps.fillParseStarvationMinMessages
+    ) {
+      fillAttribution.setParseStarvationConfig({
+        windowSeconds: next.runtimeOps.fillParseStarvationWindowSeconds,
+        minMessages: next.runtimeOps.fillParseStarvationMinMessages
+      });
+      if (next.runtimeOps.fillParseStarvationWindowSeconds !== runtimeConfig.runtimeOps.fillParseStarvationWindowSeconds) {
+        changed.opsFillParseStarvationWindowSeconds = {
+          from: runtimeConfig.runtimeOps.fillParseStarvationWindowSeconds,
+          to: next.runtimeOps.fillParseStarvationWindowSeconds
+        };
+      }
+      if (next.runtimeOps.fillParseStarvationMinMessages !== runtimeConfig.runtimeOps.fillParseStarvationMinMessages) {
+        changed.opsFillParseStarvationMinMessages = {
+          from: runtimeConfig.runtimeOps.fillParseStarvationMinMessages,
+          to: next.runtimeOps.fillParseStarvationMinMessages
+        };
+      }
+    }
+
+    if (next.runtimeOps.targetNettingEnabled !== runtimeConfig.runtimeOps.targetNettingEnabled) {
+      targetNetting.setEnabled(next.runtimeOps.targetNettingEnabled);
+      changed.opsTargetNettingEnabled = {
+        from: runtimeConfig.runtimeOps.targetNettingEnabled,
+        to: next.runtimeOps.targetNettingEnabled
+      };
+    }
+
+    if (next.runtimeOps.targetNettingIntervalMs !== runtimeConfig.runtimeOps.targetNettingIntervalMs) {
+      targetNetting.setIntervalMs(next.runtimeOps.targetNettingIntervalMs);
+      changed.opsTargetNettingIntervalMs = {
+        from: runtimeConfig.runtimeOps.targetNettingIntervalMs,
+        to: next.runtimeOps.targetNettingIntervalMs
+      };
+    }
+
+    if (next.runtimeOps.targetNettingTrackingErrorBps !== runtimeConfig.runtimeOps.targetNettingTrackingErrorBps) {
+      targetNetting.setTrackingErrorBps(next.runtimeOps.targetNettingTrackingErrorBps);
+      changed.opsTargetNettingTrackingErrorBps = {
+        from: runtimeConfig.runtimeOps.targetNettingTrackingErrorBps,
+        to: next.runtimeOps.targetNettingTrackingErrorBps
+      };
+    }
+
+    if (next.runtimeOps.reconcileEngineEnabled !== runtimeConfig.runtimeOps.reconcileEngineEnabled) {
+      reconcileEngine.setEnabled(next.runtimeOps.reconcileEngineEnabled);
+      changed.opsReconcileEngineEnabled = {
+        from: runtimeConfig.runtimeOps.reconcileEngineEnabled,
+        to: next.runtimeOps.reconcileEngineEnabled
+      };
+    }
+
+    if (
+      next.runtimeOps.reconcileStaleLeaderSyncSeconds !== runtimeConfig.runtimeOps.reconcileStaleLeaderSyncSeconds ||
+      next.runtimeOps.reconcileStaleFollowerSyncSeconds !== runtimeConfig.runtimeOps.reconcileStaleFollowerSyncSeconds
+    ) {
+      reconcileEngine.setStaleThresholds({
+        leaderSeconds: next.runtimeOps.reconcileStaleLeaderSyncSeconds,
+        followerSeconds: next.runtimeOps.reconcileStaleFollowerSyncSeconds
+      });
+      if (next.runtimeOps.reconcileStaleLeaderSyncSeconds !== runtimeConfig.runtimeOps.reconcileStaleLeaderSyncSeconds) {
+        changed.opsReconcileStaleLeaderSyncSeconds = {
+          from: runtimeConfig.runtimeOps.reconcileStaleLeaderSyncSeconds,
+          to: next.runtimeOps.reconcileStaleLeaderSyncSeconds
+        };
+      }
+      if (next.runtimeOps.reconcileStaleFollowerSyncSeconds !== runtimeConfig.runtimeOps.reconcileStaleFollowerSyncSeconds) {
+        changed.opsReconcileStaleFollowerSyncSeconds = {
+          from: runtimeConfig.runtimeOps.reconcileStaleFollowerSyncSeconds,
+          to: next.runtimeOps.reconcileStaleFollowerSyncSeconds
+        };
+      }
+    }
+
+    if (
+      next.runtimeOps.reconcileGuardrailFailureCycleThreshold !==
+      runtimeConfig.runtimeOps.reconcileGuardrailFailureCycleThreshold
+    ) {
+      reconcileEngine.setGuardrailFailureCycleThreshold(next.runtimeOps.reconcileGuardrailFailureCycleThreshold);
+      changed.opsReconcileGuardrailFailureCycleThreshold = {
+        from: runtimeConfig.runtimeOps.reconcileGuardrailFailureCycleThreshold,
+        to: next.runtimeOps.reconcileGuardrailFailureCycleThreshold
+      };
+    }
+
+    if (next.runtimeOps.leaderTradesPollIntervalSeconds !== runtimeConfig.runtimeOps.leaderTradesPollIntervalSeconds) {
+      leaderPoller.setTradesIntervalMs(next.runtimeOps.leaderTradesPollIntervalSeconds * 1000);
+      changed.opsLeaderTradesPollIntervalSeconds = {
+        from: runtimeConfig.runtimeOps.leaderTradesPollIntervalSeconds,
+        to: next.runtimeOps.leaderTradesPollIntervalSeconds
+      };
+    }
+
+    if (next.runtimeOps.leaderTradesTakerOnly !== runtimeConfig.runtimeOps.leaderTradesTakerOnly) {
+      leaderPoller.setTradesTakerOnly(next.runtimeOps.leaderTradesTakerOnly);
+      changed.opsLeaderTradesTakerOnly = {
+        from: runtimeConfig.runtimeOps.leaderTradesTakerOnly,
+        to: next.runtimeOps.leaderTradesTakerOnly
+      };
+    }
+
+    if (next.runtimeOps.executionEngineEnabled !== runtimeConfig.runtimeOps.executionEngineEnabled) {
+      executionEngine.setEnabled(next.runtimeOps.executionEngineEnabled);
+      changed.opsExecutionEngineEnabled = {
+        from: runtimeConfig.runtimeOps.executionEngineEnabled,
+        to: next.runtimeOps.executionEngineEnabled
+      };
+    }
+
+    if (next.runtimeOps.panicMode !== runtimeConfig.runtimeOps.panicMode) {
+      executionEngine.setPanicMode(next.runtimeOps.panicMode);
+      changed.opsPanicMode = {
+        from: runtimeConfig.runtimeOps.panicMode,
+        to: next.runtimeOps.panicMode
+      };
+    }
+
     runtimeConfig = next;
     if (Object.keys(changed).length > 0) {
       workerLogger.info("runtime_config.applied", {
@@ -454,7 +620,7 @@ async function bootstrap(): Promise<void> {
         changed,
         effective: {
           ...runtimeConfig,
-          chainTriggerEnabled: env.CHAIN_TRIGGER_WS_ENABLED && runtimeConfig.tradeDetectionEnabled
+          chainTriggerEnabled: resolveEffectiveChainTriggerEnabled(runtimeConfig)
         }
       });
     }
@@ -517,7 +683,7 @@ async function bootstrap(): Promise<void> {
           reconcile: reconcileEngine.getStatus(),
           runtimeConfig: {
             ...runtimeConfig,
-            chainTriggerEnabled: env.CHAIN_TRIGGER_WS_ENABLED && runtimeConfig.tradeDetectionEnabled
+            chainTriggerEnabled: resolveEffectiveChainTriggerEnabled(runtimeConfig)
           }
         })
       );
@@ -645,11 +811,11 @@ async function bootstrap(): Promise<void> {
     copySystemEnabled: env.COPY_SYSTEM_ENABLED,
     tradeDetectionEnabled: runtimeConfig.tradeDetectionEnabled,
     userChannelWsEnabled: runtimeConfig.userChannelWsEnabled,
-    fillReconcileEnabled: env.FILL_RECONCILE_ENABLED,
-    fillReconcileIntervalSeconds: env.FILL_RECONCILE_INTERVAL_SECONDS,
+    fillReconcileEnabled: runtimeConfig.runtimeOps.fillReconcileEnabled,
+    fillReconcileIntervalSeconds: runtimeConfig.runtimeOps.fillReconcileIntervalSeconds,
     fillBackfillDefaultLookbackDays: env.FILL_BACKFILL_DEFAULT_LOOKBACK_DAYS,
-    fillParseStarvationWindowSeconds: env.FILL_PARSE_STARVATION_WINDOW_SECONDS,
-    fillParseStarvationMinMessages: env.FILL_PARSE_STARVATION_MIN_MESSAGES,
+    fillParseStarvationWindowSeconds: runtimeConfig.runtimeOps.fillParseStarvationWindowSeconds,
+    fillParseStarvationMinMessages: runtimeConfig.runtimeOps.fillParseStarvationMinMessages,
     reconcileIntervalSeconds: runtimeConfig.reconcileIntervalSeconds,
     runtimeConfigRefreshIntervalMs: env.WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS,
     minNotionalPerOrderUsd: env.MIN_NOTIONAL_PER_ORDER_USD,
@@ -667,19 +833,20 @@ async function bootstrap(): Promise<void> {
     marketWatchedTokensCount: staticWatchedTokenIds.length,
     marketWatchRefreshIntervalMs: dynamicMarketWatchRefreshIntervalMs,
     dataApiBaseUrl: env.DATA_API_BASE_URL,
-    chainTriggerWsEnabled: env.CHAIN_TRIGGER_WS_ENABLED && runtimeConfig.tradeDetectionEnabled,
+    chainTriggerWsEnabled: runtimeConfig.runtimeOps.chainTriggerWsEnabled,
+    chainTriggerEnabled: resolveEffectiveChainTriggerEnabled(runtimeConfig),
     chainTriggerExchangeContracts: exchangeContracts,
     chainTriggerDedupeTtlSeconds: env.CHAIN_TRIGGER_DEDUPE_TTL_SECONDS,
     chainTriggerWalletRefreshIntervalMs: env.CHAIN_TRIGGER_WALLET_REFRESH_INTERVAL_MS,
     chainTriggerReconcileQueueMaxSize: env.CHAIN_TRIGGER_RECONCILE_QUEUE_MAX_SIZE,
-    targetNettingEnabled: env.TARGET_NETTING_ENABLED,
-    targetNettingIntervalMs: env.TARGET_NETTING_INTERVAL_MS,
-    targetNettingTrackingErrorBps: env.TARGET_NETTING_TRACKING_ERROR_BPS,
-    reconcileEngineEnabled: env.RECONCILE_ENGINE_ENABLED,
-    reconcileStaleLeaderSyncSeconds: env.RECONCILE_STALE_LEADER_SYNC_SECONDS,
-    reconcileStaleFollowerSyncSeconds: env.RECONCILE_STALE_FOLLOWER_SYNC_SECONDS,
-    reconcileGuardrailFailureCycleThreshold: env.RECONCILE_GUARDRAIL_FAILURE_CYCLE_THRESHOLD,
-    executionEngineEnabled: env.EXECUTION_ENGINE_ENABLED,
+    targetNettingEnabled: runtimeConfig.runtimeOps.targetNettingEnabled,
+    targetNettingIntervalMs: runtimeConfig.runtimeOps.targetNettingIntervalMs,
+    targetNettingTrackingErrorBps: runtimeConfig.runtimeOps.targetNettingTrackingErrorBps,
+    reconcileEngineEnabled: runtimeConfig.runtimeOps.reconcileEngineEnabled,
+    reconcileStaleLeaderSyncSeconds: runtimeConfig.runtimeOps.reconcileStaleLeaderSyncSeconds,
+    reconcileStaleFollowerSyncSeconds: runtimeConfig.runtimeOps.reconcileStaleFollowerSyncSeconds,
+    reconcileGuardrailFailureCycleThreshold: runtimeConfig.runtimeOps.reconcileGuardrailFailureCycleThreshold,
+    executionEngineEnabled: runtimeConfig.runtimeOps.executionEngineEnabled,
     executionIntervalMs: env.EXECUTION_INTERVAL_MS,
     executionMaxAttemptsPerRun: env.EXECUTION_MAX_ATTEMPTS_PER_RUN,
     executionRetryBackoffBaseMs: env.EXECUTION_RETRY_BACKOFF_BASE_MS,
@@ -688,8 +855,9 @@ async function bootstrap(): Promise<void> {
     polymarketSignerAddress,
     polymarketSignatureType: signingConfig?.signatureTypeName ?? null,
     polymarketFunderAddress: signingConfig?.funderAddress ?? null,
-    leaderTradesPollIntervalSeconds: env.LEADER_TRADES_POLL_INTERVAL_SECONDS,
-    leaderTradesTakerOnly: env.LEADER_TRADES_TAKER_ONLY,
+    leaderTradesPollIntervalSeconds: runtimeConfig.runtimeOps.leaderTradesPollIntervalSeconds,
+    leaderTradesTakerOnly: runtimeConfig.runtimeOps.leaderTradesTakerOnly,
+    panicMode: runtimeConfig.runtimeOps.panicMode,
     leaderPollPageLimit: env.LEADER_POLL_PAGE_LIMIT,
     leaderPollBatchSize: env.LEADER_POLL_BATCH_SIZE,
     leaderPollMaxRetries: env.LEADER_POLL_MAX_RETRIES,

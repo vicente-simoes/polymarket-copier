@@ -96,6 +96,29 @@ export class FillAttributionService {
     this.stop();
   }
 
+  setParseStarvationConfig(input: { windowSeconds: number; minMessages: number }): void {
+    const nextWindowMs = Math.max(1_000, Math.trunc(input.windowSeconds * 1000));
+    const nextMinMessages = Math.max(1, Math.trunc(input.minMessages));
+    const nextCheckIntervalMs = computeParseStarvationCheckIntervalMs(nextWindowMs);
+
+    const changed =
+      this.config.parseStarvationWindowMs !== nextWindowMs ||
+      this.config.parseStarvationMinMessages !== nextMinMessages ||
+      this.config.parseStarvationCheckIntervalMs !== nextCheckIntervalMs;
+
+    if (!changed) {
+      return;
+    }
+
+    this.config.parseStarvationWindowMs = nextWindowMs;
+    this.config.parseStarvationMinMessages = nextMinMessages;
+    this.config.parseStarvationCheckIntervalMs = nextCheckIntervalMs;
+
+    if (this.wsClient) {
+      this.startParseHealthMonitor();
+    }
+  }
+
   getStatus(): UserChannelStatus {
     const wsMetrics = this.wsClient?.getMetrics();
     const receivedMessages = wsMetrics?.receivedMessages ?? this.status.receivedMessages;
@@ -255,4 +278,8 @@ function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function computeParseStarvationCheckIntervalMs(windowMs: number): number {
+  return Math.max(5_000, Math.min(30_000, Math.trunc(windowMs / 5)));
 }

@@ -112,13 +112,46 @@ export class FillReconcileService {
   }
 
   start(): void {
+    this.status.enabled = this.config.enabled;
     if (!this.config.enabled) {
       return;
     }
-    this.interval = setInterval(() => {
-      void this.run();
-    }, this.config.intervalMs);
+    if (this.interval) {
+      return;
+    }
+    this.startInterval();
     void this.run();
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (this.config.enabled === enabled) {
+      this.status.enabled = enabled;
+      return;
+    }
+
+    this.config.enabled = enabled;
+    this.status.enabled = enabled;
+    if (enabled) {
+      this.start();
+      return;
+    }
+
+    this.stop();
+  }
+
+  setIntervalMs(intervalMs: number): void {
+    const normalized = Math.max(1000, Math.trunc(intervalMs));
+    if (this.config.intervalMs === normalized) {
+      return;
+    }
+
+    this.config.intervalMs = normalized;
+    if (!this.interval) {
+      return;
+    }
+
+    clearInterval(this.interval);
+    this.startInterval();
   }
 
   stop(): void {
@@ -127,6 +160,7 @@ export class FillReconcileService {
     }
     clearInterval(this.interval);
     this.interval = undefined;
+    this.status.running = false;
   }
 
   getStatus(): FillReconcileStatus {
@@ -195,6 +229,12 @@ export class FillReconcileService {
       result[address] = checkpoint?.cursorAtMs ?? fallbackMs;
     }
     return result;
+  }
+
+  private startInterval(): void {
+    this.interval = setInterval(() => {
+      void this.run();
+    }, this.config.intervalMs);
   }
 }
 

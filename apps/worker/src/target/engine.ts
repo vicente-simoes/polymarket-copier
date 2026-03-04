@@ -43,15 +43,53 @@ export class TargetNettingEngine {
   }
 
   start(): void {
+    this.status.enabled = this.config.enabled;
     if (!this.config.enabled) {
       return;
     }
+    if (this.interval) {
+      return;
+    }
 
-    this.interval = setInterval(() => {
-      void this.run();
-    }, this.config.intervalMs);
+    this.startInterval();
 
     void this.run();
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (this.config.enabled === enabled) {
+      this.status.enabled = enabled;
+      return;
+    }
+
+    this.config.enabled = enabled;
+    this.status.enabled = enabled;
+    if (enabled) {
+      this.start();
+      return;
+    }
+
+    this.stop();
+  }
+
+  setIntervalMs(intervalMs: number): void {
+    const normalized = Math.max(1000, Math.trunc(intervalMs));
+    if (this.config.intervalMs === normalized) {
+      return;
+    }
+
+    this.config.intervalMs = normalized;
+    if (!this.interval) {
+      return;
+    }
+
+    clearInterval(this.interval);
+    this.startInterval();
+  }
+
+  setTrackingErrorBps(trackingErrorBps: number): void {
+    const normalized = Math.max(0, Math.trunc(trackingErrorBps));
+    this.config.trackingErrorBps = normalized;
   }
 
   stop(): void {
@@ -59,6 +97,13 @@ export class TargetNettingEngine {
       clearInterval(this.interval);
       this.interval = undefined;
     }
+    this.status.running = false;
+  }
+
+  private startInterval(): void {
+    this.interval = setInterval(() => {
+      void this.run();
+    }, this.config.intervalMs);
   }
 
   getStatus(): TargetNettingStatus {

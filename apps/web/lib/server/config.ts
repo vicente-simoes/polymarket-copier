@@ -36,10 +36,35 @@ export const SystemConfigSchema = z.object({
 
 export type SystemConfig = z.infer<typeof SystemConfigSchema>
 
+export const RuntimeOpsConfigSchema = z.object({
+  chainTriggerWsEnabled: z.boolean(),
+  fillReconcileEnabled: z.boolean(),
+  fillReconcileIntervalSeconds: z.number().int().positive(),
+  fillParseStarvationWindowSeconds: z.number().int().positive(),
+  fillParseStarvationMinMessages: z.number().int().positive(),
+  targetNettingEnabled: z.boolean(),
+  targetNettingIntervalMs: z.number().int().positive(),
+  targetNettingTrackingErrorBps: z.number().int().nonnegative(),
+  reconcileEngineEnabled: z.boolean(),
+  reconcileStaleLeaderSyncSeconds: z.number().int().positive(),
+  reconcileStaleFollowerSyncSeconds: z.number().int().positive(),
+  reconcileGuardrailFailureCycleThreshold: z.number().int().positive(),
+  leaderTradesPollIntervalSeconds: z.number().int().positive(),
+  leaderTradesTakerOnly: z.boolean(),
+  executionEngineEnabled: z.boolean(),
+  panicMode: z.boolean()
+})
+
+export type RuntimeOpsConfig = z.infer<typeof RuntimeOpsConfigSchema>
+
+export const RuntimeOpsConfigPatchSchema = RuntimeOpsConfigSchema.partial()
+export type RuntimeOpsConfigPatch = z.infer<typeof RuntimeOpsConfigPatchSchema>
+
 export interface GlobalRuntimeConfigOverrides {
   tradeDetectionEnabled?: boolean
   userChannelWsEnabled?: boolean
   reconcileIntervalSeconds?: number
+  runtimeOps?: Partial<RuntimeOpsConfig>
 }
 
 export const SystemConfigPatchSchema = z.object({
@@ -79,6 +104,7 @@ export const SystemConfigPatchSchema = z.object({
       maxDailyNotionalTurnoverUsd: PositiveNumberSchema.optional()
     })
     .optional(),
+  runtimeOps: RuntimeOpsConfigPatchSchema.optional(),
   applyRatioToExistingLeaders: z.boolean().optional(),
   reason: z.string().trim().max(500).optional(),
   changedBy: z.string().trim().max(120).optional()
@@ -115,6 +141,25 @@ export const DEFAULT_SYSTEM_CONFIG: SystemConfig = SystemConfigSchema.parse({
     maxHourlyNotionalTurnoverUsd: fromEnvNumber(process.env.MAX_HOURLY_NOTIONAL_TURNOVER_USD, 25),
     maxDailyNotionalTurnoverUsd: fromEnvNumber(process.env.MAX_DAILY_NOTIONAL_TURNOVER_USD, 100)
   }
+})
+
+export const DEFAULT_RUNTIME_OPS_CONFIG: RuntimeOpsConfig = RuntimeOpsConfigSchema.parse({
+  chainTriggerWsEnabled: fromEnvBoolean(process.env.CHAIN_TRIGGER_WS_ENABLED, true),
+  fillReconcileEnabled: fromEnvBoolean(process.env.FILL_RECONCILE_ENABLED, true),
+  fillReconcileIntervalSeconds: fromEnvNumber(process.env.FILL_RECONCILE_INTERVAL_SECONDS, 30),
+  fillParseStarvationWindowSeconds: fromEnvNumber(process.env.FILL_PARSE_STARVATION_WINDOW_SECONDS, 300),
+  fillParseStarvationMinMessages: fromEnvNumber(process.env.FILL_PARSE_STARVATION_MIN_MESSAGES, 20),
+  targetNettingEnabled: fromEnvBoolean(process.env.TARGET_NETTING_ENABLED, true),
+  targetNettingIntervalMs: fromEnvNumber(process.env.TARGET_NETTING_INTERVAL_MS, 5_000),
+  targetNettingTrackingErrorBps: fromEnvNumber(process.env.TARGET_NETTING_TRACKING_ERROR_BPS, 0),
+  reconcileEngineEnabled: fromEnvBoolean(process.env.RECONCILE_ENGINE_ENABLED, true),
+  reconcileStaleLeaderSyncSeconds: fromEnvNumber(process.env.RECONCILE_STALE_LEADER_SYNC_SECONDS, 180),
+  reconcileStaleFollowerSyncSeconds: fromEnvNumber(process.env.RECONCILE_STALE_FOLLOWER_SYNC_SECONDS, 180),
+  reconcileGuardrailFailureCycleThreshold: fromEnvNumber(process.env.RECONCILE_GUARDRAIL_FAILURE_CYCLE_THRESHOLD, 5),
+  leaderTradesPollIntervalSeconds: fromEnvNumber(process.env.LEADER_TRADES_POLL_INTERVAL_SECONDS, 30),
+  leaderTradesTakerOnly: fromEnvBoolean(process.env.LEADER_TRADES_TAKER_ONLY, false),
+  executionEngineEnabled: fromEnvBoolean(process.env.EXECUTION_ENGINE_ENABLED, true),
+  panicMode: fromEnvBoolean(process.env.PANIC_MODE, false)
 })
 
 export function resolveSystemConfig(rawConfig: unknown, fallbackRatio: number): SystemConfig {
@@ -172,6 +217,7 @@ export function resolveGlobalRuntimeConfig(rawConfig: unknown): GlobalRuntimeCon
   const config = asObject(rawConfig)
   const masterSwitches = asObject(config.masterSwitches)
   const reconcile = asObject(config.reconcile)
+  const ops = asObject(config.ops)
 
   const tradeDetectionEnabled =
     typeof masterSwitches.tradeDetectionEnabled === 'boolean' ? masterSwitches.tradeDetectionEnabled : undefined
@@ -182,7 +228,25 @@ export function resolveGlobalRuntimeConfig(rawConfig: unknown): GlobalRuntimeCon
   return {
     tradeDetectionEnabled,
     userChannelWsEnabled,
-    reconcileIntervalSeconds: interval
+    reconcileIntervalSeconds: interval,
+    runtimeOps: {
+      chainTriggerWsEnabled: asBoolean(ops.chainTriggerWsEnabled),
+      fillReconcileEnabled: asBoolean(ops.fillReconcileEnabled),
+      fillReconcileIntervalSeconds: asPositiveInteger(ops.fillReconcileIntervalSeconds),
+      fillParseStarvationWindowSeconds: asPositiveInteger(ops.fillParseStarvationWindowSeconds),
+      fillParseStarvationMinMessages: asPositiveInteger(ops.fillParseStarvationMinMessages),
+      targetNettingEnabled: asBoolean(ops.targetNettingEnabled),
+      targetNettingIntervalMs: asPositiveInteger(ops.targetNettingIntervalMs),
+      targetNettingTrackingErrorBps: asNonNegativeInteger(ops.targetNettingTrackingErrorBps),
+      reconcileEngineEnabled: asBoolean(ops.reconcileEngineEnabled),
+      reconcileStaleLeaderSyncSeconds: asPositiveInteger(ops.reconcileStaleLeaderSyncSeconds),
+      reconcileStaleFollowerSyncSeconds: asPositiveInteger(ops.reconcileStaleFollowerSyncSeconds),
+      reconcileGuardrailFailureCycleThreshold: asPositiveInteger(ops.reconcileGuardrailFailureCycleThreshold),
+      leaderTradesPollIntervalSeconds: asPositiveInteger(ops.leaderTradesPollIntervalSeconds),
+      leaderTradesTakerOnly: asBoolean(ops.leaderTradesTakerOnly),
+      executionEngineEnabled: asBoolean(ops.executionEngineEnabled),
+      panicMode: asBoolean(ops.panicMode)
+    }
   }
 }
 
@@ -203,7 +267,28 @@ export function applyGlobalRuntimeOverrides(base: SystemConfig, overrides: Globa
   return SystemConfigSchema.parse(merged)
 }
 
+export function resolveEffectiveRuntimeOpsConfig(overrides?: Partial<RuntimeOpsConfig>): RuntimeOpsConfig {
+  return RuntimeOpsConfigSchema.parse({
+    ...DEFAULT_RUNTIME_OPS_CONFIG,
+    ...(overrides ?? {})
+  })
+}
+
+export function applyRuntimeOpsPatch(base: RuntimeOpsConfig, patch: RuntimeOpsConfigPatch): RuntimeOpsConfig {
+  return RuntimeOpsConfigSchema.parse({
+    ...base,
+    ...patch
+  })
+}
+
 export function toGlobalRuntimeConfigValue(config: SystemConfig): Record<string, unknown> {
+  return toGlobalRuntimeConfigValueWithOps(config, DEFAULT_RUNTIME_OPS_CONFIG)
+}
+
+export function toGlobalRuntimeConfigValueWithOps(
+  config: SystemConfig,
+  runtimeOps: RuntimeOpsConfig
+): Record<string, unknown> {
   return {
     masterSwitches: {
       tradeDetectionEnabled: config.masterSwitches.tradeDetectionEnabled,
@@ -211,19 +296,68 @@ export function toGlobalRuntimeConfigValue(config: SystemConfig): Record<string,
     },
     reconcile: {
       intervalSeconds: config.reconcile.intervalSeconds
-    }
+    },
+    ops: runtimeOps
   }
+}
+
+export function equalRuntimeOpsConfig(left: RuntimeOpsConfig, right: RuntimeOpsConfig): boolean {
+  return (
+    left.chainTriggerWsEnabled === right.chainTriggerWsEnabled &&
+    left.fillReconcileEnabled === right.fillReconcileEnabled &&
+    left.fillReconcileIntervalSeconds === right.fillReconcileIntervalSeconds &&
+    left.fillParseStarvationWindowSeconds === right.fillParseStarvationWindowSeconds &&
+    left.fillParseStarvationMinMessages === right.fillParseStarvationMinMessages &&
+    left.targetNettingEnabled === right.targetNettingEnabled &&
+    left.targetNettingIntervalMs === right.targetNettingIntervalMs &&
+    left.targetNettingTrackingErrorBps === right.targetNettingTrackingErrorBps &&
+    left.reconcileEngineEnabled === right.reconcileEngineEnabled &&
+    left.reconcileStaleLeaderSyncSeconds === right.reconcileStaleLeaderSyncSeconds &&
+    left.reconcileStaleFollowerSyncSeconds === right.reconcileStaleFollowerSyncSeconds &&
+    left.reconcileGuardrailFailureCycleThreshold === right.reconcileGuardrailFailureCycleThreshold &&
+    left.leaderTradesPollIntervalSeconds === right.leaderTradesPollIntervalSeconds &&
+    left.leaderTradesTakerOnly === right.leaderTradesTakerOnly &&
+    left.executionEngineEnabled === right.executionEngineEnabled &&
+    left.panicMode === right.panicMode
+  )
 }
 
 export function equalGlobalRuntimeConfig(
   left: GlobalRuntimeConfigOverrides,
   right: GlobalRuntimeConfigOverrides
 ): boolean {
+  const leftRuntimeOps = resolveEffectiveRuntimeOpsConfig(left.runtimeOps)
+  const rightRuntimeOps = resolveEffectiveRuntimeOpsConfig(right.runtimeOps)
+
   return (
     left.tradeDetectionEnabled === right.tradeDetectionEnabled &&
     left.userChannelWsEnabled === right.userChannelWsEnabled &&
-    left.reconcileIntervalSeconds === right.reconcileIntervalSeconds
+    left.reconcileIntervalSeconds === right.reconcileIntervalSeconds &&
+    equalRuntimeOpsConfig(leftRuntimeOps, rightRuntimeOps)
   )
+}
+
+export function toRuntimeOpsConfigRecord(runtimeOps: RuntimeOpsConfig): Record<string, unknown> {
+  return {
+    ops: {
+      chainTriggerWsEnabled: runtimeOps.chainTriggerWsEnabled,
+      fillReconcileEnabled: runtimeOps.fillReconcileEnabled,
+      fillReconcileIntervalSeconds: runtimeOps.fillReconcileIntervalSeconds,
+      fillParseStarvationWindowSeconds: runtimeOps.fillParseStarvationWindowSeconds,
+      fillParseStarvationMinMessages: runtimeOps.fillParseStarvationMinMessages,
+      targetNettingEnabled: runtimeOps.targetNettingEnabled,
+      targetNettingIntervalMs: runtimeOps.targetNettingIntervalMs,
+      targetNettingTrackingErrorBps: runtimeOps.targetNettingTrackingErrorBps,
+      reconcileEngineEnabled: runtimeOps.reconcileEngineEnabled,
+      reconcileStaleLeaderSyncSeconds: runtimeOps.reconcileStaleLeaderSyncSeconds,
+      reconcileStaleFollowerSyncSeconds: runtimeOps.reconcileStaleFollowerSyncSeconds,
+      reconcileGuardrailFailureCycleThreshold: runtimeOps.reconcileGuardrailFailureCycleThreshold,
+      leaderTradesPollIntervalSeconds: runtimeOps.leaderTradesPollIntervalSeconds,
+      leaderTradesTakerOnly: runtimeOps.leaderTradesTakerOnly,
+      executionEngineEnabled: runtimeOps.executionEngineEnabled,
+      panicMode: runtimeOps.panicMode
+    }
+  }
 }
 
 export function fromEnvNumber(raw: string | undefined, fallback: number): number {
@@ -281,4 +415,16 @@ function asPositiveInteger(value: unknown): number | undefined {
     return undefined
   }
   return numberValue
+}
+
+function asNonNegativeInteger(value: unknown): number | undefined {
+  const numberValue = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
+  if (!Number.isInteger(numberValue) || numberValue < 0) {
+    return undefined
+  }
+  return numberValue
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
 }

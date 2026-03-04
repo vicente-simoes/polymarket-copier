@@ -234,8 +234,26 @@ test("Stage 11 reconcile interval can be reconfigured at runtime", () => {
   });
 
   engine.setIntervalMs(2_000);
-  const config = engine as unknown as { config: { intervalMs: number } };
+  engine.setEnabled(false);
+  engine.setStaleThresholds({ leaderSeconds: 7, followerSeconds: 9 });
+  engine.setGuardrailFailureCycleThreshold(3);
+
+  const config = engine as unknown as {
+    config: {
+      intervalMs: number;
+      enabled: boolean;
+      staleLeaderSyncMs: number;
+      staleFollowerSyncMs: number;
+      guardrailFailureCycleThreshold: number;
+    };
+    status: { enabled: boolean };
+  };
   assert.equal(config.config.intervalMs, 2_000);
+  assert.equal(config.config.enabled, false);
+  assert.equal(config.status.enabled, false);
+  assert.equal(config.config.staleLeaderSyncMs, 7_000);
+  assert.equal(config.config.staleFollowerSyncMs, 9_000);
+  assert.equal(config.config.guardrailFailureCycleThreshold, 3);
 });
 
 function makeLeaderStatus(): LeaderPollerStatus {

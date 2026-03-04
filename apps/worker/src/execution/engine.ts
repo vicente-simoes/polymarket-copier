@@ -102,7 +102,11 @@ export class ExecutionEngine {
   }
 
   start(): void {
+    this.status.enabled = this.config.enabled;
     if (!this.config.enabled) {
+      return;
+    }
+    if (this.interval) {
       return;
     }
 
@@ -113,11 +117,32 @@ export class ExecutionEngine {
     void this.run();
   }
 
+  setEnabled(enabled: boolean): void {
+    if (this.config.enabled === enabled) {
+      this.status.enabled = enabled;
+      return;
+    }
+
+    this.config.enabled = enabled;
+    this.status.enabled = enabled;
+    if (enabled) {
+      this.start();
+      return;
+    }
+
+    this.stop();
+  }
+
+  setPanicMode(enabled: boolean): void {
+    this.config.panicMode = enabled;
+  }
+
   stop(): void {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = undefined;
     }
+    this.status.running = false;
   }
 
   getStatus(): ExecutionEngineStatus {

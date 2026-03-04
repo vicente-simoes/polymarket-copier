@@ -1016,7 +1016,39 @@ When the **copy system is disabled**, show additional switches directly below:
 (Option for later) Adaptive cadence:
 - under high volatility or large tracking error, temporarily reduce interval; otherwise keep it at the configured baseline.
 
-#### C) Guardrails
+#### C) Operations runtime (global, no restart)
+
+These settings are global (not profile-scoped), saved in `GlobalRuntimeConfig.config.ops`, and applied live by the worker on refresh cadence.
+
+Fields:
+- `chainTriggerWsEnabled`
+- `fillReconcileEnabled`
+- `fillReconcileIntervalSeconds`
+- `fillParseStarvationWindowSeconds`
+- `fillParseStarvationMinMessages`
+- `targetNettingEnabled`
+- `targetNettingIntervalMs`
+- `targetNettingTrackingErrorBps`
+- `reconcileEngineEnabled`
+- `reconcileStaleLeaderSyncSeconds`
+- `reconcileStaleFollowerSyncSeconds`
+- `reconcileGuardrailFailureCycleThreshold`
+- `leaderTradesPollIntervalSeconds`
+- `leaderTradesTakerOnly`
+- `executionEngineEnabled`
+- `panicMode`
+
+Runtime rules:
+- Precedence: `GlobalRuntimeConfig.config.ops` override → env fallback baseline.
+- `chainTriggerEnabled` is derived as `chainTriggerWsEnabled && tradeDetectionEnabled`.
+- DB read failure does not flap to env; worker keeps last applied runtime state.
+- `DRY_RUN_MODE`, credentials/URLs, and low-level polling/backoff/cache internals remain env-only.
+
+API contract:
+- `GET /api/v1/config` returns `runtimeOps` and `runtimeOpsDefaults` in addition to profile-scoped `config/defaults`.
+- `PATCH /api/v1/config` accepts optional `runtimeOps` and writes global runtime config + `GLOBAL` audit entry on change.
+
+#### D) Guardrails
 
 **Goal:** define when a potential copy is allowed to turn into an order, and what conditions can block/retry it.
 
@@ -1047,11 +1079,12 @@ Guardrails (with defaults):
 - **Max spread**: default **3¢**
   - If the bid/ask spread exceeds this, block execution and retry later (until expiration).
 - **Min notional per order**: default **$1.00** (Polymarket minimum)
-- **Min book depth for our size**: default **ON**
-  - Worker currently enforces depth checks in planning; the Config-page `minBookDepthForSizeEnabled` toggle is not yet wired (currently a no-op).
+- **Min book depth for our size**: default **ON** (wired)
+  - Enforced in execution planning; Config-page toggle is runtime-effective (profile override > env fallback).
 
 Other guardrail controls:
-- **Max open orders (global)**: default **20** (Config-page field exists; currently not wired in worker execution).
+- **Max open orders (global/profile)**: default **20** (wired)
+  - Enforced per `copyProfileId` against live exchange orders (`PLACED`, `PARTIALLY_FILLED`, `RETRYING` with non-null external order id).
 - **Cooldown per market** (seconds): default **5s** (wired; runtime-overridable from profile guardrails).
 - **Max retries per attempt**: wired from profile guardrails (env fallback used when unset).
 
@@ -1067,7 +1100,7 @@ Other guardrail controls:
   - converted into an execution attempt,
   - or expired/skipped permanently.
 
-#### D) Sizing
+#### E) Sizing
 
 At the top of this section:
 - Mode toggle: **Global sizing** vs **Per-leader sizing**
@@ -1083,17 +1116,25 @@ Sizing fields:
   - Targets are stored internally as **shares**, but ratio is always applied to **notional exposure**.
   - Validate to a safe range (e.g., 0.0–1.0).
 
-Recommended optional sizing controls:
-- **Max exposure per leader** ($): default **TBD**
-- **Max exposure per market/outcome** ($): default **TBD**
-- **Max daily notional turnover** ($): default **TBD**
+Sizing controls (wired):
+- **Max exposure per leader** ($): env default baseline **100**
+- **Max exposure per market/outcome** ($): env default baseline **50**
+- **Max hourly notional turnover** ($): env default baseline **25**
+- **Max daily notional turnover** ($): env default baseline **100**
+- Runtime precedence:
+  - per-leader sizing override (when set) → `copyProfile.config.sizing` → env baseline.
+  - BUY-side cap checks use this precedence; risk-reducing SELLs are not blocked by these caps.
 
-#### E) Other settings (placeholders; fill in as needed)
+#### F) Other settings (env-only for now)
 
-Because the rest of the spec includes WS/REST fallbacks, execution policies, and UI requirements, this page should eventually include settings for:
-- **Execution policy** (FAK vs marketable limit; limit price logic; retries/backoff parameters)
-- **Connectivity / credentials status** (read-only indicators for API keys/auth; not necessarily editable here)
-- **Logging / telemetry verbosity** (for debugging production issues)
+These remain intentionally env-only in this phase:
+- `DRY_RUN_MODE`
+- Credentials, URLs, signing/funder identity fields
+- Market cache TTLs and market WS internals
+- Chain dedupe queue/wallet-refresh internals
+- Leader poll pagination/batch/backoff internals
+- Execution interval/max-attempts/backoff internals
+- Worker process internals (`WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS`, heartbeat/ports)
 
 
 ### 8.8 Status page
@@ -1174,6 +1215,8 @@ These items were previously “open questions” and are now decided:
   - Worker env values are fallback baselines.
   - `copyProfile.config.guardrails` overrides env for wired fields in both execution and target netting.
   - Per-leader settings override profile/global values where supported; updates are effective next loop cycle without restart.
+  - Global runtime-safe ops switches/intervals are DB-driven via `GlobalRuntimeConfig.config.ops` (fallback to env only when absent/invalid).
+  - `GET /api/v1/config` includes `runtimeOps` + `runtimeOpsDefaults`; `PATCH /api/v1/config` accepts `runtimeOps`.
 - **Multiple leaders**
   - Targets are combined by **summing per-leader scaled positions** into one net target portfolio.
   - Execution deltas are **netted per token** (if one leader is long and another is short, the net target reflects both).

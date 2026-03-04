@@ -2052,6 +2052,46 @@ test("Stage 9 expires attempt when linked pending delta is no longer active", as
   assert.equal(store.deferred[0]?.terminalStatus, "EXPIRED");
 });
 
+test("Stage 9 runtime setters update execution enable and panic mode", () => {
+  const store = new FakeExecutionStore();
+  const venue = new FakeVenueClient([]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => 1_700_000_000_000,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-1",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-1",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  engine.setEnabled(false);
+  engine.setPanicMode(true);
+
+  const internals = engine as unknown as {
+    config: { enabled: boolean; panicMode: boolean };
+    status: { enabled: boolean };
+  };
+  assert.equal(internals.config.enabled, false);
+  assert.equal(internals.status.enabled, false);
+  assert.equal(internals.config.panicMode, true);
+});
+
 function makeAttempt(overrides: Partial<ExecutionAttemptRecord> & Pick<ExecutionAttemptRecord, "id" | "tokenId" | "side">): ExecutionAttemptRecord {
   return {
     id: overrides.id,

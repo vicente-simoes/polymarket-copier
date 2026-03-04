@@ -312,8 +312,14 @@ test("Stage 6 positions polling interval can be reconfigured at runtime", () => 
   });
 
   poller.setPositionsIntervalMs(2_500);
-  const config = poller as unknown as { config: { positionsIntervalMs: number } };
+  const config = poller as unknown as { config: { positionsIntervalMs: number; tradesIntervalMs: number; tradesTakerOnly: boolean } };
   assert.equal(config.config.positionsIntervalMs, 2_500);
+
+  poller.setTradesIntervalMs(4_000);
+  assert.equal(config.config.tradesIntervalMs, 4_000);
+
+  poller.setTradesTakerOnly(true);
+  assert.equal(config.config.tradesTakerOnly, true);
 });
 
 function makeTrade(overrides: Partial<DataApiTrade>): DataApiTrade {
