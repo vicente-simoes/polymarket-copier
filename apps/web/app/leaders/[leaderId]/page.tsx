@@ -56,6 +56,8 @@ interface LeaderDetailData {
       source: 'CHAIN' | 'DATA_API'
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
       outcome: string | null
       side: 'BUY' | 'SELL'
       shares: number
@@ -69,6 +71,9 @@ interface LeaderDetailData {
       copyAttemptId: string | null
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
+      outcome: string | null
       side: 'BUY' | 'SELL'
       status: 'PLACED' | 'PARTIALLY_FILLED' | 'FILLED' | 'FAILED' | 'CANCELLED' | 'RETRYING'
       intendedNotionalUsd: number
@@ -82,6 +87,9 @@ interface LeaderDetailData {
       id: string
       tokenId: string
       marketId: string | null
+      marketLabel: string | null
+      marketSlug: string | null
+      outcome: string | null
       side: 'BUY' | 'SELL'
       status: 'PENDING' | 'EXECUTING' | 'EXECUTED' | 'SKIPPED' | 'EXPIRED' | 'FAILED' | 'RETRYING'
       reason: string | null
@@ -148,6 +156,50 @@ const inputClass =
 const outlineButtonClass = 'rounded-xl border-white/10 bg-white/[0.02] text-[#E7E7E7] hover:bg-white/[0.06] hover:text-white'
 const activeButtonClass = 'rounded-xl bg-[#86efac] text-black hover:bg-[#9af5b1]'
 const insetCardClass = 'rounded-xl border border-white/10 bg-white/[0.02] p-3'
+
+function toPolymarketMarketUrl(marketSlug: string | null | undefined): string | null {
+  if (!marketSlug) {
+    return null
+  }
+  const normalized = marketSlug.trim().replace(/^\/+|\/+$/g, '')
+  if (!normalized) {
+    return null
+  }
+
+  const encodedPath = normalized
+    .split('/')
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/')
+
+  if (!encodedPath) {
+    return null
+  }
+
+  return `https://polymarket.com/event/${encodedPath}`
+}
+
+function MarketLink({
+  marketSlug,
+  marketLabel,
+  fallback
+}: {
+  marketSlug: string | null | undefined
+  marketLabel: string | null | undefined
+  fallback: string
+}) {
+  const label = marketLabel ?? fallback
+  const href = toPolymarketMarketUrl(marketSlug)
+  if (!href) {
+    return <span className="text-[#E7E7E7]">{label}</span>
+  }
+  return (
+    <Link href={href} target="_blank" rel="noreferrer" className="text-[#E7E7E7] underline-offset-4 hover:underline">
+      {label}
+    </Link>
+  )
+}
 
 export default function LeaderDetailPage() {
   const params = useParams<{ leaderId: string }>()
@@ -429,9 +481,20 @@ export default function LeaderDetailPage() {
                 {data.recent.triggers.map((trigger) => (
                   <div key={trigger.id} className={insetCardClass}>
                     <div className="flex items-center justify-between gap-2">
-                      <p className="text-sm font-medium text-[#E7E7E7]">{trigger.side} · {trigger.tokenId}</p>
+                      <p className="text-sm font-medium text-[#E7E7E7]">
+                        {trigger.side} ·{' '}
+                        <MarketLink
+                          marketSlug={trigger.marketSlug}
+                          marketLabel={trigger.marketLabel}
+                          fallback={trigger.marketId ?? trigger.tokenId}
+                        />
+                      </p>
                       <StatusPill label={trigger.source} tone={trigger.source === 'CHAIN' ? 'positive' : 'warning'} />
                     </div>
+                    <p className="text-xs text-[#919191]">
+                      {trigger.outcome ?? 'Unknown outcome'} ·{' '}
+                      <span className="font-mono text-[11px] text-[#7e7e7e]">{trigger.tokenId}</span>
+                    </p>
                     <p className="text-xs text-[#919191]">
                       Fill {formatDateTime(new Date(Number(trigger.leaderFillAtMs)).toISOString())} · Detected {formatDateTime(new Date(Number(trigger.detectedAtMs)).toISOString())}
                     </p>
@@ -459,12 +522,23 @@ export default function LeaderDetailPage() {
                 {data.recent.executions.map((execution) => (
                   <div key={execution.id} className={insetCardClass}>
                     <div className="flex items-center justify-between gap-2">
-                      <p className="text-sm font-medium text-[#E7E7E7]">{execution.side} · {execution.tokenId}</p>
+                      <p className="text-sm font-medium text-[#E7E7E7]">
+                        {execution.side} ·{' '}
+                        <MarketLink
+                          marketSlug={execution.marketSlug}
+                          marketLabel={execution.marketLabel}
+                          fallback={execution.marketId ?? execution.tokenId}
+                        />
+                      </p>
                       <StatusPill
                         label={execution.status}
                         tone={execution.status === 'FILLED' ? 'positive' : execution.status === 'FAILED' ? 'negative' : 'neutral'}
                       />
                     </div>
+                    <p className="text-xs text-[#919191]">
+                      {execution.outcome ?? 'Unknown outcome'} ·{' '}
+                      <span className="font-mono text-[11px] text-[#7e7e7e]">{execution.tokenId}</span>
+                    </p>
                     <p className="text-xs text-[#919191]">
                       {formatDateTime(execution.attemptedAt)} · {formatCurrency(execution.intendedNotionalUsd)} · {formatNumber(execution.intendedShares)} shares
                     </p>
@@ -493,8 +567,7 @@ export default function LeaderDetailPage() {
                   <TableHeader className="[&_tr]:border-white/10">
                     <TableRow className="hover:bg-transparent">
                       <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Time</TableHead>
-                      <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Token</TableHead>
-                      <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Side</TableHead>
+                      <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Market</TableHead>
                       <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Decision</TableHead>
                       <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Accum. delta</TableHead>
                       <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Reason</TableHead>
@@ -504,8 +577,14 @@ export default function LeaderDetailPage() {
                     {data.recent.skips.map((skip) => (
                       <TableRow key={skip.id} className="hover:bg-white/[0.03]">
                         <TableCell className="px-3 text-[#CFCFCF]">{formatDateTime(skip.createdAt)}</TableCell>
-                        <TableCell className="px-3 font-mono text-xs text-[#CFCFCF]">{skip.tokenId}</TableCell>
-                        <TableCell className="px-3 text-[#E7E7E7]">{skip.side}</TableCell>
+                        <TableCell className="px-3 text-[#E7E7E7]">
+                          <p>
+                            {skip.side} ·{' '}
+                            <MarketLink marketSlug={skip.marketSlug} marketLabel={skip.marketLabel} fallback={skip.marketId ?? skip.tokenId} />
+                          </p>
+                          <p className="text-xs text-[#919191]">{skip.outcome ?? 'Unknown outcome'}</p>
+                          <p className="font-mono text-[11px] text-[#7e7e7e]">{skip.tokenId}</p>
+                        </TableCell>
                         <TableCell className="px-3 text-[#E7E7E7]">{skip.decision}</TableCell>
                         <TableCell className="px-3 text-[#E7E7E7]">{formatCurrency(skip.accumulatedDeltaNotionalUsd)}</TableCell>
                         <TableCell className="px-3 text-[#E7E7E7]">{skip.reason ?? 'n/a'}</TableCell>
@@ -519,9 +598,14 @@ export default function LeaderDetailPage() {
                 {data.recent.skips.map((skip) => (
                   <div key={skip.id} className={insetCardClass}>
                     <div className="flex items-center justify-between gap-2">
-                      <p className="text-sm font-medium text-[#E7E7E7]">{skip.side} · {skip.tokenId}</p>
+                      <p className="text-sm font-medium text-[#E7E7E7]">
+                        {skip.side} ·{' '}
+                        <MarketLink marketSlug={skip.marketSlug} marketLabel={skip.marketLabel} fallback={skip.marketId ?? skip.tokenId} />
+                      </p>
                       <StatusPill label={skip.decision} tone="neutral" />
                     </div>
+                    <p className="text-xs text-[#919191]">{skip.outcome ?? 'Unknown outcome'}</p>
+                    <p className="font-mono text-[11px] text-[#7e7e7e]">{skip.tokenId}</p>
                     <p className="text-xs text-[#919191]">{formatDateTime(skip.createdAt)}</p>
                     <p className="text-xs text-[#919191]">Accumulated delta {formatCurrency(skip.accumulatedDeltaNotionalUsd)}</p>
                     <p className="text-sm text-[#E7E7E7]">{skip.reason ?? 'n/a'}</p>
