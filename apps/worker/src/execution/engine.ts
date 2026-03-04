@@ -439,14 +439,14 @@ export class ExecutionEngine {
         ? (guardBestBid + guardBestAsk) / 2
         : market.midPrice;
 
-    const leaderPrice = resolveLeaderPrice(context, attempt, effectiveDeltaShares, effectiveDeltaNotionalUsd);
+    const leaderBaseline = resolveLeaderBaseline(context, attempt, effectiveDeltaShares, effectiveDeltaNotionalUsd);
     const effectiveMaxPricePerShare = resolveMaxPricePerShare(this.config.maxPricePerShare, context);
     const plan = planExecution({
       side: attempt.side,
       deltaShares: effectiveDeltaShares,
       minOrderSize: market.minOrderSize,
       minNotionalUsd: effectiveGuardrails.minNotionalUsd,
-      leaderPrice,
+      leaderPrice: leaderBaseline.price,
       midPrice: guardMidPrice,
       bestBid: guardBestBid,
       bestAsk: guardBestAsk,
@@ -471,7 +471,18 @@ export class ExecutionEngine {
         incrementRetry: true,
         message: plan.blockMessage ?? "execution plan blocked",
         context: {
-          guardrailReasons: plan.guardrailReasons
+          guardrailReasons: plan.guardrailReasons,
+          leaderBaseline:
+            leaderBaseline.price !== undefined
+              ? {
+                  side: leaderBaseline.side,
+                  source: leaderBaseline.source,
+                  value: roundTo(leaderBaseline.price, 10)
+                }
+              : {
+                  side: leaderBaseline.side,
+                  source: leaderBaseline.source
+                }
         }
       });
       this.status.totalGuardrailBlocks += 1;
@@ -998,32 +1009,100 @@ export class ExecutionEngine {
   }
 }
 
-function resolveLeaderPrice(
+function resolveLeaderBaseline(
   context: ExecutionAttemptContext,
   attempt: ExecutionAttemptRecord,
   effectiveDeltaShares: number,
   effectiveDeltaNotionalUsd: number
-): number | undefined {
+): {
+  side: "BUY" | "SELL";
+  source: string;
+  price?: number;
+} {
   const metadata = context.pendingDeltaMetadata;
-  const byTokenPrice = readNumber(metadata.tokenPrice);
-  if (byTokenPrice && byTokenPrice > 0) {
-    return byTokenPrice;
+  const bySideWeightedBaseline = readSideWeightedBaseline(metadata, attempt.side);
+  if (bySideWeightedBaseline && bySideWeightedBaseline.price > 0) {
+    return {
+      side: attempt.side,
+      source: bySideWeightedBaseline.source,
+      price: bySideWeightedBaseline.price
+    };
   }
 
   const byLeaderPrice = readNumber(metadata.leaderPrice);
   if (byLeaderPrice && byLeaderPrice > 0) {
-    return byLeaderPrice;
+    return {
+      side: attempt.side,
+      source: "legacy:metadata.leaderPrice",
+      price: byLeaderPrice
+    };
+  }
+
+  const byTokenPrice = readNumber(metadata.tokenPrice);
+  if (byTokenPrice && byTokenPrice > 0) {
+    return {
+      side: attempt.side,
+      source: "legacy:metadata.tokenPrice",
+      price: byTokenPrice
+    };
   }
 
   if (effectiveDeltaShares > 0 && effectiveDeltaNotionalUsd > 0) {
-    return effectiveDeltaNotionalUsd / effectiveDeltaShares;
+    return {
+      side: attempt.side,
+      source: "legacy:live_delta_ratio",
+      price: effectiveDeltaNotionalUsd / effectiveDeltaShares
+    };
   }
 
   if (attempt.accumulatedDeltaShares > 0 && attempt.accumulatedDeltaNotionalUsd > 0) {
-    return attempt.accumulatedDeltaNotionalUsd / attempt.accumulatedDeltaShares;
+    return {
+      side: attempt.side,
+      source: "legacy:attempt_delta_ratio",
+      price: attempt.accumulatedDeltaNotionalUsd / attempt.accumulatedDeltaShares
+    };
   }
 
-  return undefined;
+  return {
+    side: attempt.side,
+    source: "missing"
+  };
+}
+
+function readSideWeightedBaseline(
+  metadata: Record<string, unknown>,
+  side: "BUY" | "SELL"
+): {
+  source: string;
+  price: number;
+} | null {
+  const baseline = readObject(metadata.baseline);
+  if (!baseline) {
+    return null;
+  }
+
+  const sideKey = side === "BUY" ? "buy" : "sell";
+  const sideNode = readObject(baseline[sideKey]);
+  if (!sideNode) {
+    return null;
+  }
+
+  const weighted = readNumber(sideNode.weighted);
+  if (!weighted || weighted <= 0) {
+    return null;
+  }
+
+  return {
+    source: `baseline.v${readNumber(baseline.version) ?? 1}.${sideKey}.weighted`,
+    price: weighted
+  };
+}
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
 }
 
 function resolveLeaderWeights(context: ExecutionAttemptContext, fallbackLeaderId?: string): Record<string, number> {

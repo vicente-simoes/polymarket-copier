@@ -5,6 +5,7 @@ export type {
   ActiveCopyProfileLeader,
   FollowerPositionPoint,
   LeaderPositionPoint,
+  LeaderTradePricePoint,
   OpenCopyAttemptRecord,
   PendingDeltaInput,
   PendingDeltaRecord,

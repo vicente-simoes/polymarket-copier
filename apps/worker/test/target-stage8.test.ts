@@ -5,6 +5,7 @@ import type {
   ActiveCopyProfile,
   FollowerPositionPoint,
   LeaderPositionPoint,
+  LeaderTradePricePoint,
   OpenCopyAttemptRecord,
   PendingDeltaInput,
   PendingDeltaRecord,
@@ -33,6 +34,7 @@ interface CreatedAttemptInput {
 class FakeTargetStore implements TargetNettingStore {
   profiles: ActiveCopyProfile[] = [];
   leaderPositions: LeaderPositionPoint[] = [];
+  leaderTradePrices: LeaderTradePricePoint[] = [];
   followerByProfile = new Map<string, FollowerPositionPoint[]>();
   pendingInputs: PendingDeltaInput[] = [];
   attempts = new Map<string, OpenCopyAttemptRecord>();
@@ -48,6 +50,15 @@ class FakeTargetStore implements TargetNettingStore {
 
   async getLatestLeaderPositions(_leaderIds: string[]): Promise<LeaderPositionPoint[]> {
     return this.leaderPositions;
+  }
+
+  async getLatestLeaderTradePrices(args: {
+    leaderIds: string[];
+    tokenIds: string[];
+  }): Promise<LeaderTradePricePoint[]> {
+    const leaderSet = new Set(args.leaderIds);
+    const tokenSet = new Set(args.tokenIds);
+    return this.leaderTradePrices.filter((point) => leaderSet.has(point.leaderId) && tokenSet.has(point.tokenId));
   }
 
   async getLatestFollowerPositions(copyProfileId: string): Promise<FollowerPositionPoint[]> {
@@ -278,6 +289,219 @@ test("Stage 8 price preference uses curPrice over market mid and does not block 
   assert.equal(pending.status, "ELIGIBLE");
   assert.equal(pending.blockReason, undefined);
   assert.equal(store.attempts.size, 1);
+});
+
+test("Stage 8 baseline metadata uses buy avg-entry, sell last-sell-fill, and weighted multi-leader aggregation", async () => {
+  const store = new FakeTargetStore();
+  store.profiles = [
+    {
+      copyProfileId: "cp-baseline-weighted",
+      defaultRatio: 1,
+      leaders: [
+        { leaderId: "leader-1", ratio: 1, settings: {} },
+        { leaderId: "leader-2", ratio: 1, settings: {} }
+      ]
+    }
+  ];
+  store.leaderPositions = [
+    {
+      leaderId: "leader-1",
+      tokenId: "token-weighted",
+      marketId: "market-weighted",
+      shares: 10,
+      avgPrice: 0.4,
+      currentPrice: 0.6,
+      currentValueUsd: 6
+    },
+    {
+      leaderId: "leader-2",
+      tokenId: "token-weighted",
+      marketId: "market-weighted",
+      shares: 20,
+      avgPrice: 0.5,
+      currentPrice: 0.7,
+      currentValueUsd: 14
+    }
+  ];
+  store.leaderTradePrices = [
+    {
+      leaderId: "leader-1",
+      tokenId: "token-weighted",
+      side: "BUY",
+      price: 0.45,
+      leaderFillAtMs: 1_000
+    },
+    {
+      leaderId: "leader-1",
+      tokenId: "token-weighted",
+      side: "SELL",
+      price: 0.48,
+      leaderFillAtMs: 2_000
+    },
+    {
+      leaderId: "leader-2",
+      tokenId: "token-weighted",
+      side: "BUY",
+      price: 0.52,
+      leaderFillAtMs: 3_000
+    },
+    {
+      leaderId: "leader-2",
+      tokenId: "token-weighted",
+      side: "SELL",
+      price: 0.62,
+      leaderFillAtMs: 4_000
+    }
+  ];
+
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 0.5,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    resolvePriceSnapshot: async (tokenId, marketId) => ({
+      tokenId,
+      marketId,
+      midPrice: 0.55,
+      minOrderSize: 0,
+      source: "MARKET_WS"
+    })
+  });
+
+  await engine.run();
+
+  const pending = store.getPending("cp-baseline-weighted", "token-weighted", "BUY");
+  assert.ok(pending);
+  const baseline = readBaselineMetadata(pending.metadata);
+  assert.ok(baseline);
+  assertApprox(baseline.buy.weighted as number, 0.4666666667);
+  assertApprox(baseline.sell.weighted as number, 0.5733333333);
+  assert.equal(baseline.perLeader["leader-1"]?.buy?.source, "AVG_ENTRY");
+  assert.equal(baseline.perLeader["leader-2"]?.buy?.source, "AVG_ENTRY");
+  assert.equal(baseline.perLeader["leader-1"]?.sell?.source, "LAST_SELL_FILL");
+  assert.equal(baseline.perLeader["leader-2"]?.sell?.source, "LAST_SELL_FILL");
+});
+
+test("Stage 8 baseline metadata fallback chains work for missing avg and fill inputs", async () => {
+  const runScenario = async (args: {
+    scenarioId: string;
+    avgPrice?: number;
+    currentPrice?: number;
+    lastBuyFill?: number;
+    lastSellFill?: number;
+    expectedBuySource: string;
+    expectedBuyWeighted: number;
+    expectedSellSource: string;
+    expectedSellWeighted: number;
+  }) => {
+    const store = new FakeTargetStore();
+    store.profiles = [
+      {
+        copyProfileId: `cp-${args.scenarioId}`,
+        defaultRatio: 1,
+        leaders: [{ leaderId: "leader-1", ratio: 1, settings: {} }]
+      }
+    ];
+    store.leaderPositions = [
+      {
+        leaderId: "leader-1",
+        tokenId: `token-${args.scenarioId}`,
+        marketId: `market-${args.scenarioId}`,
+        shares: 10,
+        avgPrice: args.avgPrice,
+        currentPrice: args.currentPrice,
+        currentValueUsd: args.currentPrice !== undefined ? args.currentPrice * 10 : 7
+      }
+    ];
+    store.leaderTradePrices = [
+      ...(args.lastBuyFill !== undefined
+        ? [
+            {
+              leaderId: "leader-1" as const,
+              tokenId: `token-${args.scenarioId}`,
+              side: "BUY" as const,
+              price: args.lastBuyFill,
+              leaderFillAtMs: 1_000
+            }
+          ]
+        : []),
+      ...(args.lastSellFill !== undefined
+        ? [
+            {
+              leaderId: "leader-1" as const,
+              tokenId: `token-${args.scenarioId}`,
+              side: "SELL" as const,
+              price: args.lastSellFill,
+              leaderFillAtMs: 2_000
+            }
+          ]
+        : [])
+    ];
+
+    const engine = new TargetNettingEngine({
+      store,
+      config: {
+        enabled: true,
+        intervalMs: 5000,
+        minNotionalUsd: 0.1,
+        trackingErrorBps: 0,
+        maxRetriesPerAttempt: 20,
+        attemptExpirationSeconds: 120
+      },
+      resolvePriceSnapshot: async (tokenId, marketId) => ({
+        tokenId,
+        marketId,
+        midPrice: 0.5,
+        minOrderSize: 0,
+        source: "MARKET_WS"
+      })
+    });
+
+    await engine.run();
+
+    const pending = store.getPending(`cp-${args.scenarioId}`, `token-${args.scenarioId}`, "BUY");
+    assert.ok(pending);
+    const baseline = readBaselineMetadata(pending.metadata);
+    assert.ok(baseline);
+    assert.equal(baseline.perLeader["leader-1"]?.buy?.source, args.expectedBuySource);
+    assert.equal(baseline.perLeader["leader-1"]?.sell?.source, args.expectedSellSource);
+    assertApprox(baseline.buy.weighted as number, args.expectedBuyWeighted);
+    assertApprox(baseline.sell.weighted as number, args.expectedSellWeighted);
+  };
+
+  await runScenario({
+    scenarioId: "fallback-last-buy",
+    currentPrice: 0.7,
+    lastBuyFill: 0.53,
+    expectedBuySource: "LAST_BUY_FILL",
+    expectedBuyWeighted: 0.53,
+    expectedSellSource: "CUR_PRICE",
+    expectedSellWeighted: 0.7
+  });
+
+  await runScenario({
+    scenarioId: "fallback-cur",
+    currentPrice: 0.68,
+    expectedBuySource: "CUR_PRICE",
+    expectedBuyWeighted: 0.68,
+    expectedSellSource: "CUR_PRICE",
+    expectedSellWeighted: 0.68
+  });
+
+  await runScenario({
+    scenarioId: "fallback-avg-sell",
+    avgPrice: 0.42,
+    currentPrice: 0.7,
+    expectedBuySource: "AVG_ENTRY",
+    expectedBuyWeighted: 0.42,
+    expectedSellSource: "AVG_ENTRY",
+    expectedSellWeighted: 0.42
+  });
 });
 
 test("Stage 8 applies tracking error threshold before creating attempts", async () => {
@@ -710,6 +934,28 @@ test("Stage 8 runtime setters update target netting config", () => {
 
 function pendingKey(copyProfileId: string, tokenId: string, side: PendingDeltaSide): string {
   return `${copyProfileId}|${tokenId}|${side}`;
+}
+
+function readBaselineMetadata(metadata: Record<string, unknown>): {
+  buy: { weighted?: number };
+  sell: { weighted?: number };
+  perLeader: Record<string, {
+    buy?: { source?: string };
+    sell?: { source?: string };
+  }>;
+} | null {
+  const raw = metadata.baseline;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  return raw as {
+    buy: { weighted?: number };
+    sell: { weighted?: number };
+    perLeader: Record<string, {
+      buy?: { source?: string };
+      sell?: { source?: string };
+    }>;
+  };
 }
 
 function assertApprox(actual: number, expected: number): void {

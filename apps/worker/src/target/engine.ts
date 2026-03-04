@@ -180,6 +180,18 @@ export class TargetNettingEngine {
       this.store.getLatestFollowerPositions(profile.copyProfileId),
       this.store.listOpenPendingTokenIds(profile.copyProfileId)
     ]);
+    const baselineTokenIds = [...new Set([...leaderPositions.map((position) => position.tokenId), ...openPendingTokenIds])];
+    const latestLeaderTradePrices = await this.store.getLatestLeaderTradePrices({
+      leaderIds,
+      tokenIds: baselineTokenIds
+    });
+    const latestTradePriceByLeaderTokenSide = new Map<string, number>();
+    for (const point of latestLeaderTradePrices) {
+      if (!Number.isFinite(point.price) || point.price <= 0) {
+        continue;
+      }
+      latestTradePriceByLeaderTokenSide.set(leaderTradePriceKey(point.leaderId, point.tokenId, point.side), point.price);
+    }
 
     const ratioByLeader = new Map(profile.leaders.map((leader) => [leader.leaderId, leader.ratio]));
     const settingsByLeader = new Map(profile.leaders.map((leader) => [leader.leaderId, leader.settings]));
@@ -187,6 +199,7 @@ export class TargetNettingEngine {
     const targetSharesByToken = new Map<string, number>();
     const targetMarketByToken = new Map<string, string | undefined>();
     const targetPriceByToken = new Map<string, { price: number; source: string; minOrderSize: number }>();
+    const leaderBaselineInputsByToken = new Map<string, Map<string, LeaderBaselineInputs>>();
     const leaderBreakdownByToken = new Map<string, Record<string, number>>();
     const contributorLeaderIdsByToken = new Map<string, Set<string>>();
     const strictestMinNotionalByToken = new Map<string, number>();
@@ -240,6 +253,7 @@ export class TargetNettingEngine {
       const breakdown = leaderBreakdownByToken.get(position.tokenId) ?? {};
       breakdown[position.leaderId] = (breakdown[position.leaderId] ?? 0) + targetShares;
       leaderBreakdownByToken.set(position.tokenId, breakdown);
+      upsertLeaderBaselineInputs(leaderBaselineInputsByToken, position);
 
       const contributors = contributorLeaderIdsByToken.get(position.tokenId) ?? new Set<string>();
       contributors.add(position.leaderId);
@@ -272,7 +286,8 @@ export class TargetNettingEngine {
       const side: PendingDeltaSide = deltaShares > 0 ? "BUY" : "SELL";
       const absoluteDeltaShares = Math.abs(deltaShares);
       const marketId = targetMarketByToken.get(tokenId);
-      const primaryLeaderId = resolvePrimaryLeaderId(leaderBreakdownByToken.get(tokenId));
+      const leaderTargetShares = leaderBreakdownByToken.get(tokenId) ?? {};
+      const primaryLeaderId = resolvePrimaryLeaderId(leaderTargetShares);
       const contributorLeaderIds = [...(contributorLeaderIdsByToken.get(tokenId) ?? new Set<string>())].sort();
       const effectiveTokenMinNotionalUsd = strictestMinNotionalByToken.get(tokenId) ?? effectiveMinNotionalUsd;
 
@@ -290,6 +305,14 @@ export class TargetNettingEngine {
         priceSource = snapshot?.source ?? "UNKNOWN";
         minOrderSize = normalizeMinOrderSize(snapshot?.minOrderSize);
       }
+      const baseline = buildPendingDeltaBaseline({
+        tokenId,
+        contributorLeaderIds,
+        leaderTargetShares,
+        leaderInputsById: leaderBaselineInputsByToken.get(tokenId),
+        latestTradePriceByLeaderTokenSide
+      });
+      const sideWeightedBaseline = side === "BUY" ? baseline.buy.weighted : baseline.sell.weighted;
 
       const deltaNotionalUsd = absoluteDeltaShares * tokenPrice;
       const trackingErrorBps = computeTrackingErrorBps(targetShares, followerShares, deltaShares);
@@ -329,8 +352,10 @@ export class TargetNettingEngine {
           requiredTrackingErrorBps: this.config.trackingErrorBps,
           thresholdEligible: thresholdResult.eligible,
           thresholdReason: thresholdResult.reason ?? null,
-          leaderTargetShares: leaderBreakdownByToken.get(tokenId) ?? {},
+          leaderTargetShares,
           contributorLeaderIds,
+          baseline,
+          ...(sideWeightedBaseline !== undefined ? { leaderPrice: sideWeightedBaseline } : {}),
           effectiveMinNotionalUsd: effectiveTokenMinNotionalUsd
         },
         expiresAt: new Date(this.now() + effectiveAttemptExpirationSeconds * 1000)
@@ -398,6 +423,210 @@ function choosePrice(currentPrice: number | undefined, snapshot: PriceSnapshot |
   }
 
   return undefined;
+}
+
+type BaselineSource = "AVG_ENTRY" | "LAST_BUY_FILL" | "LAST_SELL_FILL" | "CUR_PRICE";
+
+interface LeaderBaselineInputs {
+  avgEntry?: number;
+  curPrice?: number;
+  lastBuyFill?: number;
+  lastSellFill?: number;
+}
+
+interface BaselineResolvedValue {
+  value: number;
+  source: BaselineSource;
+}
+
+interface PendingDeltaBaselineSide {
+  weighted?: number;
+  contributorLeaderIds: string[];
+  leaderIdsUsed: string[];
+  missingLeaderIds: string[];
+}
+
+interface PendingDeltaBaselinePerLeader {
+  weight: number;
+  inputs: LeaderBaselineInputs;
+  buy?: BaselineResolvedValue;
+  sell?: BaselineResolvedValue;
+}
+
+interface PendingDeltaBaselineMetadata {
+  version: 1;
+  buy: PendingDeltaBaselineSide;
+  sell: PendingDeltaBaselineSide;
+  perLeader: Record<string, PendingDeltaBaselinePerLeader>;
+}
+
+function upsertLeaderBaselineInputs(
+  byToken: Map<string, Map<string, LeaderBaselineInputs>>,
+  position: {
+    leaderId: string;
+    tokenId: string;
+    avgPrice?: number;
+    currentPrice?: number;
+  }
+): void {
+  const leaderMap = byToken.get(position.tokenId) ?? new Map<string, LeaderBaselineInputs>();
+  const existing = leaderMap.get(position.leaderId) ?? {};
+  const avgEntry = positiveOrUndefined(position.avgPrice);
+  const curPrice = positiveOrUndefined(position.currentPrice);
+  leaderMap.set(position.leaderId, {
+    avgEntry: avgEntry ?? existing.avgEntry,
+    curPrice: curPrice ?? existing.curPrice,
+    lastBuyFill: existing.lastBuyFill,
+    lastSellFill: existing.lastSellFill
+  });
+  byToken.set(position.tokenId, leaderMap);
+}
+
+function buildPendingDeltaBaseline(args: {
+  tokenId: string;
+  contributorLeaderIds: string[];
+  leaderTargetShares: Record<string, number>;
+  leaderInputsById: Map<string, LeaderBaselineInputs> | undefined;
+  latestTradePriceByLeaderTokenSide: Map<string, number>;
+}): PendingDeltaBaselineMetadata {
+  const leaderIds = [...new Set([...args.contributorLeaderIds, ...Object.keys(args.leaderTargetShares)])].sort();
+  const totalTargetShares = leaderIds.reduce((sum, leaderId) => {
+    const targetShares = positiveOrZero(args.leaderTargetShares[leaderId]);
+    return sum + targetShares;
+  }, 0);
+
+  const perLeader: Record<string, PendingDeltaBaselinePerLeader> = {};
+  const buyUsed: string[] = [];
+  const buyMissing: string[] = [];
+  const sellUsed: string[] = [];
+  const sellMissing: string[] = [];
+  let buyNumerator = 0;
+  let buyDenominator = 0;
+  let sellNumerator = 0;
+  let sellDenominator = 0;
+
+  for (const leaderId of leaderIds) {
+    const targetShares = positiveOrZero(args.leaderTargetShares[leaderId]);
+    const weight = totalTargetShares > 0 && targetShares > 0 ? targetShares / totalTargetShares : 0;
+    const existingInputs = args.leaderInputsById?.get(leaderId) ?? {};
+    const inputs: LeaderBaselineInputs = {
+      avgEntry: positiveOrUndefined(existingInputs.avgEntry),
+      curPrice: positiveOrUndefined(existingInputs.curPrice),
+      lastBuyFill: positiveOrUndefined(
+        args.latestTradePriceByLeaderTokenSide.get(leaderTradePriceKey(leaderId, args.tokenId, "BUY"))
+      ),
+      lastSellFill: positiveOrUndefined(
+        args.latestTradePriceByLeaderTokenSide.get(leaderTradePriceKey(leaderId, args.tokenId, "SELL"))
+      )
+    };
+    const buy = resolveBuyBaseline(inputs);
+    const sell = resolveSellBaseline(inputs);
+    perLeader[leaderId] = {
+      weight: roundTo(weight, 8),
+      inputs,
+      ...(buy ? { buy } : {}),
+      ...(sell ? { sell } : {})
+    };
+
+    if (weight <= 0) {
+      continue;
+    }
+
+    if (buy) {
+      buyNumerator += weight * buy.value;
+      buyDenominator += weight;
+      buyUsed.push(leaderId);
+    } else {
+      buyMissing.push(leaderId);
+    }
+
+    if (sell) {
+      sellNumerator += weight * sell.value;
+      sellDenominator += weight;
+      sellUsed.push(leaderId);
+    } else {
+      sellMissing.push(leaderId);
+    }
+  }
+
+  return {
+    version: 1,
+    buy: {
+      weighted: buyDenominator > 0 ? roundTo(buyNumerator / buyDenominator, 10) : undefined,
+      contributorLeaderIds: [...args.contributorLeaderIds],
+      leaderIdsUsed: buyUsed,
+      missingLeaderIds: buyMissing
+    },
+    sell: {
+      weighted: sellDenominator > 0 ? roundTo(sellNumerator / sellDenominator, 10) : undefined,
+      contributorLeaderIds: [...args.contributorLeaderIds],
+      leaderIdsUsed: sellUsed,
+      missingLeaderIds: sellMissing
+    },
+    perLeader
+  };
+}
+
+function resolveBuyBaseline(inputs: LeaderBaselineInputs): BaselineResolvedValue | undefined {
+  if (inputs.avgEntry && inputs.avgEntry > 0) {
+    return {
+      value: inputs.avgEntry,
+      source: "AVG_ENTRY"
+    };
+  }
+  if (inputs.lastBuyFill && inputs.lastBuyFill > 0) {
+    return {
+      value: inputs.lastBuyFill,
+      source: "LAST_BUY_FILL"
+    };
+  }
+  if (inputs.curPrice && inputs.curPrice > 0) {
+    return {
+      value: inputs.curPrice,
+      source: "CUR_PRICE"
+    };
+  }
+  return undefined;
+}
+
+function resolveSellBaseline(inputs: LeaderBaselineInputs): BaselineResolvedValue | undefined {
+  if (inputs.lastSellFill && inputs.lastSellFill > 0) {
+    return {
+      value: inputs.lastSellFill,
+      source: "LAST_SELL_FILL"
+    };
+  }
+  if (inputs.avgEntry && inputs.avgEntry > 0) {
+    return {
+      value: inputs.avgEntry,
+      source: "AVG_ENTRY"
+    };
+  }
+  if (inputs.curPrice && inputs.curPrice > 0) {
+    return {
+      value: inputs.curPrice,
+      source: "CUR_PRICE"
+    };
+  }
+  return undefined;
+}
+
+function positiveOrUndefined(value: number | undefined): number | undefined {
+  if (!Number.isFinite(value) || value === undefined || value <= 0) {
+    return undefined;
+  }
+  return value;
+}
+
+function positiveOrZero(value: number | undefined): number {
+  if (!Number.isFinite(value) || value === undefined || value <= 0) {
+    return 0;
+  }
+  return value;
+}
+
+function leaderTradePriceKey(leaderId: string, tokenId: string, side: PendingDeltaSide): string {
+  return `${leaderId}|${tokenId}|${side}`;
 }
 
 function normalizeMinOrderSize(value: number | undefined): number {

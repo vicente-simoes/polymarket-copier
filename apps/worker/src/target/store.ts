@@ -5,6 +5,7 @@ import type {
   ActiveCopyProfile,
   FollowerPositionPoint,
   LeaderPositionPoint,
+  LeaderTradePricePoint,
   OpenCopyAttemptRecord,
   PendingDeltaInput,
   PendingDeltaRecord,
@@ -90,6 +91,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
           tokenId: true,
           marketId: true,
           shares: true,
+          avgPrice: true,
           currentPrice: true,
           currentValueUsd: true
         }
@@ -101,6 +103,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
           tokenId: snapshot.tokenId,
           marketId: snapshot.marketId ?? undefined,
           shares: Number(snapshot.shares),
+          avgPrice: snapshot.avgPrice ? Number(snapshot.avgPrice) : undefined,
           currentPrice: snapshot.currentPrice ? Number(snapshot.currentPrice) : undefined,
           currentValueUsd: snapshot.currentValueUsd ? Number(snapshot.currentValueUsd) : undefined
         });
@@ -108,6 +111,62 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
     }
 
     return rows;
+  }
+
+  async getLatestLeaderTradePrices(args: {
+    leaderIds: string[];
+    tokenIds: string[];
+  }): Promise<LeaderTradePricePoint[]> {
+    if (args.leaderIds.length === 0 || args.tokenIds.length === 0) {
+      return [];
+    }
+
+    const rows = await this.prisma.leaderTradeEvent.findMany({
+      where: {
+        leaderId: {
+          in: args.leaderIds
+        },
+        tokenId: {
+          in: args.tokenIds
+        },
+        side: {
+          in: ["BUY", "SELL"]
+        }
+      },
+      orderBy: [
+        {
+          leaderFillAtMs: "desc"
+        },
+        {
+          createdAt: "desc"
+        }
+      ],
+      select: {
+        leaderId: true,
+        tokenId: true,
+        side: true,
+        price: true,
+        leaderFillAtMs: true
+      }
+    });
+
+    const latestByKey = new Map<string, LeaderTradePricePoint>();
+
+    for (const row of rows) {
+      const key = `${row.leaderId}|${row.tokenId}|${row.side}`;
+      if (latestByKey.has(key)) {
+        continue;
+      }
+      latestByKey.set(key, {
+        leaderId: row.leaderId,
+        tokenId: row.tokenId,
+        side: row.side as PendingDeltaSide,
+        price: Number(row.price),
+        leaderFillAtMs: Number(row.leaderFillAtMs)
+      });
+    }
+
+    return [...latestByKey.values()];
   }
 
   async getLatestFollowerPositions(copyProfileId: string): Promise<FollowerPositionPoint[]> {

@@ -437,67 +437,6 @@ export default function ConfigPage() {
         </CardContent>
       </Card>
 
-      <Card className={`${panelClass} gap-4 py-5`}>
-        <CardHeader className="px-5 pb-0 md:px-6">
-          <CardDescription className="uppercase tracking-[0.18em] text-[#919191]">Operations</CardDescription>
-          <CardTitle className="text-[#E7E7E7]">Operations runtime (global)</CardTitle>
-          <CardDescription className="text-[#919191]">Live service toggles and cadence controls applied without restart.</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3 px-5 md:px-6">
-          <ToggleRow
-            label="Chain trigger WS enabled"
-            description="Global gate for chain trigger ingestion. Effective chain trigger still requires trade detection enabled."
-            checked={form.chainTriggerWsEnabled}
-            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, chainTriggerWsEnabled: checked } : previous)}
-          />
-          <ToggleRow
-            label="Fill reconcile enabled"
-            description="Enable periodic REST trade-history reconcile for follower fills."
-            checked={form.fillReconcileEnabled}
-            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, fillReconcileEnabled: checked } : previous)}
-          />
-          <InputField label="Fill reconcile interval (seconds)" value={form.fillReconcileIntervalSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, fillReconcileIntervalSeconds: value } : prev)} />
-          <InputField label="Fill parse starvation window (seconds)" value={form.fillParseStarvationWindowSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, fillParseStarvationWindowSeconds: value } : prev)} />
-          <InputField label="Fill parse starvation min messages" value={form.fillParseStarvationMinMessages} onChange={(value) => setForm((prev) => prev ? { ...prev, fillParseStarvationMinMessages: value } : prev)} />
-          <ToggleRow
-            label="Target netting enabled"
-            description="Enable pending-delta target netting loop."
-            checked={form.targetNettingEnabled}
-            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, targetNettingEnabled: checked } : previous)}
-          />
-          <InputField label="Target netting interval (ms)" value={form.targetNettingIntervalMs} onChange={(value) => setForm((prev) => prev ? { ...prev, targetNettingIntervalMs: value } : prev)} />
-          <InputField label="Target netting tracking error (bps)" value={form.targetNettingTrackingErrorBps} onChange={(value) => setForm((prev) => prev ? { ...prev, targetNettingTrackingErrorBps: value } : prev)} />
-          <ToggleRow
-            label="Reconcile engine enabled"
-            description="Enable reconcile/audit loop for profile snapshots and integrity checks."
-            checked={form.reconcileEngineEnabled}
-            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, reconcileEngineEnabled: checked } : previous)}
-          />
-          <InputField label="Reconcile stale leader sync (seconds)" value={form.reconcileStaleLeaderSyncSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, reconcileStaleLeaderSyncSeconds: value } : prev)} />
-          <InputField label="Reconcile stale follower sync (seconds)" value={form.reconcileStaleFollowerSyncSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, reconcileStaleFollowerSyncSeconds: value } : prev)} />
-          <InputField label="Reconcile guardrail failure threshold" value={form.reconcileGuardrailFailureCycleThreshold} onChange={(value) => setForm((prev) => prev ? { ...prev, reconcileGuardrailFailureCycleThreshold: value } : prev)} />
-          <InputField label="Leader trades poll interval (seconds)" value={form.leaderTradesPollIntervalSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, leaderTradesPollIntervalSeconds: value } : prev)} />
-          <ToggleRow
-            label="Leader trades taker-only"
-            description="When enabled, leader trades poll includes only taker-side trades."
-            checked={form.leaderTradesTakerOnly}
-            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, leaderTradesTakerOnly: checked } : previous)}
-          />
-          <ToggleRow
-            label="Execution engine enabled"
-            description="Enable execution loop that processes pending copy attempts."
-            checked={form.executionEngineEnabled}
-            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, executionEngineEnabled: checked } : previous)}
-          />
-          <ToggleRow
-            label="Panic mode"
-            description="Emergency execution stop while keeping system services running."
-            checked={form.panicMode}
-            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, panicMode: checked } : previous)}
-          />
-        </CardContent>
-      </Card>
-
       <div className="grid gap-4 xl:grid-cols-2">
         <Card className={`${panelClass} gap-4 py-5`}>
           <CardHeader className="px-5 pb-0 md:px-6">
@@ -568,6 +507,67 @@ export default function ConfigPage() {
           </CardContent>
         </Card>
       </div>
+
+      <Card className={`${panelClass} gap-4 py-5`}>
+        <CardHeader className="px-5 pb-0 md:px-6">
+          <CardDescription className="uppercase tracking-[0.18em] text-[#919191]">Operations</CardDescription>
+          <CardTitle className="text-[#E7E7E7]">Operations runtime (global)</CardTitle>
+          <CardDescription className="text-[#919191]">Live service toggles and cadence controls applied without restart.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3 px-5 md:px-6">
+          <ToggleRow
+            label="Chain trigger WS enabled"
+            description="Global gate for chain trigger ingestion. Effective chain trigger still requires trade detection enabled."
+            checked={form.chainTriggerWsEnabled}
+            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, chainTriggerWsEnabled: checked } : previous)}
+          />
+          <ToggleRow
+            label="Fill reconcile enabled"
+            description="Enable periodic REST trade-history reconcile for follower fills."
+            checked={form.fillReconcileEnabled}
+            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, fillReconcileEnabled: checked } : previous)}
+          />
+          <InputField label="Fill reconcile interval (seconds)" value={form.fillReconcileIntervalSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, fillReconcileIntervalSeconds: value } : prev)} />
+          <InputField label="Fill parse starvation window (seconds)" value={form.fillParseStarvationWindowSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, fillParseStarvationWindowSeconds: value } : prev)} />
+          <InputField label="Fill parse starvation min messages" value={form.fillParseStarvationMinMessages} onChange={(value) => setForm((prev) => prev ? { ...prev, fillParseStarvationMinMessages: value } : prev)} />
+          <ToggleRow
+            label="Target netting enabled"
+            description="Enable pending-delta target netting loop."
+            checked={form.targetNettingEnabled}
+            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, targetNettingEnabled: checked } : previous)}
+          />
+          <InputField label="Target netting interval (ms)" value={form.targetNettingIntervalMs} onChange={(value) => setForm((prev) => prev ? { ...prev, targetNettingIntervalMs: value } : prev)} />
+          <InputField label="Target netting tracking error (bps)" value={form.targetNettingTrackingErrorBps} onChange={(value) => setForm((prev) => prev ? { ...prev, targetNettingTrackingErrorBps: value } : prev)} />
+          <ToggleRow
+            label="Reconcile engine enabled"
+            description="Enable reconcile/audit loop for profile snapshots and integrity checks."
+            checked={form.reconcileEngineEnabled}
+            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, reconcileEngineEnabled: checked } : previous)}
+          />
+          <InputField label="Reconcile stale leader sync (seconds)" value={form.reconcileStaleLeaderSyncSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, reconcileStaleLeaderSyncSeconds: value } : prev)} />
+          <InputField label="Reconcile stale follower sync (seconds)" value={form.reconcileStaleFollowerSyncSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, reconcileStaleFollowerSyncSeconds: value } : prev)} />
+          <InputField label="Reconcile guardrail failure threshold" value={form.reconcileGuardrailFailureCycleThreshold} onChange={(value) => setForm((prev) => prev ? { ...prev, reconcileGuardrailFailureCycleThreshold: value } : prev)} />
+          <InputField label="Leader trades poll interval (seconds)" value={form.leaderTradesPollIntervalSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, leaderTradesPollIntervalSeconds: value } : prev)} />
+          <ToggleRow
+            label="Leader trades taker-only"
+            description="When enabled, leader trades poll includes only taker-side trades."
+            checked={form.leaderTradesTakerOnly}
+            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, leaderTradesTakerOnly: checked } : previous)}
+          />
+          <ToggleRow
+            label="Execution engine enabled"
+            description="Enable execution loop that processes pending copy attempts."
+            checked={form.executionEngineEnabled}
+            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, executionEngineEnabled: checked } : previous)}
+          />
+          <ToggleRow
+            label="Panic mode"
+            description="Emergency execution stop while keeping system services running."
+            checked={form.panicMode}
+            onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, panicMode: checked } : previous)}
+          />
+        </CardContent>
+      </Card>
 
       <Card className={`${panelClass} gap-4 py-5`}>
         <CardHeader className="px-5 pb-0 md:px-6">

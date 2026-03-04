@@ -365,8 +365,9 @@ This section turns the docs-driven order-type behavior into concrete rules so th
 - `delta_shares > 0` → BUY. `delta_shares < 0` → SELL.
 
 **Step 3 — Compute baseline price for “max worsening”**
-- Prefer the most recent leader fill price for this token and side (from WS trigger enrichment or trades polling).
-- If we do not have a leader fill price yet, fallback to the leader snapshot `curPrice` from the positions poll.
+- **BUY baseline**: prefer the leader snapshot `avgPrice` (entry average) for this token; fallback to most recent leader **BUY** fill price, then fallback to leader snapshot `curPrice`.
+- **SELL baseline**: prefer the most recent leader **SELL** fill price for this token; fallback to leader snapshot `avgPrice`, then fallback to `curPrice`.
+- For multi-leader netted tokens, compute a contributor-weighted baseline using the same leader target-share weights used for attribution inputs.
 
 **Step 4 — Compute price cap/floor (tick-rounded)**
 - Let `mid = (best_bid + best_ask)/2` from the cached market channel (fallback to REST top-of-book).
@@ -1064,10 +1065,12 @@ At the top of this section:
 Guardrails (with defaults):
 - **Max time before expiration**: default **2h**
   - After this time, a pending copy attempt is considered stale and should be skipped/expired.
-- **Max worsening vs leader fill (BUY)**: default **3¢**
-  - When buying, require: `our_expected_buy_price - leader_fill_price <= max_worsening_buy`.
-- **Max worsening vs leader fill (SELL)**: default **6¢** (more forgiving by default)
-  - When selling, require: `leader_fill_price - our_expected_sell_price <= max_worsening_sell`.
+- **Max worsening vs leader baseline (BUY)**: default **3¢**
+  - BUY baseline preference: `avgPrice` → latest BUY fill → `curPrice`.
+  - When buying, require: `our_expected_buy_price - leader_baseline_buy <= max_worsening_buy`.
+- **Max worsening vs leader baseline (SELL)**: default **6¢** (more forgiving by default)
+  - SELL baseline preference: latest SELL fill → `avgPrice` → `curPrice`.
+  - When selling, require: `leader_baseline_sell - our_expected_sell_price <= max_worsening_sell`.
   - Rationale: exiting a position is often higher priority than entering one.
   - Optional “exit priority” mode: once a sell attempt has been pending for longer than `sell_guard_relax_after_minutes` (default OFF), progressively relax `max_worsening_sell` until the position can be exited (still subject to spread/slippage/thin-book guards).
 - **Max slippage vs mid**: default **200 bps** (2.0%)
@@ -1206,7 +1209,7 @@ These items were previously “open questions” and are now decided:
 - **Slippage policy**
   - Slippage/spread/price movement constraints are implemented as **guardrails in the Config page** (global defaults + per-leader overrides).
   - Default policy is the combination of:
-    - max worsening vs leader fill (**3¢**),
+    - max worsening vs leader baseline (**3¢** BUY, **6¢** SELL),
     - max spread (**3¢**),
     - max slippage vs mid (**200 bps**),
     - and a thin-book rule that checks VWAP for our intended size before placing the order.

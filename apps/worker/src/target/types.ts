@@ -27,8 +27,17 @@ export interface LeaderPositionPoint {
   tokenId: string;
   marketId?: string;
   shares: number;
+  avgPrice?: number;
   currentPrice?: number;
   currentValueUsd?: number;
+}
+
+export interface LeaderTradePricePoint {
+  leaderId: string;
+  tokenId: string;
+  side: PendingDeltaSide;
+  price: number;
+  leaderFillAtMs: number;
 }
 
 export interface FollowerPositionPoint {
@@ -82,6 +91,10 @@ export interface OpenCopyAttemptRecord {
 export interface TargetNettingStore {
   listActiveCopyProfiles(): Promise<ActiveCopyProfile[]>;
   getLatestLeaderPositions(leaderIds: string[]): Promise<LeaderPositionPoint[]>;
+  getLatestLeaderTradePrices(args: {
+    leaderIds: string[];
+    tokenIds: string[];
+  }): Promise<LeaderTradePricePoint[]>;
   getLatestFollowerPositions(copyProfileId: string): Promise<FollowerPositionPoint[]>;
   listOpenPendingTokenIds(copyProfileId: string): Promise<string[]>;
   upsertPendingDelta(input: PendingDeltaInput): Promise<PendingDeltaRecord>;

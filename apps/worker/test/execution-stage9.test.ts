@@ -1431,6 +1431,128 @@ test("Stage 9 per-leader maxSlippageBps strictest override blocks attempts that 
   assert.ok(store.deferred[0]?.reason === "SLIPPAGE" || store.deferred[0]?.reason === "THIN_BOOK");
 });
 
+test("Stage 9 BUY worsening baseline uses weighted leader entry metadata before legacy tokenPrice", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_710_000;
+  store.attempts.set("attempt-buy-baseline-weighted", makeAttempt({
+    id: "attempt-buy-baseline-weighted",
+    tokenId: "token-buy-baseline-weighted",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1.4
+  }));
+  store.contexts.set("attempt-buy-baseline-weighted", makeContext("attempt-buy-baseline-weighted", {
+    tokenPrice: 0.7,
+    baseline: {
+      version: 1,
+      buy: {
+        weighted: 0.5
+      },
+      sell: {},
+      perLeader: {}
+    },
+    leaderTargetShares: {
+      "leader-1": 2
+    }
+  }));
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-buy-baseline-weighted",
+      bestBid: 0.7,
+      bestAsk: 0.71,
+      midPrice: 0.705,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-buy-baseline-weighted",
+      bids: [{ price: 0.7, size: 100 }],
+      asks: [{ price: 0.71, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+  assert.equal(
+    (store.deferred[0]?.context?.leaderBaseline as { source?: string } | undefined)?.source,
+    "baseline.v1.buy.weighted"
+  );
+});
+
+test("Stage 9 SELL worsening baseline uses weighted last-sell metadata before legacy tokenPrice", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_720_000;
+  store.attempts.set("attempt-sell-baseline-weighted", makeAttempt({
+    id: "attempt-sell-baseline-weighted",
+    tokenId: "token-sell-baseline-weighted",
+    side: "SELL",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-sell-baseline-weighted", makeContext("attempt-sell-baseline-weighted", {
+    tokenPrice: 0.5,
+    baseline: {
+      version: 1,
+      buy: {},
+      sell: {
+        weighted: 0.62
+      },
+      perLeader: {}
+    },
+    leaderTargetShares: {
+      "leader-1": 2
+    }
+  }));
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-sell-baseline-weighted",
+      bestBid: 0.54,
+      bestAsk: 0.55,
+      midPrice: 0.545,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-sell-baseline-weighted",
+      bids: [{ price: 0.54, size: 100 }],
+      asks: [{ price: 0.55, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+  assert.equal(
+    (store.deferred[0]?.context?.leaderBaseline as { source?: string } | undefined)?.source,
+    "baseline.v1.sell.weighted"
+  );
+});
+
 test("Stage 9 multi-leader strictest max-price override wins", async () => {
   const store = new FakeExecutionStore();
   const nowMs = 2_725_000;
@@ -1862,6 +1984,133 @@ test("Stage 9 failed attempts retry with backoff until they can be placed", asyn
   await engine.run();
   assert.equal(venue.requests.length, 2);
   assert.equal(store.placed.length, 1);
+});
+
+test("Stage 9 guardrail failures retry until max retries then become terminal failed", async () => {
+  const store = new FakeExecutionStore();
+  let nowMs = 3_100_000;
+  store.attempts.set("attempt-guardrail-retry", makeAttempt({
+    id: "attempt-guardrail-retry",
+    tokenId: "token-guardrail-retry",
+    side: "BUY",
+    maxRetries: 2,
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1.4
+  }));
+  store.contexts.set("attempt-guardrail-retry", makeContext("attempt-guardrail-retry", {
+    baseline: {
+      version: 1,
+      buy: {
+        weighted: 0.5
+      },
+      sell: {},
+      perLeader: {}
+    },
+    tokenPrice: 0.7
+  }));
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-guardrail-retry",
+      bestBid: 0.7,
+      bestAsk: 0.71,
+      midPrice: 0.705,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-guardrail-retry",
+      bids: [{ price: 0.7, size: 100 }],
+      asks: [{ price: 0.71, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  nowMs += 5_000;
+  await engine.run();
+  nowMs += 10_000;
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 3);
+  assert.equal(store.deferred[0]?.terminalStatus, undefined);
+  assert.equal(store.deferred[1]?.terminalStatus, undefined);
+  assert.equal(store.deferred[2]?.terminalStatus, "FAILED");
+});
+
+test("Stage 9 guardrail retries terminate as expired when expiry is reached before retry cap", async () => {
+  const store = new FakeExecutionStore();
+  let nowMs = 3_200_000;
+  store.attempts.set("attempt-guardrail-expiry", makeAttempt({
+    id: "attempt-guardrail-expiry",
+    tokenId: "token-guardrail-expiry",
+    side: "BUY",
+    maxRetries: 20,
+    expiresAt: new Date(nowMs + 2_000),
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1.4
+  }));
+  store.contexts.set("attempt-guardrail-expiry", makeContext("attempt-guardrail-expiry", {
+    baseline: {
+      version: 1,
+      buy: {
+        weighted: 0.5
+      },
+      sell: {},
+      perLeader: {}
+    },
+    tokenPrice: 0.7
+  }));
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      retryBackoffBaseMs: 1,
+      retryBackoffMaxMs: 1
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-guardrail-expiry",
+      bestBid: 0.7,
+      bestAsk: 0.71,
+      midPrice: 0.705,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-guardrail-expiry",
+      bids: [{ price: 0.7, size: 100 }],
+      asks: [{ price: 0.71, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  nowMs += 3_000;
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 2);
+  assert.equal(store.deferred[0]?.terminalStatus, undefined);
+  assert.equal(store.deferred[1]?.reason, "EXPIRED");
+  assert.equal(store.deferred[1]?.terminalStatus, "EXPIRED");
 });
 
 test("Stage 15 dry-run mode keeps decision pipeline active without submitting orders", async () => {
