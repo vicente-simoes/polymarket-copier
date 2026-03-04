@@ -3,6 +3,7 @@ import { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { jsonContract, jsonError, parseLeaderProfileAddress, toIso, toNumber } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
+import { LeaderSettingsSchema, normalizeLeaderSettings } from '@/lib/server/leader-settings'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -16,7 +17,7 @@ const UpdateLeaderBodySchema = z
     status: LeaderStatusSchema.optional(),
     copyProfileId: z.string().trim().min(1).optional(),
     ratio: z.number().min(0).max(1).optional(),
-    settings: z.record(z.string(), z.unknown()).optional()
+    settings: LeaderSettingsSchema.optional()
   })
   .refine((value) => Object.keys(value).length > 0, {
     message: 'At least one field must be provided.'
@@ -43,7 +44,7 @@ const LeaderDetailDataSchema = z.object({
       copyProfileId: z.string(),
       ratio: z.number(),
       status: z.enum(['ACTIVE', 'PAUSED', 'REMOVED']),
-      settings: z.record(z.string(), z.unknown())
+      settings: LeaderSettingsSchema
     })
   ),
   stats: z.object({
@@ -381,17 +382,19 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ le
 
     const targetExposureUsd = latestLeaderRows.reduce((sum, row) => sum + Math.abs(toNumber(row.currentValueUsd)), 0)
 
-    const ledgers = await prisma.leaderTokenLedger.findMany({
-      where: {
-        leaderId
-      },
-      select: {
-        tokenId: true,
-        shares: true
-      }
-    })
-
     const activeProfileId = leader.profileLinks.find((link) => link.status === 'ACTIVE')?.copyProfileId ?? null
+    const ledgers =
+      activeProfileId
+        ? await prisma.$queryRaw<Array<{ tokenId: string; shares: Prisma.Decimal }>>(
+            Prisma.sql`
+              SELECT "tokenId", "shares"
+              FROM "LeaderTokenLedger"
+              WHERE "copyProfileId" = ${activeProfileId}
+                AND "leaderId" = ${leaderId}
+            `
+          )
+        : []
+
     const latestFollowerSnapshotAt = activeProfileId
       ? await prisma.followerPositionSnapshot.findFirst({
           where: {
@@ -483,7 +486,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ le
           copyProfileId: link.copyProfileId,
           ratio: toNumber(link.ratio),
           status: link.status,
-          settings: asObject(link.settings)
+          settings: normalizeLeaderSettings(link.settings)
         })),
         stats: {
           targetExposureUsd,

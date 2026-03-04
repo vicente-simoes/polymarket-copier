@@ -1,5 +1,6 @@
 import { Prisma, PrismaClient } from "@copybot/db";
 import { UNATTRIBUTED_BUCKET, allocateFillByWeights, applyBuyAllocation, applySellAllocation } from "@copybot/shared";
+import { randomUUID } from "node:crypto";
 import type {
   FillAllocationResultRow,
   FillAttributionCopyOrder,
@@ -194,7 +195,12 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
       });
 
       if (args.event.side === "SELL" && allocations.length > 0) {
-        const availableByLeader = await this.loadLeaderSharesByToken(tx, args.event.tokenId, allocations);
+        const availableByLeader = await this.loadLeaderSharesByToken(
+          tx,
+          order.copyProfileId,
+          args.event.tokenId,
+          allocations
+        );
         allocations = capSellAllocationsByAvailableShares(allocations, availableByLeader);
       }
 
@@ -219,6 +225,7 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
       }
 
       const ledgerOutcome = await this.applyLeaderLedgerUpdates(tx, {
+        copyProfileId: order.copyProfileId,
         side: args.event.side,
         tokenId: args.event.tokenId,
         marketId: args.event.marketId ?? order.marketId ?? undefined,
@@ -385,6 +392,7 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
 
   private async loadLeaderSharesByToken(
     tx: TxClient,
+    copyProfileId: string,
     tokenId: string,
     allocations: FillAllocationResultRow[]
   ): Promise<Record<string, number>> {
@@ -396,18 +404,15 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
       return {};
     }
 
-    const ledgers = await tx.leaderTokenLedger.findMany({
-      where: {
-        tokenId,
-        leaderId: {
-          in: leaderIds
-        }
-      },
-      select: {
-        leaderId: true,
-        shares: true
-      }
-    });
+    const ledgers = await tx.$queryRaw<Array<{ leaderId: string; shares: Prisma.Decimal }>>(
+      Prisma.sql`
+        SELECT "leaderId", "shares"
+        FROM "LeaderTokenLedger"
+        WHERE "copyProfileId" = ${copyProfileId}
+          AND "tokenId" = ${tokenId}
+          AND "leaderId" IN (${Prisma.join(leaderIds)})
+      `
+    );
 
     const byLeader: Record<string, number> = {};
     for (const ledger of ledgers) {
@@ -419,6 +424,7 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
   private async applyLeaderLedgerUpdates(
     tx: TxClient,
     args: {
+      copyProfileId: string;
       side: "BUY" | "SELL";
       tokenId: string;
       marketId?: string;
@@ -436,21 +442,19 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
         continue;
       }
 
-      const existing = await tx.leaderTokenLedger.findUnique({
-        where: {
-          leaderId_tokenId: {
-            leaderId: allocation.leaderId,
-            tokenId: args.tokenId
-          }
-        },
-        select: {
-          shares: true,
-          costUsd: true
-        }
-      });
+      const existing = await tx.$queryRaw<Array<{ shares: Prisma.Decimal; costUsd: Prisma.Decimal }>>(
+        Prisma.sql`
+          SELECT "shares", "costUsd"
+          FROM "LeaderTokenLedger"
+          WHERE "copyProfileId" = ${args.copyProfileId}
+            AND "leaderId" = ${allocation.leaderId}
+            AND "tokenId" = ${args.tokenId}
+          LIMIT 1
+        `
+      );
 
-      const currentShares = existing ? Number(existing.shares) : 0;
-      const currentCostUsd = existing ? Number(existing.costUsd) : 0;
+      const currentShares = existing[0] ? Number(existing[0].shares) : 0;
+      const currentCostUsd = existing[0] ? Number(existing[0].costUsd) : 0;
 
       if (args.side === "BUY") {
         const next = applyBuyAllocation(
@@ -466,26 +470,38 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
           }
         );
 
-        await tx.leaderTokenLedger.upsert({
-          where: {
-            leaderId_tokenId: {
-              leaderId: allocation.leaderId,
-              tokenId: args.tokenId
-            }
-          },
-          create: {
-            leaderId: allocation.leaderId,
-            tokenId: args.tokenId,
-            marketId: args.marketId ?? null,
-            shares: String(next.shares),
-            costUsd: String(next.costUsd)
-          },
-          update: {
-            marketId: args.marketId ?? null,
-            shares: String(next.shares),
-            costUsd: String(next.costUsd)
-          }
-        });
+        await tx.$executeRaw(
+          Prisma.sql`
+            INSERT INTO "LeaderTokenLedger" (
+              "id",
+              "copyProfileId",
+              "leaderId",
+              "tokenId",
+              "marketId",
+              "shares",
+              "costUsd",
+              "createdAt",
+              "updatedAt"
+            )
+            VALUES (
+              ${randomUUID()},
+              ${args.copyProfileId},
+              ${allocation.leaderId},
+              ${args.tokenId},
+              ${args.marketId ?? null},
+              ${String(next.shares)},
+              ${String(next.costUsd)},
+              NOW(),
+              NOW()
+            )
+            ON CONFLICT ("copyProfileId", "leaderId", "tokenId")
+            DO UPDATE SET
+              "marketId" = EXCLUDED."marketId",
+              "shares" = EXCLUDED."shares",
+              "costUsd" = EXCLUDED."costUsd",
+              "updatedAt" = NOW()
+          `
+        );
 
         ledgerUpdates += 1;
         continue;
@@ -508,43 +524,65 @@ export class PrismaFillAttributionStore implements FillAttributionStore {
         }
       );
 
-      await tx.leaderTokenLedger.upsert({
-        where: {
-          leaderId_tokenId: {
-            leaderId: allocation.leaderId,
-            tokenId: args.tokenId
-          }
-        },
-        create: {
-          leaderId: allocation.leaderId,
-          tokenId: args.tokenId,
-          marketId: args.marketId ?? null,
-          shares: String(next.shares),
-          costUsd: String(next.costUsd)
-        },
-        update: {
-          marketId: args.marketId ?? null,
-          shares: String(next.shares),
-          costUsd: String(next.costUsd)
-        }
-      });
+      await tx.$executeRaw(
+        Prisma.sql`
+          INSERT INTO "LeaderTokenLedger" (
+            "id",
+            "copyProfileId",
+            "leaderId",
+            "tokenId",
+            "marketId",
+            "shares",
+            "costUsd",
+            "createdAt",
+            "updatedAt"
+          )
+          VALUES (
+            ${randomUUID()},
+            ${args.copyProfileId},
+            ${allocation.leaderId},
+            ${args.tokenId},
+            ${args.marketId ?? null},
+            ${String(next.shares)},
+            ${String(next.costUsd)},
+            NOW(),
+            NOW()
+          )
+          ON CONFLICT ("copyProfileId", "leaderId", "tokenId")
+          DO UPDATE SET
+            "marketId" = EXCLUDED."marketId",
+            "shares" = EXCLUDED."shares",
+            "costUsd" = EXCLUDED."costUsd",
+            "updatedAt" = NOW()
+        `
+      );
 
       const realizedIncrement = Number(next.realizedPnlUsd);
       if (realizedIncrement !== 0) {
-        await tx.leaderPnlSummary.upsert({
-          where: {
-            leaderId: allocation.leaderId
-          },
-          create: {
-            leaderId: allocation.leaderId,
-            realizedPnlUsd: String(realizedIncrement)
-          },
-          update: {
-            realizedPnlUsd: {
-              increment: String(realizedIncrement)
-            }
-          }
-        });
+        await tx.$executeRaw(
+          Prisma.sql`
+            INSERT INTO "LeaderPnlSummary" (
+              "id",
+              "copyProfileId",
+              "leaderId",
+              "realizedPnlUsd",
+              "createdAt",
+              "updatedAt"
+            )
+            VALUES (
+              ${randomUUID()},
+              ${args.copyProfileId},
+              ${allocation.leaderId},
+              ${String(realizedIncrement)},
+              NOW(),
+              NOW()
+            )
+            ON CONFLICT ("copyProfileId", "leaderId")
+            DO UPDATE SET
+              "realizedPnlUsd" = "LeaderPnlSummary"."realizedPnlUsd" + EXCLUDED."realizedPnlUsd",
+              "updatedAt" = NOW()
+          `
+        );
         realizedPnlDeltaByLeader[allocation.leaderId] =
           (realizedPnlDeltaByLeader[allocation.leaderId] ?? 0) + realizedIncrement;
       }

@@ -11,6 +11,7 @@ import {
   toNumber
 } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
+import { LeaderSettingsSchema, normalizeLeaderSettings } from '@/lib/server/leader-settings'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -23,7 +24,7 @@ const CreateLeaderBodySchema = z.object({
   status: LeaderStatusSchema.optional(),
   copyProfileId: z.string().trim().min(1).optional(),
   ratio: z.number().min(0).max(1).optional(),
-  settings: z.record(z.string(), z.unknown()).optional()
+  settings: LeaderSettingsSchema.optional()
 })
 
 const LeaderListDataSchema = z.object({
@@ -213,17 +214,13 @@ export async function GET(request: NextRequest) {
           }),
       leaderIds.length === 0
         ? Promise.resolve([])
-        : prisma.leaderPnlSummary.findMany({
-            where: {
-              leaderId: {
-                in: leaderIds
-              }
-            },
-            select: {
-              leaderId: true,
-              realizedPnlUsd: true
-            }
-          })
+        : prisma.$queryRaw<Array<{ leaderId: string; copyProfileId: string; realizedPnlUsd: Prisma.Decimal }>>(
+            Prisma.sql`
+              SELECT "leaderId", "copyProfileId", "realizedPnlUsd"
+              FROM "LeaderPnlSummary"
+              WHERE "leaderId" IN (${Prisma.join(leaderIds)})
+            `
+          )
     ])
 
     const latestSnapshotPairs = latestSnapshots
@@ -276,13 +273,13 @@ export async function GET(request: NextRequest) {
         continue
       }
 
-      const settings = asObject(link.settings)
-      const allowDenyConfigured = toStringArray(settings.allowList).length > 0 || toStringArray(settings.denyList).length > 0
+      const settings = normalizeLeaderSettings(link.settings)
+      const allowDenyConfigured = (settings.allowList?.length ?? 0) > 0 || (settings.denyList?.length ?? 0) > 0
       const capsConfigured =
-        toNumber(settings.maxExposurePerLeaderUsd) > 0 ||
-        toNumber(settings.maxExposurePerMarketOutcomeUsd) > 0 ||
-        toNumber(settings.maxDailyNotionalTurnoverUsd) > 0 ||
-        toNumber(settings.maxPricePerShareUsd) > 0
+        (settings.maxExposurePerLeaderUsd ?? 0) > 0 ||
+        (settings.maxExposurePerMarketOutcomeUsd ?? 0) > 0 ||
+        (settings.maxDailyNotionalTurnoverUsd ?? 0) > 0 ||
+        (settings.maxPricePerShareUsd ?? 0) > 0
 
       profileLinkByLeader.set(link.leaderId, {
         copyProfileId: link.copyProfileId,
@@ -314,9 +311,9 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    const pnlByLeader = new Map<string, number>()
+    const pnlByLeaderProfile = new Map<string, number>()
     for (const row of pnlSummaries) {
-      pnlByLeader.set(row.leaderId, toNumber(row.realizedPnlUsd))
+      pnlByLeaderProfile.set(`${row.leaderId}|${row.copyProfileId}`, toNumber(row.realizedPnlUsd))
     }
 
     const items = leaders.map((leader) => {
@@ -341,7 +338,7 @@ export async function GET(request: NextRequest) {
         metrics: {
           exposureUsd: exposureByLeader.get(leader.id) ?? 0,
           trackingErrorUsd: trackingErrorByLeader.get(leader.id) ?? 0,
-          pnlContributionUsd: pnlByLeader.get(leader.id) ?? 0,
+          pnlContributionUsd: link ? (pnlByLeaderProfile.get(`${leader.id}|${link.copyProfileId}`) ?? 0) : 0,
           executedCount: executedCountByLeader.get(leader.id) ?? 0,
           skippedCount: skippedCountByLeader.get(leader.id) ?? 0
         }
@@ -551,13 +548,6 @@ async function ensureActiveCopyProfile(
   })
 }
 
-function asObject(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {}
-  }
-  return value as Record<string, unknown>
-}
-
 function resolveFallbackFollowerAddress(): string | null {
   return normalizeAddress(process.env.POLYMARKET_FUNDER_ADDRESS ?? '')
 }
@@ -575,13 +565,6 @@ function normalizeAddress(value: string | null | undefined): string | null {
     return null
   }
   return normalized
-}
-
-function toStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return []
-  }
-  return value.filter((entry): entry is string => typeof entry === 'string')
 }
 
 function isUniqueConstraintError(error: unknown): boolean {

@@ -53,9 +53,7 @@ export class LeaderPoller {
   }
 
   start(): void {
-    this.positionsInterval = setInterval(() => {
-      void this.runPositionsPoll();
-    }, this.config.positionsIntervalMs);
+    this.startPositionsInterval();
 
     this.tradesInterval = setInterval(() => {
       void this.runTradesPoll();
@@ -63,6 +61,21 @@ export class LeaderPoller {
 
     void this.runPositionsPoll();
     void this.runTradesPoll();
+  }
+
+  setPositionsIntervalMs(intervalMs: number): void {
+    const normalized = Math.max(1000, Math.trunc(intervalMs));
+    if (this.config.positionsIntervalMs === normalized) {
+      return;
+    }
+
+    this.config.positionsIntervalMs = normalized;
+    if (!this.positionsInterval) {
+      return;
+    }
+
+    clearInterval(this.positionsInterval);
+    this.startPositionsInterval();
   }
 
   stop(): void {
@@ -82,6 +95,12 @@ export class LeaderPoller {
       trades: { ...this.status.trades },
       lastUpdatedAtMs: this.status.lastUpdatedAtMs
     };
+  }
+
+  private startPositionsInterval(): void {
+    this.positionsInterval = setInterval(() => {
+      void this.runPositionsPoll();
+    }, this.config.positionsIntervalMs);
   }
 
   async runPositionsPoll(): Promise<void> {

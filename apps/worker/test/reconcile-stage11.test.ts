@@ -210,6 +210,34 @@ test("Stage 11 detects stale states, repeated guard failures, and integrity viol
   assert.ok(status.lastDetectedIssues.includes("REPEATED_GUARD_FAILURES"));
 });
 
+test("Stage 11 reconcile interval can be reconfigured at runtime", () => {
+  const store = new FakeReconcileStore();
+  const engine = new ReconcileEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 60_000,
+      staleLeaderSyncMs: 60_000,
+      staleFollowerSyncMs: 60_000,
+      guardrailFailureCycleThreshold: 1
+    },
+    leaderPoller: {
+      runPositionsPoll: async () => undefined,
+      getStatus: () => makeLeaderStatus()
+    },
+    targetNetting: {
+      run: async () => undefined,
+      getStatus: () => makeTargetStatus()
+    },
+    getMarketDataStatus: () => makeMarketStatus({}),
+    getExecutionStatus: () => makeExecutionStatus({})
+  });
+
+  engine.setIntervalMs(2_000);
+  const config = engine as unknown as { config: { intervalMs: number } };
+  assert.equal(config.config.intervalMs, 2_000);
+});
+
 function makeLeaderStatus(): LeaderPollerStatus {
   const snapshot = {
     running: false,

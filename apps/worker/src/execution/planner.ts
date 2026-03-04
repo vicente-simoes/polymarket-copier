@@ -28,6 +28,7 @@ export interface PlannedExecutionInput {
   maxSlippageBps: number;
   maxSpreadUsd: number;
   maxPricePerShare?: number;
+  enforceMinBookDepth: boolean;
   book: ExecutionOrderBookSnapshot;
 }
 
@@ -127,7 +128,7 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
       bestAsk: input.bestAsk,
       expectedPrice: fillEstimate.expectedPrice,
       tickSize: input.tickSize,
-      depthSufficient: fillEstimate.depthSufficient
+      depthSufficient: input.enforceMinBookDepth ? fillEstimate.depthSufficient : undefined
     }
   });
 

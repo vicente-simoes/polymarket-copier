@@ -284,6 +284,38 @@ test("Stage 6 poller retries throttled requests with backoff", async () => {
   assert.equal(status.positions.consecutiveFailures, 0);
 });
 
+test("Stage 6 positions polling interval can be reconfigured at runtime", () => {
+  const store = new FakeStore();
+  const dataApi: LeaderDataApiClient = {
+    async fetchTradesPage() {
+      return [];
+    },
+    async fetchPositionsPage() {
+      return [];
+    }
+  };
+
+  const poller = new LeaderPoller({
+    dataApi,
+    store,
+    config: {
+      positionsIntervalMs: 60_000,
+      tradesIntervalMs: 30_000,
+      pageLimit: 100,
+      batchSize: 1,
+      maxRetries: 2,
+      backoffBaseMs: 10,
+      backoffMaxMs: 100,
+      maxPagesPerLeader: 1,
+      tradesTakerOnly: false
+    }
+  });
+
+  poller.setPositionsIntervalMs(2_500);
+  const config = poller as unknown as { config: { positionsIntervalMs: number } };
+  assert.equal(config.config.positionsIntervalMs, 2_500);
+});
+
 function makeTrade(overrides: Partial<DataApiTrade>): DataApiTrade {
   return {
     proxyWallet: "0xwallet",

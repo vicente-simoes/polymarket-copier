@@ -36,6 +36,12 @@ export const SystemConfigSchema = z.object({
 
 export type SystemConfig = z.infer<typeof SystemConfigSchema>
 
+export interface GlobalRuntimeConfigOverrides {
+  tradeDetectionEnabled?: boolean
+  userChannelWsEnabled?: boolean
+  reconcileIntervalSeconds?: number
+}
+
 export const SystemConfigPatchSchema = z.object({
   masterSwitches: z
     .object({
@@ -100,7 +106,7 @@ export const DEFAULT_SYSTEM_CONFIG: SystemConfig = SystemConfigSchema.parse({
     minBookDepthForSizeEnabled: fromEnvBoolean(process.env.MIN_BOOK_DEPTH_FOR_SIZE_ENABLED, true),
     cooldownPerMarketSeconds: fromEnvNumber(process.env.COOLDOWN_PER_MARKET_SECONDS, 5),
     maxRetriesPerAttempt: fromEnvNumber(process.env.MAX_RETRIES_PER_ATTEMPT, 20),
-    maxOpenOrders: 20
+    maxOpenOrders: fromEnvNumber(process.env.MAX_OPEN_ORDERS, 20)
   },
   sizing: {
     copyRatio: 0.01,
@@ -162,6 +168,64 @@ export function applySystemConfigPatch(base: SystemConfig, patch: SystemConfigPa
   return SystemConfigSchema.parse(merged)
 }
 
+export function resolveGlobalRuntimeConfig(rawConfig: unknown): GlobalRuntimeConfigOverrides {
+  const config = asObject(rawConfig)
+  const masterSwitches = asObject(config.masterSwitches)
+  const reconcile = asObject(config.reconcile)
+
+  const tradeDetectionEnabled =
+    typeof masterSwitches.tradeDetectionEnabled === 'boolean' ? masterSwitches.tradeDetectionEnabled : undefined
+  const userChannelWsEnabled =
+    typeof masterSwitches.userChannelWsEnabled === 'boolean' ? masterSwitches.userChannelWsEnabled : undefined
+  const interval = asPositiveInteger(reconcile.intervalSeconds)
+
+  return {
+    tradeDetectionEnabled,
+    userChannelWsEnabled,
+    reconcileIntervalSeconds: interval
+  }
+}
+
+export function applyGlobalRuntimeOverrides(base: SystemConfig, overrides: GlobalRuntimeConfigOverrides): SystemConfig {
+  const merged = {
+    ...base,
+    masterSwitches: {
+      ...base.masterSwitches,
+      tradeDetectionEnabled: overrides.tradeDetectionEnabled ?? base.masterSwitches.tradeDetectionEnabled,
+      userChannelWsEnabled: overrides.userChannelWsEnabled ?? base.masterSwitches.userChannelWsEnabled
+    },
+    reconcile: {
+      ...base.reconcile,
+      intervalSeconds: overrides.reconcileIntervalSeconds ?? base.reconcile.intervalSeconds
+    }
+  }
+
+  return SystemConfigSchema.parse(merged)
+}
+
+export function toGlobalRuntimeConfigValue(config: SystemConfig): Record<string, unknown> {
+  return {
+    masterSwitches: {
+      tradeDetectionEnabled: config.masterSwitches.tradeDetectionEnabled,
+      userChannelWsEnabled: config.masterSwitches.userChannelWsEnabled
+    },
+    reconcile: {
+      intervalSeconds: config.reconcile.intervalSeconds
+    }
+  }
+}
+
+export function equalGlobalRuntimeConfig(
+  left: GlobalRuntimeConfigOverrides,
+  right: GlobalRuntimeConfigOverrides
+): boolean {
+  return (
+    left.tradeDetectionEnabled === right.tradeDetectionEnabled &&
+    left.userChannelWsEnabled === right.userChannelWsEnabled &&
+    left.reconcileIntervalSeconds === right.reconcileIntervalSeconds
+  )
+}
+
 export function fromEnvNumber(raw: string | undefined, fallback: number): number {
   if (!raw) {
     return fallback
@@ -209,4 +273,12 @@ function asObject(value: unknown): Record<string, unknown> {
   }
 
   return value as Record<string, unknown>
+}
+
+function asPositiveInteger(value: unknown): number | undefined {
+  const numberValue = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN
+  if (!Number.isInteger(numberValue) || numberValue <= 0) {
+    return undefined
+  }
+  return numberValue
 }

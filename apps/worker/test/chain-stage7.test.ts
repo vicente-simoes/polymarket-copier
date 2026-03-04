@@ -330,6 +330,44 @@ test("Stage 7 subscribes Alchemy logs with leader wallet topic filters", async (
   pipeline.stop();
 });
 
+test("Stage 7 runtime enable toggle stops and restarts the chain pipeline", async () => {
+  const store = new FakeChainStore();
+  store.wallets = [{ leaderId: "l1", walletAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }];
+  const sockets: FakeSocket[] = [];
+
+  const pipeline = new ChainTriggerPipeline({
+    store,
+    deduper: new InMemoryTriggerDeduper(() => 30_000),
+    config: {
+      enabled: true,
+      wsUrl: "wss://alchemy.example",
+      exchangeContracts: ["0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"],
+      dedupeTtlSeconds: 3600,
+      walletRefreshIntervalMs: 30_000,
+      reconcileQueueMaxSize: 100
+    },
+    now: () => 30_000,
+    createSocket: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    }
+  });
+
+  await pipeline.start();
+  sockets[0]?.open();
+  assert.equal(pipeline.getStatus().enabled, true);
+
+  await pipeline.setEnabled(false);
+  assert.equal(pipeline.getStatus().enabled, false);
+
+  await pipeline.setEnabled(true);
+  assert.equal(pipeline.getStatus().enabled, true);
+  assert.equal(sockets.length, 2);
+
+  pipeline.stop();
+});
+
 function buildLogNotification(input: {
   topic0: string;
   txHash: string;

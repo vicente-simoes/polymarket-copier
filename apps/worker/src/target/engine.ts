@@ -115,6 +115,12 @@ export class TargetNettingEngine {
     pendingUpdated: number;
     attemptsCreated: number;
   }> {
+    const effectiveMinNotionalUsd = profile.guardrailOverrides?.minNotionalUsd ?? this.config.minNotionalUsd;
+    const effectiveMaxRetriesPerAttempt =
+      profile.guardrailOverrides?.maxRetriesPerAttempt ?? this.config.maxRetriesPerAttempt;
+    const effectiveAttemptExpirationSeconds =
+      profile.guardrailOverrides?.attemptExpirationSeconds ?? this.config.attemptExpirationSeconds;
+
     const leaderIds = [...new Set(profile.leaders.map((leader) => leader.leaderId))];
     if (leaderIds.length === 0) {
       return {
@@ -131,15 +137,25 @@ export class TargetNettingEngine {
     ]);
 
     const ratioByLeader = new Map(profile.leaders.map((leader) => [leader.leaderId, leader.ratio]));
+    const settingsByLeader = new Map(profile.leaders.map((leader) => [leader.leaderId, leader.settings]));
     const followerSharesByToken = new Map(followerPositions.map((position) => [position.tokenId, position.shares]));
     const targetSharesByToken = new Map<string, number>();
     const targetMarketByToken = new Map<string, string | undefined>();
     const targetPriceByToken = new Map<string, { price: number; source: string; minOrderSize: number }>();
     const leaderBreakdownByToken = new Map<string, Record<string, number>>();
+    const contributorLeaderIdsByToken = new Map<string, Set<string>>();
+    const strictestMinNotionalByToken = new Map<string, number>();
 
     for (const position of leaderPositions) {
       const ratio = ratioByLeader.get(position.leaderId);
       if (ratio === undefined || ratio <= 0) {
+        continue;
+      }
+      const leaderSettings = settingsByLeader.get(position.leaderId);
+      if (!leaderSettings) {
+        continue;
+      }
+      if (!isMarketAllowed(position.marketId, leaderSettings.allowList, leaderSettings.denyList)) {
         continue;
       }
 
@@ -159,6 +175,9 @@ export class TargetNettingEngine {
 
       const targetNotionalUsd = currentValueUsd * ratio;
       const targetShares = targetNotionalUsd / chosenPrice;
+      if (!isContributionEligible(targetNotionalUsd, targetShares, leaderSettings.minDeltaNotionalUsd, leaderSettings.minDeltaShares)) {
+        continue;
+      }
       const existingTarget = targetSharesByToken.get(position.tokenId) ?? 0;
       targetSharesByToken.set(position.tokenId, existingTarget + targetShares);
 
@@ -176,6 +195,19 @@ export class TargetNettingEngine {
       const breakdown = leaderBreakdownByToken.get(position.tokenId) ?? {};
       breakdown[position.leaderId] = (breakdown[position.leaderId] ?? 0) + targetShares;
       leaderBreakdownByToken.set(position.tokenId, breakdown);
+
+      const contributors = contributorLeaderIdsByToken.get(position.tokenId) ?? new Set<string>();
+      contributors.add(position.leaderId);
+      contributorLeaderIdsByToken.set(position.tokenId, contributors);
+
+      if (leaderSettings.minNotionalPerOrderUsd !== undefined) {
+        const existingMin = strictestMinNotionalByToken.get(position.tokenId);
+        const nextMin =
+          existingMin === undefined
+            ? leaderSettings.minNotionalPerOrderUsd
+            : Math.max(existingMin, leaderSettings.minNotionalPerOrderUsd);
+        strictestMinNotionalByToken.set(position.tokenId, nextMin);
+      }
     }
 
     const tokenUniverse = new Set<string>([...targetSharesByToken.keys(), ...followerSharesByToken.keys(), ...openPendingTokenIds]);
@@ -196,6 +228,8 @@ export class TargetNettingEngine {
       const absoluteDeltaShares = Math.abs(deltaShares);
       const marketId = targetMarketByToken.get(tokenId);
       const primaryLeaderId = resolvePrimaryLeaderId(leaderBreakdownByToken.get(tokenId));
+      const contributorLeaderIds = [...(contributorLeaderIdsByToken.get(tokenId) ?? new Set<string>())].sort();
+      const effectiveTokenMinNotionalUsd = strictestMinNotionalByToken.get(tokenId) ?? effectiveMinNotionalUsd;
 
       let tokenPrice = targetPriceByToken.get(tokenId)?.price;
       let priceSource = targetPriceByToken.get(tokenId)?.source ?? "UNKNOWN";
@@ -216,7 +250,7 @@ export class TargetNettingEngine {
       const trackingErrorBps = computeTrackingErrorBps(targetShares, followerShares, deltaShares);
       const thresholdResult = evaluateThresholds({
         deltaNotionalUsd,
-        minNotionalUsd: this.config.minNotionalUsd,
+        minNotionalUsd: effectiveTokenMinNotionalUsd,
         trackingErrorBps,
         requiredTrackingErrorBps: this.config.trackingErrorBps
       });
@@ -235,7 +269,7 @@ export class TargetNettingEngine {
         side,
         pendingDeltaShares: absoluteDeltaShares,
         pendingDeltaNotionalUsd: deltaNotionalUsd,
-        minExecutableNotionalUsd: this.config.minNotionalUsd,
+        minExecutableNotionalUsd: effectiveTokenMinNotionalUsd,
         status: pendingStatus,
         blockReason: thresholdResult.reason,
         metadata: {
@@ -250,9 +284,11 @@ export class TargetNettingEngine {
           requiredTrackingErrorBps: this.config.trackingErrorBps,
           thresholdEligible: thresholdResult.eligible,
           thresholdReason: thresholdResult.reason ?? null,
-          leaderTargetShares: leaderBreakdownByToken.get(tokenId) ?? {}
+          leaderTargetShares: leaderBreakdownByToken.get(tokenId) ?? {},
+          contributorLeaderIds,
+          effectiveMinNotionalUsd: effectiveTokenMinNotionalUsd
         },
-        expiresAt: new Date(this.now() + this.config.attemptExpirationSeconds * 1000)
+        expiresAt: new Date(this.now() + effectiveAttemptExpirationSeconds * 1000)
       });
 
       pendingUpdated += 1;
@@ -276,8 +312,8 @@ export class TargetNettingEngine {
         side,
         pendingDeltaShares: absoluteDeltaShares,
         pendingDeltaNotionalUsd: deltaNotionalUsd,
-        expiresAt: new Date(this.now() + this.config.attemptExpirationSeconds * 1000),
-        maxRetries: this.config.maxRetriesPerAttempt,
+        expiresAt: new Date(this.now() + effectiveAttemptExpirationSeconds * 1000),
+        maxRetries: effectiveMaxRetriesPerAttempt,
         idempotencyKey: copyDecisionKey({
           copyProfileId: profile.copyProfileId,
           tokenId,
@@ -378,6 +414,43 @@ function resolvePrimaryLeaderId(leaderShares: Record<string, number> | undefined
   }
 
   return bestLeaderId;
+}
+
+function isMarketAllowed(
+  marketId: string | undefined,
+  allowList: string[] | undefined,
+  denyList: string[] | undefined
+): boolean {
+  if (marketId && denyList && denyList.includes(marketId)) {
+    return false;
+  }
+
+  if (!allowList || allowList.length === 0) {
+    return true;
+  }
+
+  if (!marketId) {
+    return false;
+  }
+
+  return allowList.includes(marketId);
+}
+
+function isContributionEligible(
+  targetNotionalUsd: number,
+  targetShares: number,
+  minDeltaNotionalUsd: number | undefined,
+  minDeltaShares: number | undefined
+): boolean {
+  if (minDeltaNotionalUsd === undefined && minDeltaShares === undefined) {
+    return true;
+  }
+
+  const absNotional = Math.abs(targetNotionalUsd);
+  const absShares = Math.abs(targetShares);
+  const notionalEligible = minDeltaNotionalUsd !== undefined ? absNotional >= minDeltaNotionalUsd : false;
+  const sharesEligible = minDeltaShares !== undefined ? absShares >= minDeltaShares : false;
+  return notionalEligible || sharesEligible;
 }
 
 function toErrorMessage(error: unknown): string {

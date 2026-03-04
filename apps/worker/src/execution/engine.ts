@@ -6,6 +6,9 @@ import type {
   ExecutionAttemptRecord,
   ExecutionBookLevel,
   ExecutionEngineConfig,
+  ExecutionGuardrailOverrides,
+  ExecutionProfileSizingOverrides,
+  ExecutionLeaderLedgerPosition,
   ExecutionEngineStatus,
   ExecutionOrderBookSnapshot,
   ExecutionOrderResult,
@@ -41,6 +44,23 @@ export interface ExecutionEngineDeps {
 }
 
 type ProcessOutcome = "PLACED" | "DEFERRED" | "DRY_RUN_DEFERRED" | "ORDER_FAILURE" | "BACKOFF_SKIP" | "NOOP";
+interface EffectiveExecutionGuardrails {
+  minNotionalUsd: number;
+  maxWorseningBuyUsd: number;
+  maxWorseningSellUsd: number;
+  maxSlippageBps: number;
+  maxSpreadUsd: number;
+  minBookDepthForSizeEnabled: boolean;
+  cooldownPerMarketSeconds: number;
+  maxOpenOrders: number | null;
+}
+
+interface EffectiveExecutionSizingCaps {
+  maxExposurePerLeaderUsd: number;
+  maxExposurePerMarketOutcomeUsd: number;
+  maxHourlyNotionalTurnoverUsd: number;
+  maxDailyNotionalTurnoverUsd: number;
+}
 
 export class ExecutionEngine {
   private readonly store: ExecutionStore;
@@ -270,6 +290,8 @@ export class ExecutionEngine {
       return "DEFERRED";
     }
 
+    const effectiveGuardrails = resolveEffectiveGuardrails(this.config, context.guardrailOverrides);
+    const effectiveSizingCaps = resolveEffectiveSizingCaps(this.config, context.profileSizingOverrides);
     const effectiveDeltaShares = pendingState.deltaShares;
     const effectiveDeltaNotionalUsd = pendingState.deltaNotionalUsd;
 
@@ -277,7 +299,7 @@ export class ExecutionEngine {
     const hourlySpent = await this.store.getNotionalTurnoverUsd(attempt.copyProfileId, new Date(nowMs - 3_600_000));
     const baselineNotional = positiveOrZero(effectiveDeltaNotionalUsd);
 
-    if (dailySpent + baselineNotional > this.config.maxDailyNotionalTurnoverUsd) {
+    if (dailySpent + baselineNotional > effectiveSizingCaps.maxDailyNotionalTurnoverUsd) {
       await this.deferAttempt(attempt, "RATE_LIMIT", {
         nowDate,
         incrementRetry: true,
@@ -285,14 +307,14 @@ export class ExecutionEngine {
         context: {
           dailySpent,
           baselineNotional,
-          maxDailyNotionalTurnoverUsd: this.config.maxDailyNotionalTurnoverUsd
+          maxDailyNotionalTurnoverUsd: effectiveSizingCaps.maxDailyNotionalTurnoverUsd
         }
       });
       this.status.totalControlBlocks += 1;
       return "DEFERRED";
     }
 
-    if (hourlySpent + baselineNotional > this.config.maxHourlyNotionalTurnoverUsd) {
+    if (hourlySpent + baselineNotional > effectiveSizingCaps.maxHourlyNotionalTurnoverUsd) {
       await this.deferAttempt(attempt, "RATE_LIMIT", {
         nowDate,
         incrementRetry: true,
@@ -300,7 +322,7 @@ export class ExecutionEngine {
         context: {
           hourlySpent,
           baselineNotional,
-          maxHourlyNotionalTurnoverUsd: this.config.maxHourlyNotionalTurnoverUsd
+          maxHourlyNotionalTurnoverUsd: effectiveSizingCaps.maxHourlyNotionalTurnoverUsd
         }
       });
       this.status.totalControlBlocks += 1;
@@ -308,14 +330,14 @@ export class ExecutionEngine {
     }
 
     const lastOrderAt = await this.store.getLastOrderAttemptAt(attempt.copyProfileId, attempt.tokenId);
-    const cooldownMs = this.config.cooldownPerMarketSeconds * 1000;
+    const cooldownMs = effectiveGuardrails.cooldownPerMarketSeconds * 1000;
     if (lastOrderAt && nowMs - lastOrderAt.getTime() < cooldownMs) {
       await this.deferAttempt(attempt, "RATE_LIMIT", {
         nowDate,
         incrementRetry: true,
         message: "market cooldown is active",
         context: {
-          cooldownPerMarketSeconds: this.config.cooldownPerMarketSeconds
+          cooldownPerMarketSeconds: effectiveGuardrails.cooldownPerMarketSeconds
         }
       });
       this.status.totalControlBlocks += 1;
@@ -398,17 +420,18 @@ export class ExecutionEngine {
       side: attempt.side,
       deltaShares: effectiveDeltaShares,
       minOrderSize: market.minOrderSize,
-      minNotionalUsd: this.config.minNotionalUsd,
+      minNotionalUsd: effectiveGuardrails.minNotionalUsd,
       leaderPrice,
       midPrice: guardMidPrice,
       bestBid: guardBestBid,
       bestAsk: guardBestAsk,
       tickSize: market.tickSize,
-      maxWorseningBuyUsd: this.config.maxWorseningBuyUsd,
-      maxWorseningSellUsd: this.config.maxWorseningSellUsd,
-      maxSlippageBps: this.config.maxSlippageBps,
-      maxSpreadUsd: this.config.maxSpreadUsd,
+      maxWorseningBuyUsd: effectiveGuardrails.maxWorseningBuyUsd,
+      maxWorseningSellUsd: effectiveGuardrails.maxWorseningSellUsd,
+      maxSlippageBps: effectiveGuardrails.maxSlippageBps,
+      maxSpreadUsd: effectiveGuardrails.maxSpreadUsd,
       maxPricePerShare: effectiveMaxPricePerShare,
+      enforceMinBookDepth: effectiveGuardrails.minBookDepthForSizeEnabled,
       book: {
         tokenId: attempt.tokenId,
         marketId: market.marketId ?? attempt.marketId,
@@ -438,6 +461,33 @@ export class ExecutionEngine {
         incrementRetry: true,
         message: "non-positive planned notional or shares"
       });
+      return "DEFERRED";
+    }
+
+    const leaderWeights = resolveLeaderWeights(context, attempt.leaderId);
+    const capCheck = await this.evaluateLeaderBuyCaps({
+      attempt,
+      context,
+      nowDate,
+      side: attempt.side,
+      tokenMarkPrice: guardMidPrice,
+      intendedNotionalUsd,
+      intendedShares,
+      leaderWeights,
+      sizingCaps: effectiveSizingCaps
+    });
+    if (capCheck.blocked) {
+      await this.deferAttempt(attempt, capCheck.reason, {
+        nowDate,
+        incrementRetry: true,
+        message: capCheck.message,
+        context: capCheck.context
+      });
+      if (capCheck.countsAsGuardrail) {
+        this.status.totalGuardrailBlocks += 1;
+      } else {
+        this.status.totalControlBlocks += 1;
+      }
       return "DEFERRED";
     }
 
@@ -472,6 +522,30 @@ export class ExecutionEngine {
       return "DRY_RUN_DEFERRED";
     }
 
+    if (effectiveGuardrails.maxOpenOrders !== null) {
+      const openOrders = await this.store.countOpenOrders(attempt.copyProfileId);
+      if (openOrders >= effectiveGuardrails.maxOpenOrders) {
+        workerLogger.warn("execution.max_open_orders_blocked", {
+          attemptId: attempt.id,
+          copyProfileId: attempt.copyProfileId,
+          observedOpenOrders: openOrders,
+          maxOpenOrders: effectiveGuardrails.maxOpenOrders
+        });
+        await this.deferAttempt(attempt, "RATE_LIMIT", {
+          nowDate,
+          incrementRetry: true,
+          message: "max open orders limit reached",
+          context: {
+            copyProfileId: attempt.copyProfileId,
+            observedOpenOrders: openOrders,
+            maxOpenOrders: effectiveGuardrails.maxOpenOrders
+          }
+        });
+        this.status.totalControlBlocks += 1;
+        return "DEFERRED";
+      }
+    }
+
     const idempotencyKey = orderRetryKey(attempt.id, attempt.retries);
     const orderRecord = await this.store.createCopyOrderDraft({
       copyProfileId: attempt.copyProfileId,
@@ -482,7 +556,7 @@ export class ExecutionEngine {
       intendedNotionalUsd,
       intendedShares,
       priceLimit: plan.priceLimit,
-      leaderWeights: resolveLeaderWeights(context, attempt.leaderId),
+      leaderWeights,
       idempotencyKey,
       retryCount: attempt.retries,
       attemptedAt: nowDate
@@ -676,6 +750,227 @@ export class ExecutionEngine {
       attemptedAt: args.attemptedAt
     } as const;
   }
+
+  private async evaluateLeaderBuyCaps(args: {
+    attempt: ExecutionAttemptRecord;
+    context: ExecutionAttemptContext;
+    nowDate: Date;
+    side: "BUY" | "SELL";
+    tokenMarkPrice: number | undefined;
+    intendedNotionalUsd: number;
+    intendedShares: number;
+    leaderWeights: Record<string, number>;
+    sizingCaps: EffectiveExecutionSizingCaps;
+  }): Promise<
+    | { blocked: false }
+    | {
+        blocked: true;
+        reason: ExecutionSkipReason;
+        message: string;
+        context: Record<string, unknown>;
+        countsAsGuardrail: boolean;
+      }
+  > {
+    if (args.side !== "BUY") {
+      return { blocked: false };
+    }
+    if (!args.tokenMarkPrice || args.tokenMarkPrice <= 0) {
+      return {
+        blocked: true,
+        reason: "STALE_PRICE",
+        message: "cap price unavailable for attempt token",
+        countsAsGuardrail: true,
+        context: {
+          capType: "CAP_PRICE_UNAVAILABLE",
+          tokenId: args.attempt.tokenId
+        }
+      };
+    }
+
+    const candidateLeaderIds = [...new Set([
+      ...args.context.contributorLeaderIds,
+      ...Object.keys(args.leaderWeights).filter((leaderId) => args.leaderWeights[leaderId] && args.leaderWeights[leaderId] > 0)
+    ])].sort();
+    if (candidateLeaderIds.length === 0) {
+      return { blocked: false };
+    }
+
+    const capLeaderIds = candidateLeaderIds.filter((leaderId) => {
+      const plannedWeight = Math.max(args.leaderWeights[leaderId] ?? 0, 0);
+      if (plannedWeight <= 0) {
+        return false;
+      }
+      const settings = resolveEffectiveLeaderBuyCaps({
+        leaderSettings: args.context.contributorSettingsByLeaderId[leaderId],
+        sizingCaps: args.sizingCaps
+      });
+      return (
+        settings.maxDailyNotionalTurnoverUsd !== undefined ||
+        settings.maxExposurePerMarketOutcomeUsd !== undefined ||
+        settings.maxExposurePerLeaderUsd !== undefined
+      );
+    });
+    if (capLeaderIds.length === 0) {
+      return { blocked: false };
+    }
+
+    const [recentTurnoverByLeader, ledgerPositions] = await Promise.all([
+      this.store.getLeaderRecentNotionalTurnoverUsd({
+        copyProfileId: args.attempt.copyProfileId,
+        leaderIds: capLeaderIds,
+        since: new Date(args.nowDate.getTime() - 86_400_000)
+      }),
+      this.store.listLeaderLedgerPositions({
+        copyProfileId: args.attempt.copyProfileId,
+        leaderIds: capLeaderIds
+      })
+    ]);
+
+    const markPricesByToken = new Map<string, number>([[args.attempt.tokenId, args.tokenMarkPrice]]);
+    const needsTotalExposureMarks = capLeaderIds.some((leaderId) => {
+      const settings = resolveEffectiveLeaderBuyCaps({
+        leaderSettings: args.context.contributorSettingsByLeaderId[leaderId],
+        sizingCaps: args.sizingCaps
+      });
+      return settings?.maxExposurePerLeaderUsd !== undefined;
+    });
+    if (needsTotalExposureMarks) {
+      const extraTokens = [...new Set(ledgerPositions.map((row) => row.tokenId).filter((tokenId) => tokenId !== args.attempt.tokenId))];
+      for (const tokenId of extraTokens) {
+        let snapshot: Awaited<ReturnType<ExecutionEngineDeps["getMarketSnapshot"]>>;
+        try {
+          snapshot = await this.getMarketSnapshot(tokenId);
+        } catch (error) {
+          return {
+            blocked: true,
+            reason: "BOOK_UNAVAILABLE",
+            message: `failed to load cap market snapshot: ${toErrorMessage(error)}`,
+            countsAsGuardrail: true,
+            context: {
+              capType: "CAP_PRICE_UNAVAILABLE",
+              tokenId
+            }
+          };
+        }
+        const mark = resolveMarkPrice(snapshot);
+        if (!mark || mark <= 0 || snapshot.isStale) {
+          return {
+            blocked: true,
+            reason: "STALE_PRICE",
+            message: "cap price unavailable for exposure check",
+            countsAsGuardrail: true,
+            context: {
+              capType: "CAP_PRICE_UNAVAILABLE",
+              tokenId
+            }
+          };
+        }
+        markPricesByToken.set(tokenId, mark);
+      }
+    }
+
+    const ledgerByLeader = groupLedgerByLeader(ledgerPositions);
+    for (const leaderId of capLeaderIds) {
+      const settings = resolveEffectiveLeaderBuyCaps({
+        leaderSettings: args.context.contributorSettingsByLeaderId[leaderId],
+        sizingCaps: args.sizingCaps
+      });
+
+      const plannedWeight = Math.max(args.leaderWeights[leaderId] ?? 0, 0);
+      if (plannedWeight <= 0) {
+        continue;
+      }
+      const plannedBuyNotionalUsd = args.intendedNotionalUsd * plannedWeight;
+      const plannedBuyExposureUsd = args.intendedShares * plannedWeight * args.tokenMarkPrice;
+      const currentTurnoverUsd = recentTurnoverByLeader[leaderId] ?? 0;
+
+      if (
+        settings.maxDailyNotionalTurnoverUsd !== undefined &&
+        currentTurnoverUsd + plannedBuyNotionalUsd > settings.maxDailyNotionalTurnoverUsd
+      ) {
+        const observed = currentTurnoverUsd + plannedBuyNotionalUsd;
+        workerLogger.warn("execution.leader_cap_blocked", {
+          attemptId: args.attempt.id,
+          leaderId,
+          capType: "MAX_DAILY_NOTIONAL_TURNOVER_USD",
+          observedUsd: roundTo(observed, 8),
+          limitUsd: settings.maxDailyNotionalTurnoverUsd
+        });
+        return {
+          blocked: true,
+          reason: "RATE_LIMIT",
+          message: "leader daily notional turnover cap exceeded",
+          countsAsGuardrail: false,
+          context: {
+            leaderId,
+            capType: "MAX_DAILY_NOTIONAL_TURNOVER_USD",
+            observedUsd: roundTo(observed, 8),
+            limitUsd: settings.maxDailyNotionalTurnoverUsd,
+            plannedBuyNotionalUsd: roundTo(plannedBuyNotionalUsd, 8)
+          }
+        };
+      }
+
+      const leaderPositions = ledgerByLeader.get(leaderId) ?? [];
+      const currentTokenExposureUsd = exposureForToken(leaderPositions, args.attempt.tokenId, markPricesByToken);
+      if (
+        settings.maxExposurePerMarketOutcomeUsd !== undefined &&
+        currentTokenExposureUsd + plannedBuyExposureUsd > settings.maxExposurePerMarketOutcomeUsd
+      ) {
+        const observed = currentTokenExposureUsd + plannedBuyExposureUsd;
+        workerLogger.warn("execution.leader_cap_blocked", {
+          attemptId: args.attempt.id,
+          leaderId,
+          capType: "MAX_EXPOSURE_PER_MARKET_OUTCOME_USD",
+          observedUsd: roundTo(observed, 8),
+          limitUsd: settings.maxExposurePerMarketOutcomeUsd
+        });
+        return {
+          blocked: true,
+          reason: "RATE_LIMIT",
+          message: "leader market outcome exposure cap exceeded",
+          countsAsGuardrail: false,
+          context: {
+            leaderId,
+            capType: "MAX_EXPOSURE_PER_MARKET_OUTCOME_USD",
+            observedUsd: roundTo(observed, 8),
+            limitUsd: settings.maxExposurePerMarketOutcomeUsd,
+            plannedBuyExposureUsd: roundTo(plannedBuyExposureUsd, 8),
+            tokenId: args.attempt.tokenId
+          }
+        };
+      }
+
+      if (settings.maxExposurePerLeaderUsd !== undefined) {
+        const currentLeaderExposureUsd = totalExposureForLeader(leaderPositions, markPricesByToken);
+        if (currentLeaderExposureUsd + plannedBuyExposureUsd > settings.maxExposurePerLeaderUsd) {
+          const observed = currentLeaderExposureUsd + plannedBuyExposureUsd;
+          workerLogger.warn("execution.leader_cap_blocked", {
+            attemptId: args.attempt.id,
+            leaderId,
+            capType: "MAX_EXPOSURE_PER_LEADER_USD",
+            observedUsd: roundTo(observed, 8),
+            limitUsd: settings.maxExposurePerLeaderUsd
+          });
+          return {
+            blocked: true,
+            reason: "RATE_LIMIT",
+            message: "leader total exposure cap exceeded",
+            countsAsGuardrail: false,
+            context: {
+              leaderId,
+              capType: "MAX_EXPOSURE_PER_LEADER_USD",
+              observedUsd: roundTo(observed, 8),
+              limitUsd: settings.maxExposurePerLeaderUsd,
+              plannedBuyExposureUsd: roundTo(plannedBuyExposureUsd, 8)
+            }
+          };
+        }
+      }
+    }
+
+    return { blocked: false };
+  }
 }
 
 function resolveLeaderPrice(
@@ -743,6 +1038,57 @@ function resolveMaxPricePerShare(defaultValue: number | undefined, context: Exec
     return context.maxPricePerShareOverride;
   }
   return defaultValue;
+}
+
+function resolveEffectiveGuardrails(
+  defaults: ExecutionEngineConfig,
+  overrides: ExecutionGuardrailOverrides | undefined
+): EffectiveExecutionGuardrails {
+  const maxOpenOrdersOverride = overrides?.maxOpenOrders;
+  return {
+    minNotionalUsd: overrides?.minNotionalUsd ?? defaults.minNotionalUsd,
+    maxWorseningBuyUsd: overrides?.maxWorseningBuyUsd ?? defaults.maxWorseningBuyUsd,
+    maxWorseningSellUsd: overrides?.maxWorseningSellUsd ?? defaults.maxWorseningSellUsd,
+    maxSlippageBps: overrides?.maxSlippageBps ?? defaults.maxSlippageBps,
+    maxSpreadUsd: overrides?.maxSpreadUsd ?? defaults.maxSpreadUsd,
+    minBookDepthForSizeEnabled:
+      overrides?.minBookDepthForSizeEnabled ?? defaults.minBookDepthForSizeEnabled,
+    cooldownPerMarketSeconds: overrides?.cooldownPerMarketSeconds ?? defaults.cooldownPerMarketSeconds,
+    maxOpenOrders: maxOpenOrdersOverride === undefined ? defaults.maxOpenOrders : maxOpenOrdersOverride
+  };
+}
+
+function resolveEffectiveSizingCaps(
+  defaults: ExecutionEngineConfig,
+  overrides: ExecutionProfileSizingOverrides | undefined
+): EffectiveExecutionSizingCaps {
+  return {
+    maxExposurePerLeaderUsd: overrides?.maxExposurePerLeaderUsd ?? defaults.maxExposurePerLeaderUsd,
+    maxExposurePerMarketOutcomeUsd:
+      overrides?.maxExposurePerMarketOutcomeUsd ?? defaults.maxExposurePerMarketOutcomeUsd,
+    maxHourlyNotionalTurnoverUsd:
+      overrides?.maxHourlyNotionalTurnoverUsd ?? defaults.maxHourlyNotionalTurnoverUsd,
+    maxDailyNotionalTurnoverUsd:
+      overrides?.maxDailyNotionalTurnoverUsd ?? defaults.maxDailyNotionalTurnoverUsd
+  };
+}
+
+function resolveEffectiveLeaderBuyCaps(args: {
+  leaderSettings?: ExecutionAttemptContext["contributorSettingsByLeaderId"][string];
+  sizingCaps: EffectiveExecutionSizingCaps;
+}): {
+  maxDailyNotionalTurnoverUsd: number;
+  maxExposurePerMarketOutcomeUsd: number;
+  maxExposurePerLeaderUsd: number;
+} {
+  return {
+    maxDailyNotionalTurnoverUsd:
+      args.leaderSettings?.maxDailyNotionalTurnoverUsd ?? args.sizingCaps.maxDailyNotionalTurnoverUsd,
+    maxExposurePerMarketOutcomeUsd:
+      args.leaderSettings?.maxExposurePerMarketOutcomeUsd ?? args.sizingCaps.maxExposurePerMarketOutcomeUsd,
+    maxExposurePerLeaderUsd:
+      args.leaderSettings?.maxExposurePerLeaderUsd ?? args.sizingCaps.maxExposurePerLeaderUsd
+  };
 }
 
 function normalizePlacedStatus(result: ExecutionOrderResult): "PLACED" | "PARTIALLY_FILLED" | "FILLED" | null {
@@ -898,6 +1244,71 @@ function resolvePendingDeltaState(
     terminalExpired: false,
     message: "pending delta is eligible"
   };
+}
+
+function resolveMarkPrice(snapshot: {
+  bestBid?: number;
+  bestAsk?: number;
+  midPrice?: number;
+  isStale: boolean;
+}): number | undefined {
+  if (snapshot.midPrice !== undefined && snapshot.midPrice > 0) {
+    return snapshot.midPrice;
+  }
+  if (snapshot.bestBid !== undefined && snapshot.bestBid > 0 && snapshot.bestAsk !== undefined && snapshot.bestAsk > 0) {
+    return (snapshot.bestBid + snapshot.bestAsk) / 2;
+  }
+  if (snapshot.bestAsk !== undefined && snapshot.bestAsk > 0) {
+    return snapshot.bestAsk;
+  }
+  if (snapshot.bestBid !== undefined && snapshot.bestBid > 0) {
+    return snapshot.bestBid;
+  }
+  return undefined;
+}
+
+function groupLedgerByLeader(rows: ExecutionLeaderLedgerPosition[]): Map<string, ExecutionLeaderLedgerPosition[]> {
+  const grouped = new Map<string, ExecutionLeaderLedgerPosition[]>();
+  for (const row of rows) {
+    const current = grouped.get(row.leaderId) ?? [];
+    current.push(row);
+    grouped.set(row.leaderId, current);
+  }
+  return grouped;
+}
+
+function exposureForToken(
+  positions: ExecutionLeaderLedgerPosition[],
+  tokenId: string,
+  markPricesByToken: Map<string, number>
+): number {
+  let total = 0;
+  for (const position of positions) {
+    if (position.tokenId !== tokenId) {
+      continue;
+    }
+    const markPrice = markPricesByToken.get(tokenId);
+    if (!markPrice || markPrice <= 0) {
+      continue;
+    }
+    total += Math.abs(position.shares * markPrice);
+  }
+  return total;
+}
+
+function totalExposureForLeader(
+  positions: ExecutionLeaderLedgerPosition[],
+  markPricesByToken: Map<string, number>
+): number {
+  let total = 0;
+  for (const position of positions) {
+    const markPrice = markPricesByToken.get(position.tokenId);
+    if (!markPrice || markPrice <= 0) {
+      continue;
+    }
+    total += Math.abs(position.shares * markPrice);
+  }
+  return total;
 }
 
 function resolveLiveDeltaShares(context: ExecutionAttemptContext, attempt: ExecutionAttemptRecord): number {

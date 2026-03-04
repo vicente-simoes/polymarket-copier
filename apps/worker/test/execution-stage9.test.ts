@@ -33,6 +33,8 @@ class FakeExecutionStore implements ExecutionStore {
   invariantRepairCalls = 0;
   pendingDeltasConvertedByInvariantRepair = 0;
   attemptsClosedByInvariantRepair = 0;
+  leaderRecentNotionalTurnover = new Map<string, number>();
+  leaderLedgerPositions: Array<{ copyProfileId: string; leaderId: string; tokenId: string; shares: number }> = [];
   private orderSeq = 0;
   private readonly lastOrderAtByKey = new Map<string, Date>();
 
@@ -62,8 +64,55 @@ class FakeExecutionStore implements ExecutionStore {
     return total;
   }
 
+  async getLeaderRecentNotionalTurnoverUsd(args: {
+    copyProfileId: string;
+    leaderIds: string[];
+    since: Date;
+  }): Promise<Record<string, number>> {
+    void args.since;
+    const output: Record<string, number> = {};
+    for (const leaderId of args.leaderIds) {
+      output[leaderId] = this.leaderRecentNotionalTurnover.get(`${args.copyProfileId}|${leaderId}`) ?? 0;
+    }
+    return output;
+  }
+
+  async listLeaderLedgerPositions(args: {
+    copyProfileId: string;
+    leaderIds: string[];
+  }): Promise<Array<{ leaderId: string; tokenId: string; shares: number }>> {
+    const leaderIdSet = new Set(args.leaderIds);
+    return this.leaderLedgerPositions
+      .filter((row) => row.copyProfileId === args.copyProfileId && leaderIdSet.has(row.leaderId))
+      .map((row) => ({
+        leaderId: row.leaderId,
+        tokenId: row.tokenId,
+        shares: row.shares
+      }));
+  }
+
+  async countOpenOrders(copyProfileId: string): Promise<number> {
+    let count = 0;
+    for (const order of this.orders.values()) {
+      if (order.copyProfileId !== copyProfileId) {
+        continue;
+      }
+      if (!order.externalOrderId) {
+        continue;
+      }
+      if (order.status === "PLACED" || order.status === "PARTIALLY_FILLED" || order.status === "RETRYING") {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
   async getLastOrderAttemptAt(copyProfileId: string, tokenId: string): Promise<Date | null> {
     return this.lastOrderAtByKey.get(`${copyProfileId}|${tokenId}`) ?? null;
+  }
+
+  setLastOrderAttemptAt(copyProfileId: string, tokenId: string, attemptedAt: Date): void {
+    this.lastOrderAtByKey.set(`${copyProfileId}|${tokenId}`, attemptedAt);
   }
 
   async createCopyOrderDraft(input: CopyOrderDraft): Promise<CopyOrderRecord> {
@@ -387,6 +436,769 @@ test("Stage 9 guardrail failures stay pending and do not place orders", async ()
   assert.equal(store.failures.length, 0);
 });
 
+test("Stage 9 max-worsening override can tighten price cap and defer on thin books", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_050_000;
+  store.attempts.set("attempt-override-worsening", makeAttempt({
+    id: "attempt-override-worsening",
+    tokenId: "token-override-worsening",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-override-worsening", {
+    ...makeContext("attempt-override-worsening", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      maxWorseningBuyUsd: 0.005
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-worsening",
+      bestBid: 0.5,
+      bestAsk: 0.51,
+      midPrice: 0.505,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-worsening",
+      bids: [{ price: 0.5, size: 100 }],
+      asks: [{ price: 0.51, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+});
+
+test("Stage 9 spread override blocks execution even when env spread would allow", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_075_000;
+  store.attempts.set("attempt-override-spread", makeAttempt({
+    id: "attempt-override-spread",
+    tokenId: "token-override-spread",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-override-spread", {
+    ...makeContext("attempt-override-spread", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      maxSpreadUsd: 0.005
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-spread",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-spread",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "SPREAD");
+});
+
+test("Stage 9 min-notional override can defer BUY attempts on thin books", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_100_000;
+  store.attempts.set("attempt-override-min-notional", makeAttempt({
+    id: "attempt-override-min-notional",
+    tokenId: "token-override-min-notional",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-override-min-notional", {
+    ...makeContext("attempt-override-min-notional", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      minNotionalUsd: 2
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-min-notional",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-min-notional",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 2 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+});
+
+test("Stage 9 cooldown override rate-limits attempts without changing env defaults", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_125_000;
+  store.attempts.set("attempt-override-cooldown", makeAttempt({
+    id: "attempt-override-cooldown",
+    tokenId: "token-override-cooldown",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-override-cooldown", {
+    ...makeContext("attempt-override-cooldown", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      cooldownPerMarketSeconds: 10
+    }
+  });
+  store.setLastOrderAttemptAt("copy-profile-1", "token-override-cooldown", new Date(nowMs - 5_000));
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      cooldownPerMarketSeconds: 0
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-cooldown",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-override-cooldown",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+});
+
+test("Stage 9 falls back to env guardrails when profile overrides are absent", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_150_000;
+  store.attempts.set("attempt-no-overrides", makeAttempt({
+    id: "attempt-no-overrides",
+    tokenId: "token-no-overrides",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-no-overrides", makeContext("attempt-no-overrides", {
+    tokenPrice: 0.5
+  }));
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-no-overrides" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-no-overrides",
+      bestBid: 0.5,
+      bestAsk: 0.51,
+      midPrice: 0.505,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-no-overrides",
+      bids: [{ price: 0.5, size: 100 }],
+      asks: [{ price: 0.51, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+  assert.equal(store.deferred.length, 0);
+});
+
+test("Stage 9 min-book-depth guard can be disabled via profile override", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_180_000;
+  store.attempts.set("attempt-min-depth-disabled", makeAttempt({
+    id: "attempt-min-depth-disabled",
+    tokenId: "token-min-depth-disabled",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-min-depth-disabled", {
+    ...makeContext("attempt-min-depth-disabled", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      minBookDepthForSizeEnabled: false
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-min-depth-disabled" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-min-depth-disabled",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-min-depth-disabled",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 1 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+  assert.equal(store.deferred.length, 0);
+});
+
+test("Stage 9 min-book-depth guard stays active when explicitly enabled by override", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_190_000;
+  store.attempts.set("attempt-min-depth-enabled", makeAttempt({
+    id: "attempt-min-depth-enabled",
+    tokenId: "token-min-depth-enabled",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-min-depth-enabled", {
+    ...makeContext("attempt-min-depth-enabled", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      minBookDepthForSizeEnabled: true
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      minBookDepthForSizeEnabled: false
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-min-depth-enabled",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-min-depth-enabled",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 1 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+});
+
+test("Stage 9 max-open-orders override blocks new submission when limit is reached", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_195_000;
+  store.attempts.set("attempt-open-orders-block", makeAttempt({
+    id: "attempt-open-orders-block",
+    tokenId: "token-open-orders-block",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-open-orders-block", {
+    ...makeContext("attempt-open-orders-block", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      maxOpenOrders: 1
+    }
+  });
+  store.orders.set("existing-open", {
+    id: "existing-open",
+    idempotencyKey: "existing-open",
+    copyProfileId: "copy-profile-1",
+    tokenId: "token-existing-open",
+    intendedNotionalUsd: 3,
+    status: "PLACED",
+    externalOrderId: "ext-existing-open",
+    attemptedAt: new Date(nowMs - 1_000)
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-open-orders-block",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-open-orders-block",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+  assert.equal(store.deferred[0]?.context?.maxOpenOrders, 1);
+});
+
+test("Stage 9 max-open-orders null override disables open-order blocking", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_198_000;
+  store.attempts.set("attempt-open-orders-null", makeAttempt({
+    id: "attempt-open-orders-null",
+    tokenId: "token-open-orders-null",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-open-orders-null", {
+    ...makeContext("attempt-open-orders-null", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      maxOpenOrders: null
+    }
+  });
+  store.orders.set("existing-open-null", {
+    id: "existing-open-null",
+    idempotencyKey: "existing-open-null",
+    copyProfileId: "copy-profile-1",
+    tokenId: "token-existing-open-null",
+    intendedNotionalUsd: 3,
+    status: "PLACED",
+    externalOrderId: "ext-existing-open-null",
+    attemptedAt: new Date(nowMs - 1_000)
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-open-orders-null" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxOpenOrders: 1
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-open-orders-null",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-open-orders-null",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+  assert.equal(store.deferred.length, 0);
+});
+
+test("Stage 9 profile sizing hourly turnover override is enforced at runtime", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_205_000;
+  store.attempts.set("attempt-hourly-override", makeAttempt({
+    id: "attempt-hourly-override",
+    tokenId: "token-hourly-override",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-hourly-override", {
+    ...makeContext("attempt-hourly-override", {
+      tokenPrice: 0.5
+    }),
+    profileSizingOverrides: {
+      maxHourlyNotionalTurnoverUsd: 3
+    }
+  });
+  store.orders.set("existing-hourly-turnover", {
+    id: "existing-hourly-turnover",
+    idempotencyKey: "existing-hourly-turnover",
+    copyProfileId: "copy-profile-1",
+    tokenId: "token-hourly-existing",
+    intendedNotionalUsd: 2.5,
+    status: "PLACED",
+    externalOrderId: "ext-hourly-existing",
+    attemptedAt: new Date(nowMs - 10_000)
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxHourlyNotionalTurnoverUsd: 100,
+      maxDailyNotionalTurnoverUsd: 100
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-hourly-override",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-hourly-override",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+  assert.equal(store.deferred[0]?.context?.maxHourlyNotionalTurnoverUsd, 3);
+});
+
+test("Stage 9 profile sizing daily turnover override is enforced at runtime", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_210_000;
+  store.attempts.set("attempt-daily-override", makeAttempt({
+    id: "attempt-daily-override",
+    tokenId: "token-daily-override",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-daily-override", {
+    ...makeContext("attempt-daily-override", {
+      tokenPrice: 0.5
+    }),
+    profileSizingOverrides: {
+      maxDailyNotionalTurnoverUsd: 3,
+      maxHourlyNotionalTurnoverUsd: 100
+    }
+  });
+  store.orders.set("existing-daily-turnover", {
+    id: "existing-daily-turnover",
+    idempotencyKey: "existing-daily-turnover",
+    copyProfileId: "copy-profile-1",
+    tokenId: "token-daily-existing",
+    intendedNotionalUsd: 2.5,
+    status: "PLACED",
+    externalOrderId: "ext-daily-existing",
+    attemptedAt: new Date(nowMs - 4_000_000)
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxHourlyNotionalTurnoverUsd: 100,
+      maxDailyNotionalTurnoverUsd: 100
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-daily-override",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-daily-override",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+  assert.equal(store.deferred[0]?.context?.maxDailyNotionalTurnoverUsd, 3);
+});
+
+test("Stage 9 falls back to env sizing caps when profile sizing overrides are absent", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_212_000;
+  store.attempts.set("attempt-sizing-fallback", makeAttempt({
+    id: "attempt-sizing-fallback",
+    tokenId: "token-sizing-fallback",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-sizing-fallback", makeContext("attempt-sizing-fallback", {
+    tokenPrice: 0.5
+  }));
+  store.orders.set("existing-hourly-fallback", {
+    id: "existing-hourly-fallback",
+    idempotencyKey: "existing-hourly-fallback",
+    copyProfileId: "copy-profile-1",
+    tokenId: "token-hourly-fallback-existing",
+    intendedNotionalUsd: 2.5,
+    status: "PLACED",
+    externalOrderId: "ext-hourly-fallback-existing",
+    attemptedAt: new Date(nowMs - 10_000)
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxHourlyNotionalTurnoverUsd: 3
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-sizing-fallback",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-sizing-fallback",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+  assert.equal(store.deferred[0]?.context?.maxHourlyNotionalTurnoverUsd, 3);
+});
+
+test("Stage 9 profile sizing exposure caps apply when leader-specific caps are unset", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_215_000;
+  store.attempts.set("attempt-profile-exposure-defaults", makeAttempt({
+    id: "attempt-profile-exposure-defaults",
+    tokenId: "token-profile-exposure-defaults",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-profile-exposure-defaults", {
+    ...makeContext("attempt-profile-exposure-defaults", {
+      tokenPrice: 0.5,
+      leaderTargetShares: {
+        "leader-1": 2
+      }
+    }),
+    contributorLeaderIds: ["leader-1"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {}
+    },
+    profileSizingOverrides: {
+      maxExposurePerMarketOutcomeUsd: 5.2,
+      maxExposurePerLeaderUsd: 6
+    }
+  });
+  store.leaderLedgerPositions = [
+    {
+      copyProfileId: "copy-profile-1",
+      leaderId: "leader-1",
+      tokenId: "token-profile-exposure-defaults",
+      shares: 10
+    },
+    {
+      copyProfileId: "copy-profile-1",
+      leaderId: "leader-1",
+      tokenId: "token-profile-other-held",
+      shares: 10
+    }
+  ];
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxExposurePerMarketOutcomeUsd: 1_000,
+      maxExposurePerLeaderUsd: 1_000
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: tokenId === "token-profile-other-held" ? "market-profile-other-held" : "market-profile-exposure-defaults",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-profile-exposure-defaults",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+});
+
 test("Stage 9 handles reverse-ordered CLOB book levels without false spread/thin-book blocks", async () => {
   const store = new FakeExecutionStore();
   const nowMs = 2_250_000;
@@ -501,6 +1313,500 @@ test("Stage 9 max price per share can be disabled per-attempt via override", asy
   assert.equal(venue.requests.length, 1);
   assert.equal(store.placed.length, 1);
   assert.equal(store.deferred.length, 0);
+});
+
+test("Stage 9 per-attempt max-price override takes precedence over env max-price", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_550_000;
+  store.attempts.set("attempt-price-precedence", makeAttempt({
+    id: "attempt-price-precedence",
+    tokenId: "token-price-precedence",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1.2
+  }));
+  store.contexts.set("attempt-price-precedence", {
+    ...makeContext("attempt-price-precedence", {
+      tokenPrice: 0.6
+    }),
+    maxPricePerShareOverride: 0.61
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-price-precedence" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxPricePerShare: 0.5
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-price-precedence",
+      bestBid: 0.59,
+      bestAsk: 0.6,
+      midPrice: 0.595,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-price-precedence",
+      bids: [{ price: 0.59, size: 100 }],
+      asks: [{ price: 0.6, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+  assert.equal(store.deferred.length, 0);
+});
+
+test("Stage 9 per-leader maxSlippageBps strictest override blocks attempts that env would allow", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_700_000;
+  store.attempts.set("attempt-leader-slippage", makeAttempt({
+    id: "attempt-leader-slippage",
+    tokenId: "token-leader-slippage",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-leader-slippage", {
+    ...makeContext("attempt-leader-slippage", {
+      tokenPrice: 0.5,
+      leaderTargetShares: {
+        "leader-1": 2
+      }
+    }),
+    contributorLeaderIds: ["leader-1"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {
+        maxSlippageBps: 10
+      }
+    },
+    guardrailOverrides: {
+      maxSlippageBps: 10
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxSlippageBps: 500
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-leader-slippage",
+      bestBid: 0.5,
+      bestAsk: 0.52,
+      midPrice: 0.51,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-leader-slippage",
+      bids: [{ price: 0.5, size: 100 }],
+      asks: [{ price: 0.52, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.ok(store.deferred[0]?.reason === "SLIPPAGE" || store.deferred[0]?.reason === "THIN_BOOK");
+});
+
+test("Stage 9 multi-leader strictest max-price override wins", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_725_000;
+  store.attempts.set("attempt-multi-leader-max-price", makeAttempt({
+    id: "attempt-multi-leader-max-price",
+    tokenId: "token-multi-leader-max-price",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1.2
+  }));
+  store.contexts.set("attempt-multi-leader-max-price", {
+    ...makeContext("attempt-multi-leader-max-price", {
+      tokenPrice: 0.6,
+      leaderTargetShares: {
+        "leader-1": 1,
+        "leader-2": 1
+      },
+      contributorLeaderIds: ["leader-1", "leader-2"]
+    }),
+    maxPricePerShareOverride: 0.59,
+    contributorLeaderIds: ["leader-1", "leader-2"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {
+        maxPricePerShareUsd: 0.61
+      },
+      "leader-2": {
+        maxPricePerShareUsd: 0.59
+      }
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      maxPricePerShare: 0.65
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-multi-leader-max-price",
+      bestBid: 0.59,
+      bestAsk: 0.6,
+      midPrice: 0.595,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-multi-leader-max-price",
+      bids: [{ price: 0.59, size: 100 }],
+      asks: [{ price: 0.6, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.ok(store.deferred[0]?.reason === "PRICE_GUARD" || store.deferred[0]?.reason === "THIN_BOOK");
+});
+
+test("Stage 9 per-leader min-notional override can defer attempts", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_740_000;
+  store.attempts.set("attempt-leader-min-notional", makeAttempt({
+    id: "attempt-leader-min-notional",
+    tokenId: "token-leader-min-notional",
+    side: "BUY",
+    accumulatedDeltaShares: 3,
+    accumulatedDeltaNotionalUsd: 1.5
+  }));
+  store.contexts.set("attempt-leader-min-notional", {
+    ...makeContext("attempt-leader-min-notional", {
+      tokenPrice: 0.5,
+      leaderTargetShares: {
+        "leader-1": 3
+      }
+    }),
+    contributorLeaderIds: ["leader-1"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {
+        minNotionalPerOrderUsd: 2
+      }
+    },
+    guardrailOverrides: {
+      minNotionalUsd: 2
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-leader-min-notional",
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-leader-min-notional",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 1 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+});
+
+test("Stage 9 per-leader daily turnover cap blocks BUY but does not block SELL", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_780_000;
+
+  store.attempts.set("attempt-cap-buy", makeAttempt({
+    id: "attempt-cap-buy",
+    tokenId: "token-cap-buy",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-cap-buy", {
+    ...makeContext("attempt-cap-buy", {
+      tokenPrice: 0.5,
+      leaderTargetShares: {
+        "leader-1": 2
+      }
+    }),
+    contributorLeaderIds: ["leader-1"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {
+        maxDailyNotionalTurnoverUsd: 5
+      }
+    }
+  });
+  store.leaderRecentNotionalTurnover.set("copy-profile-1|leader-1", 4.8);
+
+  store.attempts.set("attempt-cap-sell", makeAttempt({
+    id: "attempt-cap-sell",
+    tokenId: "token-cap-sell",
+    side: "SELL",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-cap-sell", {
+    ...makeContext("attempt-cap-sell", {
+      tokenPrice: 0.5,
+      leaderTargetShares: {
+        "leader-1": 2
+      }
+    }),
+    contributorLeaderIds: ["leader-1"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {
+        maxDailyNotionalTurnoverUsd: 5
+      }
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "ext-cap-sell" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: `market-${tokenId}`,
+      bestBid: 0.49,
+      bestAsk: 0.5,
+      midPrice: 0.495,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: `market-${tokenId}`,
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+  assert.equal(venue.requests.length, 1);
+  assert.equal(store.placed.length, 1);
+});
+
+test("Stage 9 per-leader market-outcome and total exposure caps block BUY", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_820_000;
+  store.attempts.set("attempt-exposure-caps", makeAttempt({
+    id: "attempt-exposure-caps",
+    tokenId: "token-exposure-caps",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-exposure-caps", {
+    ...makeContext("attempt-exposure-caps", {
+      tokenPrice: 0.5,
+      leaderTargetShares: {
+        "leader-1": 2
+      }
+    }),
+    contributorLeaderIds: ["leader-1"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {
+        maxExposurePerMarketOutcomeUsd: 5.2,
+        maxExposurePerLeaderUsd: 6
+      }
+    }
+  });
+  store.leaderLedgerPositions = [
+    {
+      copyProfileId: "copy-profile-1",
+      leaderId: "leader-1",
+      tokenId: "token-exposure-caps",
+      shares: 10
+    },
+    {
+      copyProfileId: "copy-profile-1",
+      leaderId: "leader-1",
+      tokenId: "token-other-held",
+      shares: 10
+    }
+  ];
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => {
+      if (tokenId === "token-other-held") {
+        return {
+          tokenId,
+          marketId: "market-other-held",
+          bestBid: 0.09,
+          bestAsk: 0.11,
+          midPrice: 0.1,
+          tickSize: 0.01,
+          minOrderSize: 1,
+          negRisk: false,
+          isStale: false,
+          priceSource: "WS" as const
+        };
+      }
+      return {
+        tokenId,
+        marketId: "market-exposure-caps",
+        bestBid: 0.49,
+        bestAsk: 0.5,
+        midPrice: 0.495,
+        tickSize: 0.01,
+        minOrderSize: 1,
+        negRisk: false,
+        isStale: false,
+        priceSource: "WS" as const
+      };
+    },
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-exposure-caps",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "RATE_LIMIT");
+});
+
+test("Stage 9 fails closed on BUY cap checks when mark prices are unavailable", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_860_000;
+  store.attempts.set("attempt-cap-price-missing", makeAttempt({
+    id: "attempt-cap-price-missing",
+    tokenId: "token-cap-price-missing",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-cap-price-missing", {
+    ...makeContext("attempt-cap-price-missing", {
+      tokenPrice: 0.5,
+      leaderTargetShares: {
+        "leader-1": 2
+      }
+    }),
+    contributorLeaderIds: ["leader-1"],
+    contributorSettingsByLeaderId: {
+      "leader-1": {
+        maxExposurePerLeaderUsd: 100
+      }
+    }
+  });
+  store.leaderLedgerPositions = [
+    {
+      copyProfileId: "copy-profile-1",
+      leaderId: "leader-1",
+      tokenId: "token-unpriced",
+      shares: 5
+    }
+  ];
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: baseConfig(),
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => {
+      if (tokenId === "token-unpriced") {
+        return {
+          tokenId,
+          marketId: "market-token-unpriced",
+          bestBid: undefined,
+          bestAsk: undefined,
+          midPrice: undefined,
+          tickSize: 0.01,
+          minOrderSize: 1,
+          negRisk: false,
+          isStale: true,
+          priceSource: "REST" as const
+        };
+      }
+      return {
+        tokenId,
+        marketId: "market-cap-price-missing",
+        bestBid: 0.49,
+        bestAsk: 0.5,
+        midPrice: 0.495,
+        tickSize: 0.01,
+        minOrderSize: 1,
+        negRisk: false,
+        isStale: false,
+        priceSource: "WS" as const
+      };
+    },
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-cap-price-missing",
+      bids: [{ price: 0.49, size: 100 }],
+      asks: [{ price: 0.5, size: 100 }]
+    })
+  });
+
+  await engine.run();
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "STALE_PRICE");
 });
 
 test("Stage 9 failed attempts retry with backoff until they can be placed", async () => {
@@ -767,14 +2073,40 @@ function makeAttempt(overrides: Partial<ExecutionAttemptRecord> & Pick<Execution
 }
 
 function makeContext(attemptId: string, metadata: Record<string, unknown>): ExecutionAttemptContext {
+  const contributorLeaderIds = resolveContributorLeaderIdsForTest(metadata);
+  const contributorSettingsByLeaderId = Object.fromEntries(contributorLeaderIds.map((leaderId) => [leaderId, {}]));
   return {
     attemptId,
     copyProfileStatus: "ACTIVE",
     leaderStatus: "ACTIVE",
+    contributorLeaderIds,
+    contributorSettingsByLeaderId,
     pendingDeltaId: `pending-${attemptId}`,
     pendingDeltaStatus: "ELIGIBLE",
     pendingDeltaMetadata: metadata
   };
+}
+
+function resolveContributorLeaderIdsForTest(metadata: Record<string, unknown>): string[] {
+  const raw = metadata.contributorLeaderIds;
+  if (Array.isArray(raw)) {
+    const parsed = raw
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter((entry) => entry.length > 0);
+    if (parsed.length > 0) {
+      return [...new Set(parsed)];
+    }
+  }
+
+  const leaderTargetShares = metadata.leaderTargetShares;
+  if (leaderTargetShares && typeof leaderTargetShares === "object" && !Array.isArray(leaderTargetShares)) {
+    const keys = Object.keys(leaderTargetShares);
+    if (keys.length > 0) {
+      return keys;
+    }
+  }
+
+  return ["leader-1"];
 }
 
 function baseConfig() {
@@ -792,6 +2124,10 @@ function baseConfig() {
     maxWorseningSellUsd: 0.06,
     maxSlippageBps: 200,
     maxSpreadUsd: 0.03,
+    minBookDepthForSizeEnabled: true,
+    maxOpenOrders: 20,
+    maxExposurePerLeaderUsd: 1000,
+    maxExposurePerMarketOutcomeUsd: 1000,
     maxDailyNotionalTurnoverUsd: 1000,
     maxHourlyNotionalTurnoverUsd: 1000,
     cooldownPerMarketSeconds: 0

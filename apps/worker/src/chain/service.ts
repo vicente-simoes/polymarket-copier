@@ -79,7 +79,11 @@ export class ChainTriggerPipeline {
   }
 
   async start(): Promise<void> {
+    this.status.enabled = this.config.enabled;
     if (!this.config.enabled) {
+      return;
+    }
+    if (this.refreshTimer) {
       return;
     }
 
@@ -104,6 +108,23 @@ export class ChainTriggerPipeline {
     this.subscriptionIds.clear();
     this.status.activeSubscriptionCount = 0;
     this.status.connected = false;
+    this.status.enabled = false;
+  }
+
+  async setEnabled(enabled: boolean): Promise<void> {
+    if (this.config.enabled === enabled) {
+      this.status.enabled = enabled;
+      return;
+    }
+
+    this.config.enabled = enabled;
+    this.status.enabled = enabled;
+    if (enabled) {
+      await this.start();
+      return;
+    }
+
+    this.stop();
   }
 
   getStatus(): ChainPipelineStatus {

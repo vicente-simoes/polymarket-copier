@@ -1,4 +1,6 @@
 import { Prisma, PrismaClient } from "@copybot/db";
+import { readProfileGuardrailOverrides } from "../config/copy-profile-guardrails.js";
+import { readLeaderSettings } from "../config/leader-settings.js";
 import type {
   ActiveCopyProfile,
   FollowerPositionPoint,
@@ -25,6 +27,7 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
       select: {
         id: true,
         defaultRatio: true,
+        config: true,
         leaders: {
           where: {
             status: "ACTIVE",
@@ -34,20 +37,30 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
           },
           select: {
             leaderId: true,
-            ratio: true
+            ratio: true,
+            settings: true
           }
         }
       }
     });
 
-    return profiles.map((profile) => ({
-      copyProfileId: profile.id,
-      defaultRatio: Number(profile.defaultRatio),
-      leaders: profile.leaders.map((leaderLink) => ({
-        leaderId: leaderLink.leaderId,
-        ratio: Number(leaderLink.ratio)
-      }))
-    }));
+    return profiles.map((profile) => {
+      const guardrails = readProfileGuardrailOverrides(profile.config);
+      return {
+        copyProfileId: profile.id,
+        defaultRatio: Number(profile.defaultRatio),
+        leaders: profile.leaders.map((leaderLink) => ({
+          leaderId: leaderLink.leaderId,
+          ratio: Number(leaderLink.ratio),
+          settings: readLeaderSettings(leaderLink.settings)
+        })),
+        guardrailOverrides: toTargetGuardrailOverrides({
+          minNotionalPerOrderUsd: guardrails.minNotionalPerOrderUsd,
+          maxRetriesPerAttempt: guardrails.maxRetriesPerAttempt,
+          attemptExpirationSeconds: guardrails.attemptExpirationSeconds
+        })
+      };
+    });
   }
 
   async getLatestLeaderPositions(leaderIds: string[]): Promise<LeaderPositionPoint[]> {
@@ -313,4 +326,28 @@ export class PrismaTargetNettingStore implements TargetNettingStore {
 
 function toJsonValue(value: Record<string, unknown>): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function toTargetGuardrailOverrides(input: {
+  minNotionalPerOrderUsd?: number;
+  maxRetriesPerAttempt?: number;
+  attemptExpirationSeconds?: number;
+}):
+  | {
+      minNotionalUsd?: number;
+      maxRetriesPerAttempt?: number;
+      attemptExpirationSeconds?: number;
+    }
+  | undefined {
+  const overrides = {
+    minNotionalUsd: input.minNotionalPerOrderUsd,
+    maxRetriesPerAttempt: input.maxRetriesPerAttempt,
+    attemptExpirationSeconds: input.attemptExpirationSeconds
+  };
+
+  if (Object.values(overrides).every((value) => value === undefined)) {
+    return undefined;
+  }
+
+  return overrides;
 }

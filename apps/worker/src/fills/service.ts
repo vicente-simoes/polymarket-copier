@@ -43,7 +43,11 @@ export class FillAttributionService {
   }
 
   start(): void {
+    this.status.enabled = this.config.enabled;
     if (!this.config.enabled) {
+      return;
+    }
+    if (this.wsClient) {
       return;
     }
 
@@ -71,8 +75,25 @@ export class FillAttributionService {
     this.status.connected = false;
     this.status.degraded = false;
     this.status.degradedReason = undefined;
+    this.status.enabled = false;
     this.starvationSamples.length = 0;
     this.starvationActive = false;
+  }
+
+  setEnabled(enabled: boolean): void {
+    if (this.config.enabled === enabled) {
+      this.status.enabled = enabled;
+      return;
+    }
+
+    this.config.enabled = enabled;
+    this.status.enabled = enabled;
+    if (enabled) {
+      this.start();
+      return;
+    }
+
+    this.stop();
   }
 
   getStatus(): UserChannelStatus {

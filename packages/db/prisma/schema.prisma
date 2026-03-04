@@ -161,7 +161,7 @@ model Leader {
   pendingDeltas     PendingDelta[]
   copyAttempts      CopyAttempt[]
   tokenLedgers      LeaderTokenLedger[]
-  pnlSummary        LeaderPnlSummary?
+  pnlSummaries      LeaderPnlSummary[]
   errorEvents       ErrorEvent[]
   fillAllocations   CopyFillAllocation[]
 
@@ -204,6 +204,8 @@ model CopyProfile {
   pendingDeltas           PendingDelta[]
   copyAttempts            CopyAttempt[]
   copyOrders              CopyOrder[]
+  leaderTokenLedgers      LeaderTokenLedger[]
+  leaderPnlSummaries      LeaderPnlSummary[]
   portfolioSnapshots      PortfolioSnapshot[]
   configAuditLogs         ConfigAuditLog[]
 
@@ -451,30 +453,37 @@ model CopyFillAllocation {
 }
 
 model LeaderTokenLedger {
-  id        String   @id @default(cuid())
-  leaderId  String
-  tokenId   String
-  marketId  String?
-  shares    Decimal  @default(0) @db.Decimal(38, 18)
-  costUsd   Decimal  @default(0) @db.Decimal(20, 8)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id            String   @id @default(cuid())
+  copyProfileId String
+  leaderId      String
+  tokenId       String
+  marketId      String?
+  shares        Decimal  @default(0) @db.Decimal(38, 18)
+  costUsd       Decimal  @default(0) @db.Decimal(20, 8)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+  copyProfile CopyProfile @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+  leader      Leader      @relation(fields: [leaderId], references: [id], onDelete: Cascade)
 
-  @@unique([leaderId, tokenId])
+  @@unique([copyProfileId, leaderId, tokenId])
+  @@index([copyProfileId, leaderId, tokenId])
   @@index([tokenId, updatedAt])
 }
 
 model LeaderPnlSummary {
   id             String   @id @default(cuid())
-  leaderId       String   @unique
+  copyProfileId  String
+  leaderId       String
   realizedPnlUsd Decimal  @default(0) @db.Decimal(20, 8)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+  copyProfile CopyProfile @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+  leader      Leader      @relation(fields: [leaderId], references: [id], onDelete: Cascade)
 
+  @@unique([copyProfileId, leaderId])
+  @@index([copyProfileId, leaderId])
   @@index([realizedPnlUsd])
 }
 
@@ -570,4 +579,11 @@ model ConfigAuditLog {
   @@index([scope, createdAt])
   @@index([scopeRefId, createdAt])
   @@index([copyProfileId, createdAt])
+}
+
+model GlobalRuntimeConfig {
+  id        String   @id
+  config    Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

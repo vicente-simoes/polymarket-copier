@@ -1,3 +1,5 @@
+import type { ParsedLeaderSettings } from "../config/leader-settings.js";
+
 export type ExecutionSide = "BUY" | "SELL";
 export type ExecutionOrderAmountKind = "USD" | "SHARES";
 export type ExecutionOrderType = "FAK";
@@ -49,12 +51,34 @@ export interface ExecutionAttemptContext {
   copySystemEnabled?: boolean;
   leaderStatus?: "ACTIVE" | "PAUSED" | "DISABLED";
   maxPricePerShareOverride?: number | null;
+  guardrailOverrides?: ExecutionGuardrailOverrides;
+  profileSizingOverrides?: ExecutionProfileSizingOverrides;
+  contributorLeaderIds: string[];
+  contributorSettingsByLeaderId: Record<string, ParsedLeaderSettings>;
   pendingDeltaId?: string;
   pendingDeltaStatus?: "PENDING" | "ELIGIBLE" | "BLOCKED" | "EXPIRED" | "CONVERTED";
   pendingDeltaBlockReason?: string;
   pendingDeltaShares?: number;
   pendingDeltaNotionalUsd?: number;
   pendingDeltaMetadata: Record<string, unknown>;
+}
+
+export interface ExecutionGuardrailOverrides {
+  minNotionalUsd?: number;
+  maxWorseningBuyUsd?: number;
+  maxWorseningSellUsd?: number;
+  maxSlippageBps?: number;
+  maxSpreadUsd?: number;
+  minBookDepthForSizeEnabled?: boolean;
+  cooldownPerMarketSeconds?: number;
+  maxOpenOrders?: number | null;
+}
+
+export interface ExecutionProfileSizingOverrides {
+  maxExposurePerLeaderUsd?: number;
+  maxExposurePerMarketOutcomeUsd?: number;
+  maxHourlyNotionalTurnoverUsd?: number;
+  maxDailyNotionalTurnoverUsd?: number;
 }
 
 export interface ExecutionMarketSnapshot {
@@ -144,6 +168,16 @@ export interface ExecutionStore {
   listOpenAttempts(limit: number): Promise<ExecutionAttemptRecord[]>;
   getAttemptContext(attemptId: string): Promise<ExecutionAttemptContext | null>;
   getNotionalTurnoverUsd(copyProfileId: string, since: Date): Promise<number>;
+  getLeaderRecentNotionalTurnoverUsd(args: {
+    copyProfileId: string;
+    leaderIds: string[];
+    since: Date;
+  }): Promise<Record<string, number>>;
+  listLeaderLedgerPositions(args: {
+    copyProfileId: string;
+    leaderIds: string[];
+  }): Promise<ExecutionLeaderLedgerPosition[]>;
+  countOpenOrders(copyProfileId: string): Promise<number>;
   getLastOrderAttemptAt(copyProfileId: string, tokenId: string): Promise<Date | null>;
   createCopyOrderDraft(input: CopyOrderDraft): Promise<CopyOrderRecord>;
   markCopyOrderPlaced(input: {
@@ -162,6 +196,12 @@ export interface ExecutionStore {
   }): Promise<void>;
   deferAttempt(input: ExecutionTransitionInput): Promise<void>;
   repairExecutionInvariants(now: Date): Promise<ExecutionInvariantRepairResult>;
+}
+
+export interface ExecutionLeaderLedgerPosition {
+  leaderId: string;
+  tokenId: string;
+  shares: number;
 }
 
 export interface ExecutionVenueClient {
@@ -183,6 +223,10 @@ export interface ExecutionEngineConfig {
   maxSlippageBps: number;
   maxSpreadUsd: number;
   maxPricePerShare?: number;
+  minBookDepthForSizeEnabled: boolean;
+  maxOpenOrders: number | null;
+  maxExposurePerLeaderUsd: number;
+  maxExposurePerMarketOutcomeUsd: number;
   maxDailyNotionalTurnoverUsd: number;
   maxHourlyNotionalTurnoverUsd: number;
   cooldownPerMarketSeconds: number;

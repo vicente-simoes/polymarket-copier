@@ -1,17 +1,28 @@
 import { NextRequest } from 'next/server'
+import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { jsonContract, jsonError, toNumber } from '@/lib/server/api'
 import {
+  applyGlobalRuntimeOverrides,
   DEFAULT_SYSTEM_CONFIG,
   SystemConfigPatchSchema,
   SystemConfigSchema,
   applySystemConfigPatch,
-  resolveSystemConfig
+  equalGlobalRuntimeConfig,
+  resolveSystemConfig,
+  resolveGlobalRuntimeConfig,
+  toGlobalRuntimeConfigValue
 } from '@/lib/server/config'
 import { prisma } from '@/lib/server/db'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
+const GLOBAL_RUNTIME_CONFIG_ID = 'global'
+
+interface SqlClient {
+  $queryRaw<T = unknown>(query: Prisma.Sql): Promise<T>
+  $executeRaw(query: Prisma.Sql): Promise<number>
+}
 
 const ConfigDataSchema = z.object({
   copyProfileId: z.string().nullable(),
@@ -25,7 +36,7 @@ export async function GET(request: NextRequest) {
     const url = new URL(request.url)
     const requestedProfileId = url.searchParams.get('copyProfileId')
 
-    const copyProfile =
+    const [copyProfile, globalRuntimeRow] = await Promise.all([
       requestedProfileId
         ? await prisma.copyProfile.findUnique({
             where: {
@@ -53,24 +64,28 @@ export async function GET(request: NextRequest) {
               defaultRatio: true,
               updatedAt: true
             }
-          })
+          }),
+      readGlobalRuntimeConfigRow(prisma)
+    ])
+    const globalRuntimeOverrides = resolveGlobalRuntimeConfig(globalRuntimeRow?.config)
 
     if (!copyProfile) {
       return jsonContract(ConfigDataSchema, {
         copyProfileId: null,
-        updatedAt: null,
-        config: DEFAULT_SYSTEM_CONFIG,
+        updatedAt: globalRuntimeRow?.updatedAt.toISOString() ?? null,
+        config: applyGlobalRuntimeOverrides(DEFAULT_SYSTEM_CONFIG, globalRuntimeOverrides),
         defaults: DEFAULT_SYSTEM_CONFIG
       })
     }
 
-    const resolvedConfig = resolveSystemConfig(copyProfile.config, toNumber(copyProfile.defaultRatio))
+    const profileConfig = resolveSystemConfig(copyProfile.config, toNumber(copyProfile.defaultRatio))
+    const resolvedConfig = applyGlobalRuntimeOverrides(profileConfig, globalRuntimeOverrides)
 
     return jsonContract(
       ConfigDataSchema,
       {
         copyProfileId: copyProfile.id,
-        updatedAt: copyProfile.updatedAt.toISOString(),
+        updatedAt: maxUpdatedAt(copyProfile.updatedAt, globalRuntimeRow?.updatedAt),
         config: resolvedConfig,
         defaults: DEFAULT_SYSTEM_CONFIG
       },
@@ -128,8 +143,15 @@ export async function PATCH(request: NextRequest) {
 
     const previousConfig = resolveSystemConfig(profile.config, toNumber(profile.defaultRatio))
     const nextConfig = applySystemConfigPatch(previousConfig, body)
+    const nextGlobalRuntimeConfig = toGlobalRuntimeConfigValue(nextConfig)
 
     await prisma.$transaction(async (tx) => {
+      const previousGlobalRuntimeRow = await readGlobalRuntimeConfigRow(tx as unknown as SqlClient)
+      const previousGlobalRuntime = previousGlobalRuntimeRow?.config
+        ? resolveGlobalRuntimeConfig(previousGlobalRuntimeRow.config)
+        : resolveGlobalRuntimeConfig(toGlobalRuntimeConfigValue(previousConfig))
+      const nextGlobalRuntime = resolveGlobalRuntimeConfig(nextGlobalRuntimeConfig)
+
       await tx.copyProfile.update({
         where: {
           id: profile.id
@@ -166,25 +188,48 @@ export async function PATCH(request: NextRequest) {
           reason: body.reason ?? null
         }
       })
-    })
 
-    const updatedProfile = await prisma.copyProfile.findUnique({
-      where: {
-        id: profile.id
-      },
-      select: {
-        id: true,
-        config: true,
-        defaultRatio: true,
-        updatedAt: true
+      await upsertGlobalRuntimeConfigRow(tx as unknown as SqlClient, nextGlobalRuntimeConfig)
+
+      if (!equalGlobalRuntimeConfig(previousGlobalRuntime, nextGlobalRuntime)) {
+        await tx.configAuditLog.create({
+          data: {
+            scope: 'GLOBAL',
+            scopeRefId: GLOBAL_RUNTIME_CONFIG_ID,
+            copyProfileId: null,
+            changedBy: body.changedBy ?? request.headers.get('x-user') ?? null,
+            changeType: 'UPDATED',
+            previousValue: toJsonValue(toGlobalRuntimeConfigRecord(previousGlobalRuntime)),
+            nextValue: toJsonValue(toGlobalRuntimeConfigRecord(nextGlobalRuntime)),
+            reason: body.reason ?? null
+          }
+        })
       }
     })
 
-    const resolvedConfig = resolveSystemConfig(updatedProfile?.config, toNumber(updatedProfile?.defaultRatio))
+    const [updatedProfile, globalRuntimeRow] = await Promise.all([
+      prisma.copyProfile.findUnique({
+        where: {
+          id: profile.id
+        },
+        select: {
+          id: true,
+          config: true,
+          defaultRatio: true,
+          updatedAt: true
+        }
+      }),
+      readGlobalRuntimeConfigRow(prisma)
+    ])
+
+    const profileConfig = updatedProfile
+      ? resolveSystemConfig(updatedProfile.config, toNumber(updatedProfile.defaultRatio))
+      : nextConfig
+    const resolvedConfig = applyGlobalRuntimeOverrides(profileConfig, resolveGlobalRuntimeConfig(globalRuntimeRow?.config))
 
     return jsonContract(ConfigDataSchema, {
       copyProfileId: updatedProfile?.id ?? profile.id,
-      updatedAt: updatedProfile?.updatedAt.toISOString() ?? null,
+      updatedAt: maxUpdatedAt(updatedProfile?.updatedAt, globalRuntimeRow?.updatedAt),
       config: resolvedConfig,
       defaults: DEFAULT_SYSTEM_CONFIG
     })
@@ -203,4 +248,69 @@ function toErrorMessage(error: unknown): string {
     return error.message
   }
   return String(error)
+}
+
+function toGlobalRuntimeConfigRecord(config: {
+  tradeDetectionEnabled?: boolean
+  userChannelWsEnabled?: boolean
+  reconcileIntervalSeconds?: number
+}): Record<string, unknown> {
+  return {
+    masterSwitches: {
+      ...(config.tradeDetectionEnabled !== undefined ? { tradeDetectionEnabled: config.tradeDetectionEnabled } : {}),
+      ...(config.userChannelWsEnabled !== undefined ? { userChannelWsEnabled: config.userChannelWsEnabled } : {})
+    },
+    reconcile: {
+      ...(config.reconcileIntervalSeconds !== undefined ? { intervalSeconds: config.reconcileIntervalSeconds } : {})
+    }
+  }
+}
+
+function maxUpdatedAt(left: Date | null | undefined, right: Date | null | undefined): string | null {
+  if (left && right) {
+    return (left.getTime() >= right.getTime() ? left : right).toISOString()
+  }
+  return (left ?? right)?.toISOString() ?? null
+}
+
+async function readGlobalRuntimeConfigRow(client: SqlClient): Promise<{ config: unknown; updatedAt: Date } | null> {
+  let rows: Array<{ config: Prisma.JsonValue | null; updatedAt: Date }>
+  try {
+    rows = await client.$queryRaw<Array<{ config: Prisma.JsonValue | null; updatedAt: Date }>>(
+      Prisma.sql`
+        SELECT "config", "updatedAt"
+        FROM "GlobalRuntimeConfig"
+        WHERE "id" = ${GLOBAL_RUNTIME_CONFIG_ID}
+        LIMIT 1
+      `
+    )
+  } catch {
+    return null
+  }
+  const row = rows[0]
+  if (!row) {
+    return null
+  }
+  return {
+    config: row.config,
+    updatedAt: row.updatedAt
+  }
+}
+
+async function upsertGlobalRuntimeConfigRow(client: SqlClient, config: Record<string, unknown>): Promise<void> {
+  const payload = JSON.stringify(config)
+  await client.$executeRaw(
+    Prisma.sql`
+      INSERT INTO "GlobalRuntimeConfig" ("id", "config", "createdAt", "updatedAt")
+      VALUES (${GLOBAL_RUNTIME_CONFIG_ID}, CAST(${payload} AS jsonb), NOW(), NOW())
+      ON CONFLICT ("id")
+      DO UPDATE SET
+        "config" = CAST(${payload} AS jsonb),
+        "updatedAt" = NOW()
+    `
+  )
+}
+
+function toJsonValue(value: Record<string, unknown>): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue
 }

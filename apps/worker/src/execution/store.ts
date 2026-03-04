@@ -1,8 +1,16 @@
 import { Prisma, PrismaClient } from "@copybot/db";
+import {
+  readCopySystemEnabled,
+  readProfileGuardrailOverrides,
+  readProfileMaxPriceOverride,
+  readProfileSizingOverrides
+} from "../config/copy-profile-guardrails.js";
+import { readLeaderSettings } from "../config/leader-settings.js";
 import type {
   CopyOrderDraft,
   CopyOrderRecord,
   ExecutionAttemptContext,
+  ExecutionGuardrailOverrides,
   ExecutionAttemptRecord,
   ExecutionSkipReason,
   ExecutionStore,
@@ -103,29 +111,45 @@ export class PrismaExecutionStore implements ExecutionStore {
       return null;
     }
 
-    const profileMaxPricePerShare = readMaxPricePerShareOverrideFromProfileConfig(attempt.copyProfile.config);
-    const leaderSettings = attempt.leaderId
-      ? await this.prisma.copyProfileLeader.findUnique({
-          where: {
-            copyProfileId_leaderId: {
+    const pendingDeltaMetadata = asObject(attempt.pendingDelta?.metadata);
+    const contributorLeaderIds = resolveContributorLeaderIds(pendingDeltaMetadata, attempt.leaderId ?? undefined);
+    const contributorLeaderRows =
+      contributorLeaderIds.length === 0
+        ? []
+        : await this.prisma.copyProfileLeader.findMany({
+            where: {
               copyProfileId: attempt.copyProfileId,
-              leaderId: attempt.leaderId
+              leaderId: {
+                in: contributorLeaderIds
+              }
+            },
+            select: {
+              leaderId: true,
+              settings: true
             }
-          },
-          select: {
-            settings: true
-          }
-        })
-      : null;
-    const leaderMaxPricePerShare = readMaxPricePerShareOverrideFromLeaderSettings(leaderSettings?.settings);
+          });
+    const contributorSettingsByLeaderId = Object.fromEntries(
+      contributorLeaderRows.map((row) => [row.leaderId, readLeaderSettings(row.settings)])
+    );
+    const profileGuardrailOverrides = readProfileGuardrailOverrides(attempt.copyProfile.config);
+    const profileSizingOverrides = readProfileSizingOverrides(attempt.copyProfile.config);
+    const profileMaxPricePerShare = readProfileMaxPriceOverride(attempt.copyProfile.config);
+    const contributorMaxPricePerShare = resolveContributorMaxPricePerShare(
+      contributorLeaderIds,
+      contributorSettingsByLeaderId
+    );
 
     return {
       attemptId: attempt.id,
       copyProfileStatus: attempt.copyProfile.status as "ACTIVE" | "PAUSED" | "DISABLED",
-      copySystemEnabled: readCopySystemEnabledFromConfig(attempt.copyProfile.config),
+      copySystemEnabled: readCopySystemEnabled(attempt.copyProfile.config) ?? true,
       leaderStatus: attempt.leader?.status as "ACTIVE" | "PAUSED" | "DISABLED" | undefined,
       maxPricePerShareOverride:
-        leaderMaxPricePerShare !== undefined ? leaderMaxPricePerShare : profileMaxPricePerShare,
+        contributorMaxPricePerShare !== undefined ? contributorMaxPricePerShare : profileMaxPricePerShare,
+      guardrailOverrides: toExecutionGuardrailOverrides(profileGuardrailOverrides, contributorSettingsByLeaderId),
+      profileSizingOverrides: toExecutionProfileSizingOverrides(profileSizingOverrides),
+      contributorLeaderIds,
+      contributorSettingsByLeaderId,
       pendingDeltaId: attempt.pendingDeltaId ?? undefined,
       pendingDeltaStatus: attempt.pendingDelta?.status as "PENDING" | "ELIGIBLE" | "BLOCKED" | "EXPIRED" | "CONVERTED" | undefined,
       pendingDeltaBlockReason: attempt.pendingDelta?.blockReason ?? undefined,
@@ -137,7 +161,7 @@ export class PrismaExecutionStore implements ExecutionStore {
         attempt.pendingDelta?.pendingDeltaNotionalUsd !== null && attempt.pendingDelta?.pendingDeltaNotionalUsd !== undefined
           ? Number(attempt.pendingDelta.pendingDeltaNotionalUsd)
           : undefined,
-      pendingDeltaMetadata: asObject(attempt.pendingDelta?.metadata)
+      pendingDeltaMetadata
     };
   }
 
@@ -158,6 +182,86 @@ export class PrismaExecutionStore implements ExecutionStore {
     });
 
     return aggregate._sum.intendedNotionalUsd ? Number(aggregate._sum.intendedNotionalUsd) : 0;
+  }
+
+  async getLeaderRecentNotionalTurnoverUsd(args: {
+    copyProfileId: string;
+    leaderIds: string[];
+    since: Date;
+  }): Promise<Record<string, number>> {
+    if (args.leaderIds.length === 0) {
+      return {};
+    }
+
+    const rows = await this.prisma.copyFillAllocation.findMany({
+      where: {
+        leaderId: {
+          in: args.leaderIds
+        },
+        allocatedAt: {
+          gte: args.since
+        },
+        copyOrder: {
+          copyProfileId: args.copyProfileId
+        }
+      },
+      select: {
+        leaderId: true,
+        usdcDelta: true
+      }
+    });
+
+    const byLeader: Record<string, number> = {};
+    for (const leaderId of args.leaderIds) {
+      byLeader[leaderId] = 0;
+    }
+
+    for (const row of rows) {
+      if (!row.leaderId) {
+        continue;
+      }
+      byLeader[row.leaderId] = (byLeader[row.leaderId] ?? 0) + Math.abs(Number(row.usdcDelta));
+    }
+
+    return byLeader;
+  }
+
+  async listLeaderLedgerPositions(args: {
+    copyProfileId: string;
+    leaderIds: string[];
+  }): Promise<Array<{ leaderId: string; tokenId: string; shares: number }>> {
+    if (args.leaderIds.length === 0) {
+      return [];
+    }
+
+    const rows = await this.prisma.$queryRaw<Array<{ leaderId: string; tokenId: string; shares: Prisma.Decimal }>>(
+      Prisma.sql`
+        SELECT "leaderId", "tokenId", "shares"
+        FROM "LeaderTokenLedger"
+        WHERE "copyProfileId" = ${args.copyProfileId}
+          AND "leaderId" IN (${Prisma.join(args.leaderIds)})
+      `
+    );
+
+    return rows.map((row) => ({
+      leaderId: row.leaderId,
+      tokenId: row.tokenId,
+      shares: Number(row.shares)
+    }));
+  }
+
+  async countOpenOrders(copyProfileId: string): Promise<number> {
+    return this.prisma.copyOrder.count({
+      where: {
+        copyProfileId,
+        externalOrderId: {
+          not: null
+        },
+        status: {
+          in: ["PLACED", "PARTIALLY_FILLED", "RETRYING"]
+        }
+      }
+    });
   }
 
   async getLastOrderAttemptAt(copyProfileId: string, tokenId: string): Promise<Date | null> {
@@ -493,48 +597,138 @@ function toJsonValue(value: Record<string, unknown>): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
 
-function readCopySystemEnabledFromConfig(value: unknown): boolean {
-  const config = asObject(value);
-  const masterSwitches = asObject(config.masterSwitches);
-  const configured = masterSwitches.copySystemEnabled;
-  if (typeof configured === "boolean") {
-    return configured;
-  }
-  return true;
-}
+function toExecutionGuardrailOverrides(
+  input: {
+    minNotionalPerOrderUsd?: number;
+    maxWorseningBuyUsd?: number;
+    maxWorseningSellUsd?: number;
+    maxSlippageBps?: number;
+    maxSpreadUsd?: number;
+    minBookDepthForSizeEnabled?: boolean;
+    cooldownPerMarketSeconds?: number;
+    maxOpenOrders?: number | null;
+  },
+  contributorSettingsByLeaderId: Record<string, ReturnType<typeof readLeaderSettings>>
+): ExecutionGuardrailOverrides | undefined {
+  const strictestContributorMinNotional = pickStrictestMax(
+    Object.values(contributorSettingsByLeaderId).map((settings) => settings.minNotionalPerOrderUsd)
+  );
+  const strictestContributorSlippage = pickStrictestMin(
+    Object.values(contributorSettingsByLeaderId).map((settings) => settings.maxSlippageBps)
+  );
 
-function readMaxPricePerShareOverrideFromProfileConfig(value: unknown): number | null | undefined {
-  const config = asObject(value);
-  const guardrails = asObject(config.guardrails);
-  return readOptionalPositiveNumberOverride(guardrails.maxPricePerShareUsd);
-}
+  const overrides: ExecutionGuardrailOverrides = {
+    minNotionalUsd: strictestContributorMinNotional ?? input.minNotionalPerOrderUsd,
+    maxWorseningBuyUsd: input.maxWorseningBuyUsd,
+    maxWorseningSellUsd: input.maxWorseningSellUsd,
+    maxSlippageBps: strictestContributorSlippage ?? input.maxSlippageBps,
+    maxSpreadUsd: input.maxSpreadUsd,
+    minBookDepthForSizeEnabled: input.minBookDepthForSizeEnabled,
+    cooldownPerMarketSeconds: input.cooldownPerMarketSeconds,
+    maxOpenOrders: input.maxOpenOrders
+  };
 
-function readMaxPricePerShareOverrideFromLeaderSettings(value: unknown): number | null | undefined {
-  const settings = asObject(value);
-  return readOptionalPositiveNumberOverride(settings.maxPricePerShareUsd);
-}
-
-function readOptionalPositiveNumberOverride(value: unknown): number | null | undefined {
-  if (value === null) {
-    return null;
-  }
-
-  const parsed = readNumber(value);
-  if (parsed === undefined || parsed <= 0) {
+  if (Object.values(overrides).every((value) => value === undefined)) {
     return undefined;
   }
-  return parsed;
+  return overrides;
 }
 
-function readNumber(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
+function toExecutionProfileSizingOverrides(input: {
+  maxExposurePerLeaderUsd?: number;
+  maxExposurePerMarketOutcomeUsd?: number;
+  maxHourlyNotionalTurnoverUsd?: number;
+  maxDailyNotionalTurnoverUsd?: number;
+}) {
+  const overrides = {
+    maxExposurePerLeaderUsd: input.maxExposurePerLeaderUsd,
+    maxExposurePerMarketOutcomeUsd: input.maxExposurePerMarketOutcomeUsd,
+    maxHourlyNotionalTurnoverUsd: input.maxHourlyNotionalTurnoverUsd,
+    maxDailyNotionalTurnoverUsd: input.maxDailyNotionalTurnoverUsd
+  };
+
+  if (Object.values(overrides).every((value) => value === undefined)) {
+    return undefined;
   }
-  if (typeof value === "string") {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) {
-      return parsed;
+  return overrides;
+}
+
+function resolveContributorLeaderIds(metadata: Record<string, unknown>, fallbackLeaderId: string | undefined): string[] {
+  const fromMetadata = readContributorLeaderIds(metadata);
+  if (fromMetadata.length > 0) {
+    return fromMetadata;
+  }
+
+  const fromTargetShares = Object.keys(asObject(metadata.leaderTargetShares));
+  if (fromTargetShares.length > 0) {
+    return [...new Set(fromTargetShares)].sort();
+  }
+
+  if (fallbackLeaderId) {
+    return [fallbackLeaderId];
+  }
+  return [];
+}
+
+function readContributorLeaderIds(metadata: Record<string, unknown>): string[] {
+  const raw = metadata.contributorLeaderIds;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const values = raw
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter((entry) => entry.length > 0);
+  return [...new Set(values)].sort();
+}
+
+function resolveContributorMaxPricePerShare(
+  contributorLeaderIds: string[],
+  contributorSettingsByLeaderId: Record<string, ReturnType<typeof readLeaderSettings>>
+): number | null | undefined {
+  const numeric: number[] = [];
+  let sawExplicitDisable = false;
+
+  for (const leaderId of contributorLeaderIds) {
+    const settings = contributorSettingsByLeaderId[leaderId];
+    if (!settings) {
+      continue;
+    }
+    if (settings.maxPricePerShareUsd === null) {
+      sawExplicitDisable = true;
+      continue;
+    }
+    if (settings.maxPricePerShareUsd !== undefined) {
+      numeric.push(settings.maxPricePerShareUsd);
     }
   }
+
+  if (numeric.length > 0) {
+    return Math.min(...numeric);
+  }
+  if (sawExplicitDisable) {
+    return null;
+  }
   return undefined;
+}
+
+function pickStrictestMax(values: Array<number | undefined>): number | undefined {
+  let result: number | undefined;
+  for (const value of values) {
+    if (value === undefined) {
+      continue;
+    }
+    result = result === undefined ? value : Math.max(result, value);
+  }
+  return result;
+}
+
+function pickStrictestMin(values: Array<number | undefined>): number | undefined {
+  let result: number | undefined;
+  for (const value of values) {
+    if (value === undefined) {
+      continue;
+    }
+    result = result === undefined ? value : Math.min(result, value);
+  }
+  return result;
 }

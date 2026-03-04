@@ -1,5 +1,5 @@
 import http from "node:http";
-import { PrismaClient } from "@copybot/db";
+import { Prisma, PrismaClient } from "@copybot/db";
 import { parseWorkerEnv } from "@copybot/shared";
 import { Wallet } from "ethers";
 import {
@@ -29,6 +29,13 @@ import {
 import { PrismaTargetNettingStore, TargetNettingEngine } from "./target/index.js";
 import { PrismaReconcileStore, ReconcileEngine } from "./reconcile/index.js";
 import { workerLogger } from "./logger.js";
+import {
+  readGlobalRuntimeConfigOverrides,
+  resolveEffectiveGlobalRuntimeConfig,
+  type EffectiveGlobalRuntimeConfig
+} from "./config/global-runtime-config.js";
+
+const GLOBAL_RUNTIME_CONFIG_ID = "global";
 
 function maskSecret(value: string): string {
   if (value.length <= 6) {
@@ -292,6 +299,10 @@ async function bootstrap(): Promise<void> {
       maxSlippageBps: env.MAX_SLIPPAGE_BPS,
       maxSpreadUsd: env.MAX_SPREAD_USD,
       maxPricePerShare: env.MAX_PRICE_PER_SHARE_USD,
+      minBookDepthForSizeEnabled: env.MIN_BOOK_DEPTH_FOR_SIZE_ENABLED,
+      maxOpenOrders: env.MAX_OPEN_ORDERS,
+      maxExposurePerLeaderUsd: env.MAX_EXPOSURE_PER_LEADER_USD,
+      maxExposurePerMarketOutcomeUsd: env.MAX_EXPOSURE_PER_MARKET_OUTCOME_USD,
       maxDailyNotionalTurnoverUsd: env.MAX_DAILY_NOTIONAL_TURNOVER_USD,
       maxHourlyNotionalTurnoverUsd: env.MAX_HOURLY_NOTIONAL_TURNOVER_USD,
       cooldownPerMarketSeconds: env.COOLDOWN_PER_MARKET_SECONDS
@@ -400,6 +411,82 @@ async function bootstrap(): Promise<void> {
   });
   reconcileEngine.start();
 
+  const runtimeConfigBaseline: EffectiveGlobalRuntimeConfig = {
+    tradeDetectionEnabled: env.TRADE_DETECTION_ENABLED,
+    userChannelWsEnabled: env.USER_CHANNEL_WS_ENABLED,
+    reconcileIntervalSeconds: env.RECONCILE_INTERVAL_SECONDS
+  };
+  let runtimeConfig = { ...runtimeConfigBaseline };
+
+  async function applyRuntimeConfig(next: EffectiveGlobalRuntimeConfig, source: "bootstrap" | "refresh"): Promise<void> {
+    const changed: Record<string, { from: number | boolean; to: number | boolean }> = {};
+
+    if (next.tradeDetectionEnabled !== runtimeConfig.tradeDetectionEnabled) {
+      await chainPipeline.setEnabled(env.CHAIN_TRIGGER_WS_ENABLED && next.tradeDetectionEnabled);
+      changed.tradeDetectionEnabled = {
+        from: runtimeConfig.tradeDetectionEnabled,
+        to: next.tradeDetectionEnabled
+      };
+    }
+
+    if (next.userChannelWsEnabled !== runtimeConfig.userChannelWsEnabled) {
+      fillAttribution.setEnabled(next.userChannelWsEnabled);
+      changed.userChannelWsEnabled = {
+        from: runtimeConfig.userChannelWsEnabled,
+        to: next.userChannelWsEnabled
+      };
+    }
+
+    if (next.reconcileIntervalSeconds !== runtimeConfig.reconcileIntervalSeconds) {
+      const intervalMs = next.reconcileIntervalSeconds * 1000;
+      leaderPoller.setPositionsIntervalMs(intervalMs);
+      reconcileEngine.setIntervalMs(intervalMs);
+      changed.reconcileIntervalSeconds = {
+        from: runtimeConfig.reconcileIntervalSeconds,
+        to: next.reconcileIntervalSeconds
+      };
+    }
+
+    runtimeConfig = next;
+    if (Object.keys(changed).length > 0) {
+      workerLogger.info("runtime_config.applied", {
+        source,
+        changed,
+        effective: {
+          ...runtimeConfig,
+          chainTriggerEnabled: env.CHAIN_TRIGGER_WS_ENABLED && runtimeConfig.tradeDetectionEnabled
+        }
+      });
+    }
+  }
+
+  async function refreshRuntimeConfig(source: "bootstrap" | "refresh"): Promise<void> {
+    try {
+      const rows = await prisma.$queryRaw<Array<{ config: Prisma.JsonValue | null }>>(
+        Prisma.sql`
+          SELECT "config"
+          FROM "GlobalRuntimeConfig"
+          WHERE "id" = ${GLOBAL_RUNTIME_CONFIG_ID}
+          LIMIT 1
+        `
+      );
+      const row = rows[0];
+      const overrides = readGlobalRuntimeConfigOverrides(row?.config);
+      const next = resolveEffectiveGlobalRuntimeConfig(runtimeConfigBaseline, overrides);
+      await applyRuntimeConfig(next, source);
+    } catch (error) {
+      workerLogger.warn("runtime_config.refresh_failed", {
+        source,
+        error: toErrorDetails(error)
+      });
+    }
+  }
+
+  await refreshRuntimeConfig("bootstrap");
+  const runtimeConfigRefresh = setInterval(() => {
+    void refreshRuntimeConfig("refresh");
+  }, env.WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS);
+
   const heartbeat = setInterval(() => {
     lastHeartbeatAtMs = Date.now();
   }, env.WORKER_HEARTBEAT_INTERVAL_MS);
@@ -427,7 +514,11 @@ async function bootstrap(): Promise<void> {
           execution: executionEngine.getStatus(),
           userChannel: fillAttribution.getStatus(),
           fillReconcile: fillReconcile.getStatus(),
-          reconcile: reconcileEngine.getStatus()
+          reconcile: reconcileEngine.getStatus(),
+          runtimeConfig: {
+            ...runtimeConfig,
+            chainTriggerEnabled: env.CHAIN_TRIGGER_WS_ENABLED && runtimeConfig.tradeDetectionEnabled
+          }
         })
       );
       return;
@@ -552,15 +643,18 @@ async function bootstrap(): Promise<void> {
   const startupConfig = {
     nodeEnv: env.NODE_ENV,
     copySystemEnabled: env.COPY_SYSTEM_ENABLED,
-    tradeDetectionEnabled: env.TRADE_DETECTION_ENABLED,
-    userChannelWsEnabled: env.USER_CHANNEL_WS_ENABLED,
+    tradeDetectionEnabled: runtimeConfig.tradeDetectionEnabled,
+    userChannelWsEnabled: runtimeConfig.userChannelWsEnabled,
     fillReconcileEnabled: env.FILL_RECONCILE_ENABLED,
     fillReconcileIntervalSeconds: env.FILL_RECONCILE_INTERVAL_SECONDS,
     fillBackfillDefaultLookbackDays: env.FILL_BACKFILL_DEFAULT_LOOKBACK_DAYS,
     fillParseStarvationWindowSeconds: env.FILL_PARSE_STARVATION_WINDOW_SECONDS,
     fillParseStarvationMinMessages: env.FILL_PARSE_STARVATION_MIN_MESSAGES,
-    reconcileIntervalSeconds: env.RECONCILE_INTERVAL_SECONDS,
+    reconcileIntervalSeconds: runtimeConfig.reconcileIntervalSeconds,
+    runtimeConfigRefreshIntervalMs: env.WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS,
     minNotionalPerOrderUsd: env.MIN_NOTIONAL_PER_ORDER_USD,
+    minBookDepthForSizeEnabled: env.MIN_BOOK_DEPTH_FOR_SIZE_ENABLED,
+    maxOpenOrders: env.MAX_OPEN_ORDERS,
     maxExposurePerLeaderUsd: env.MAX_EXPOSURE_PER_LEADER_USD,
     maxExposurePerMarketOutcomeUsd: env.MAX_EXPOSURE_PER_MARKET_OUTCOME_USD,
     maxHourlyNotionalTurnoverUsd: env.MAX_HOURLY_NOTIONAL_TURNOVER_USD,
@@ -573,7 +667,7 @@ async function bootstrap(): Promise<void> {
     marketWatchedTokensCount: staticWatchedTokenIds.length,
     marketWatchRefreshIntervalMs: dynamicMarketWatchRefreshIntervalMs,
     dataApiBaseUrl: env.DATA_API_BASE_URL,
-    chainTriggerWsEnabled: env.CHAIN_TRIGGER_WS_ENABLED,
+    chainTriggerWsEnabled: env.CHAIN_TRIGGER_WS_ENABLED && runtimeConfig.tradeDetectionEnabled,
     chainTriggerExchangeContracts: exchangeContracts,
     chainTriggerDedupeTtlSeconds: env.CHAIN_TRIGGER_DEDUPE_TTL_SECONDS,
     chainTriggerWalletRefreshIntervalMs: env.CHAIN_TRIGGER_WALLET_REFRESH_INTERVAL_MS,
@@ -616,6 +710,7 @@ async function bootstrap(): Promise<void> {
   workerLogger.info("worker.config_validated", startupConfig);
 
   const shutdown = async () => {
+    clearInterval(runtimeConfigRefresh);
     clearInterval(heartbeat);
     await writeRedisSystemStatus(
       prisma,

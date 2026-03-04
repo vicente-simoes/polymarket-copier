@@ -14,6 +14,7 @@
     "test:integration": "pnpm generate && node --import tsx --test src/integration.test.ts",
     "generate": "prisma generate --schema prisma/schema.prisma",
     "seed": "pnpm generate && node --import tsx prisma/seed.ts",
+    "seed:global-runtime": "pnpm generate && node --import tsx prisma/seed-global-runtime-config.ts",
     "migrate:deploy": "prisma migrate deploy --schema prisma/schema.prisma",
     "migrate:status": "prisma migrate status --schema prisma/schema.prisma"
   },

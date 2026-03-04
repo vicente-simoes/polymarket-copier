@@ -60,11 +60,26 @@ export class ReconcileEngine {
       return;
     }
 
-    this.interval = setInterval(() => {
-      void this.run();
-    }, this.config.intervalMs);
+    if (!this.interval) {
+      this.startInterval();
+    }
 
     void this.run();
+  }
+
+  setIntervalMs(intervalMs: number): void {
+    const normalized = Math.max(1000, Math.trunc(intervalMs));
+    if (this.config.intervalMs === normalized) {
+      return;
+    }
+
+    this.config.intervalMs = normalized;
+    if (!this.interval) {
+      return;
+    }
+
+    clearInterval(this.interval);
+    this.startInterval();
   }
 
   stop(): void {
@@ -202,6 +217,12 @@ export class ReconcileEngine {
       openAttemptCollisions,
       duplicateDecisionExecutions
     };
+  }
+
+  private startInterval(): void {
+    this.interval = setInterval(() => {
+      void this.run();
+    }, this.config.intervalMs);
   }
 
   private async detectIssues(input: {

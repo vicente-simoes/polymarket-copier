@@ -17,12 +17,26 @@ interface PendingState extends PendingDeltaRecord {
   metadata: Record<string, unknown>;
 }
 
+interface CreatedAttemptInput {
+  copyProfileId: string;
+  pendingDeltaId: string;
+  tokenId: string;
+  marketId?: string;
+  side: PendingDeltaSide;
+  pendingDeltaShares: number;
+  pendingDeltaNotionalUsd: number;
+  expiresAt: Date;
+  maxRetries: number;
+  idempotencyKey: string;
+}
+
 class FakeTargetStore implements TargetNettingStore {
   profiles: ActiveCopyProfile[] = [];
   leaderPositions: LeaderPositionPoint[] = [];
   followerByProfile = new Map<string, FollowerPositionPoint[]>();
   pendingInputs: PendingDeltaInput[] = [];
   attempts = new Map<string, OpenCopyAttemptRecord>();
+  createdAttempts: CreatedAttemptInput[] = [];
 
   private readonly pendingByKey = new Map<string, PendingState>();
   private pendingSeq = 0;
@@ -125,6 +139,7 @@ class FakeTargetStore implements TargetNettingStore {
     maxRetries: number;
     idempotencyKey: string;
   }): Promise<void> {
+    this.createdAttempts.push(input);
     const id = `attempt-${++this.attemptSeq}`;
     this.attempts.set(id, {
       id,
@@ -144,7 +159,7 @@ test("Stage 8 small deltas accumulate into eligible attempts once notional thres
     {
       copyProfileId: "cp-1",
       defaultRatio: 0.1,
-      leaders: [{ leaderId: "leader-1", ratio: 0.1 }]
+      leaders: [{ leaderId: "leader-1", ratio: 0.1, settings: {} }]
     }
   ];
 
@@ -221,7 +236,7 @@ test("Stage 8 price preference uses curPrice over market mid and does not block 
     {
       copyProfileId: "cp-2",
       defaultRatio: 0.1,
-      leaders: [{ leaderId: "leader-2", ratio: 0.1 }]
+      leaders: [{ leaderId: "leader-2", ratio: 0.1, settings: {} }]
     }
   ];
   store.leaderPositions = [
@@ -271,7 +286,7 @@ test("Stage 8 applies tracking error threshold before creating attempts", async 
     {
       copyProfileId: "cp-3",
       defaultRatio: 1,
-      leaders: [{ leaderId: "leader-3", ratio: 1 }]
+      leaders: [{ leaderId: "leader-3", ratio: 1, settings: {} }]
     }
   ];
   store.leaderPositions = [
@@ -320,13 +335,310 @@ test("Stage 8 applies tracking error threshold before creating attempts", async 
   assert.equal(store.attempts.size, 0);
 });
 
+test("Stage 8 applies per-leader allow and deny market lists before token aggregation", async () => {
+  const store = new FakeTargetStore();
+  store.profiles = [
+    {
+      copyProfileId: "cp-allow-deny",
+      defaultRatio: 1,
+      leaders: [{ leaderId: "leader-allow-deny", ratio: 1, settings: { allowList: ["market-a"], denyList: ["market-b"] } }]
+    }
+  ];
+  store.leaderPositions = [
+    {
+      leaderId: "leader-allow-deny",
+      tokenId: "token-allow",
+      marketId: "market-a",
+      shares: 2,
+      currentPrice: 1,
+      currentValueUsd: 2
+    },
+    {
+      leaderId: "leader-allow-deny",
+      tokenId: "token-deny",
+      marketId: "market-b",
+      shares: 2,
+      currentPrice: 1,
+      currentValueUsd: 2
+    },
+    {
+      leaderId: "leader-allow-deny",
+      tokenId: "token-outside-allow",
+      marketId: "market-c",
+      shares: 2,
+      currentPrice: 1,
+      currentValueUsd: 2
+    }
+  ];
+
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 1,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    resolvePriceSnapshot: async (tokenId, marketId) => ({
+      tokenId,
+      marketId,
+      midPrice: 1,
+      minOrderSize: 0,
+      source: "MARKET_WS"
+    })
+  });
+
+  await engine.run();
+
+  assert.ok(store.getPending("cp-allow-deny", "token-allow", "BUY"));
+  assert.equal(store.getPending("cp-allow-deny", "token-deny", "BUY"), undefined);
+  assert.equal(store.getPending("cp-allow-deny", "token-outside-allow", "BUY"), undefined);
+});
+
+test("Stage 8 applies per-leader minDeltaNotional OR minDeltaShares eligibility", async () => {
+  const store = new FakeTargetStore();
+  store.profiles = [
+    {
+      copyProfileId: "cp-min-delta-or",
+      defaultRatio: 1,
+      leaders: [{ leaderId: "leader-min-delta-or", ratio: 1, settings: { minDeltaNotionalUsd: 2, minDeltaShares: 10 } }]
+    }
+  ];
+  store.leaderPositions = [
+    {
+      leaderId: "leader-min-delta-or",
+      tokenId: "token-notional-pass",
+      marketId: "market-notional-pass",
+      shares: 1,
+      currentPrice: 2,
+      currentValueUsd: 2
+    },
+    {
+      leaderId: "leader-min-delta-or",
+      tokenId: "token-shares-pass",
+      marketId: "market-shares-pass",
+      shares: 20,
+      currentPrice: 0.05,
+      currentValueUsd: 1
+    },
+    {
+      leaderId: "leader-min-delta-or",
+      tokenId: "token-fail",
+      marketId: "market-fail",
+      shares: 5,
+      currentPrice: 0.1,
+      currentValueUsd: 0.5
+    }
+  ];
+
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 0.2,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    resolvePriceSnapshot: async (tokenId, marketId) => ({
+      tokenId,
+      marketId,
+      midPrice: 1,
+      minOrderSize: 0,
+      source: "MARKET_WS"
+    })
+  });
+
+  await engine.run();
+
+  assert.ok(store.getPending("cp-min-delta-or", "token-notional-pass", "BUY"));
+  assert.ok(store.getPending("cp-min-delta-or", "token-shares-pass", "BUY"));
+  assert.equal(store.getPending("cp-min-delta-or", "token-fail", "BUY"), undefined);
+});
+
+test("Stage 8 uses strictest contributor min-notional for multi-leader token eligibility", async () => {
+  const store = new FakeTargetStore();
+  store.profiles = [
+    {
+      copyProfileId: "cp-strictest-leader-min",
+      defaultRatio: 0.1,
+      leaders: [
+        { leaderId: "leader-1", ratio: 0.1, settings: { minNotionalPerOrderUsd: 1 } },
+        { leaderId: "leader-2", ratio: 0.1, settings: { minNotionalPerOrderUsd: 3 } }
+      ],
+      guardrailOverrides: {
+        minNotionalUsd: 0.5
+      }
+    }
+  ];
+  store.leaderPositions = [
+    {
+      leaderId: "leader-1",
+      tokenId: "token-shared",
+      marketId: "market-shared",
+      shares: 10,
+      currentPrice: 1,
+      currentValueUsd: 10
+    },
+    {
+      leaderId: "leader-2",
+      tokenId: "token-shared",
+      marketId: "market-shared",
+      shares: 15,
+      currentPrice: 1,
+      currentValueUsd: 15
+    }
+  ];
+
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 1,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    resolvePriceSnapshot: async (tokenId, marketId) => ({
+      tokenId,
+      marketId,
+      midPrice: 1,
+      minOrderSize: 0,
+      source: "MARKET_WS"
+    })
+  });
+
+  await engine.run();
+
+  const pending = store.getPending("cp-strictest-leader-min", "token-shared", "BUY");
+  assert.ok(pending);
+  assert.equal(pending.status, "PENDING");
+  assert.equal(pending.blockReason, "MIN_NOTIONAL");
+  assert.equal(store.pendingInputs[0]?.minExecutableNotionalUsd, 3);
+  assert.deepEqual((store.pendingInputs[0]?.metadata.contributorLeaderIds as string[] | undefined)?.sort(), ["leader-1", "leader-2"]);
+});
+
+test("Stage 8 uses copy-profile min-notional override when deciding eligibility", async () => {
+  const store = new FakeTargetStore();
+  store.profiles = [
+    {
+      copyProfileId: "cp-override-min",
+      defaultRatio: 0.1,
+      leaders: [{ leaderId: "leader-override-min", ratio: 0.1, settings: {} }],
+      guardrailOverrides: {
+        minNotionalUsd: 2
+      }
+    }
+  ];
+  store.leaderPositions = [
+    {
+      leaderId: "leader-override-min",
+      tokenId: "token-override-min",
+      marketId: "market-override-min",
+      shares: 15,
+      currentPrice: 1,
+      currentValueUsd: 15
+    }
+  ];
+
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 1,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    resolvePriceSnapshot: async (tokenId, marketId) => ({
+      tokenId,
+      marketId,
+      midPrice: 1,
+      minOrderSize: 0,
+      source: "MARKET_WS"
+    })
+  });
+
+  await engine.run();
+
+  const pending = store.getPending("cp-override-min", "token-override-min", "BUY");
+  assert.ok(pending);
+  assertApprox(pending.pendingDeltaNotionalUsd, 1.5);
+  assert.equal(pending.status, "PENDING");
+  assert.equal(pending.blockReason, "MIN_NOTIONAL");
+  assert.equal(store.attempts.size, 0);
+});
+
+test("Stage 8 uses copy-profile maxRetries and expiration overrides for new attempts", async () => {
+  const store = new FakeTargetStore();
+  const nowMs = 10_000_000;
+  store.profiles = [
+    {
+      copyProfileId: "cp-override-attempt",
+      defaultRatio: 0.1,
+      leaders: [{ leaderId: "leader-override-attempt", ratio: 0.1, settings: {} }],
+      guardrailOverrides: {
+        maxRetriesPerAttempt: 7,
+        attemptExpirationSeconds: 30
+      }
+    }
+  ];
+  store.leaderPositions = [
+    {
+      leaderId: "leader-override-attempt",
+      tokenId: "token-override-attempt",
+      marketId: "market-override-attempt",
+      shares: 100,
+      currentPrice: 1,
+      currentValueUsd: 100
+    }
+  ];
+
+  const engine = new TargetNettingEngine({
+    store,
+    config: {
+      enabled: true,
+      intervalMs: 5000,
+      minNotionalUsd: 1,
+      trackingErrorBps: 0,
+      maxRetriesPerAttempt: 20,
+      attemptExpirationSeconds: 120
+    },
+    now: () => nowMs,
+    resolvePriceSnapshot: async (tokenId, marketId) => ({
+      tokenId,
+      marketId,
+      midPrice: 1,
+      minOrderSize: 0,
+      source: "MARKET_WS"
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(store.createdAttempts.length, 1);
+  const created = store.createdAttempts[0];
+  assert.ok(created);
+  assert.equal(created.maxRetries, 7);
+  assert.equal(created.expiresAt.getTime(), nowMs + 30_000);
+
+  const pending = store.pendingInputs[0];
+  assert.ok(pending);
+  assert.equal(pending?.expiresAt.getTime(), nowMs + 30_000);
+});
+
 test("Stage 8 clears stale pending deltas when token disappears from leader and follower snapshots", async () => {
   const store = new FakeTargetStore();
   store.profiles = [
     {
       copyProfileId: "cp-4",
       defaultRatio: 1,
-      leaders: [{ leaderId: "leader-4", ratio: 1 }]
+      leaders: [{ leaderId: "leader-4", ratio: 1, settings: {} }]
     }
   ];
   store.leaderPositions = [];

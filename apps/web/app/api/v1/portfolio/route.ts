@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server'
+import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import {
   jsonContract,
@@ -222,14 +223,14 @@ export async function GET(request: NextRequest) {
     const totalPositions = filteredPositions.length
     const pagedPositions = filteredPositions.slice(pagination.skip, pagination.skip + pagination.pageSize)
 
-    const realizedPnlUsd =
-      (
-        await prisma.leaderPnlSummary.aggregate({
-          _sum: {
-            realizedPnlUsd: true
-          }
-        })
-      )._sum.realizedPnlUsd
+    const realizedPnlRows = await prisma.$queryRaw<Array<{ realizedPnlUsd: Prisma.Decimal | null }>>(
+      Prisma.sql`
+        SELECT SUM("realizedPnlUsd") AS "realizedPnlUsd"
+        FROM "LeaderPnlSummary"
+        WHERE "copyProfileId" = ${copyProfile.id}
+      `
+    )
+    const realizedPnlUsd = realizedPnlRows[0]?.realizedPnlUsd ?? null
 
     const realizedTotal = toNumber(realizedPnlUsd)
     const unrealizedTotal = sortedPositions.reduce((sum, row) => sum + row.unrealizedPnlUsd, 0)
@@ -302,23 +303,23 @@ export async function GET(request: NextRequest) {
     }
 
     const priceByToken = new Map(sortedPositions.map((position) => [position.tokenId, position.currentPrice]))
-    const leaderLedgers = await prisma.leaderTokenLedger.findMany({
-      select: {
-        leaderId: true,
-        tokenId: true,
-        shares: true,
-        leader: {
-          select: {
-            name: true
-          }
-        }
-      }
-    })
+    const leaderLedgers = await prisma.$queryRaw<Array<{ leaderId: string; tokenId: string; shares: Prisma.Decimal; leaderName: string }>>(
+      Prisma.sql`
+        SELECT
+          ltl."leaderId",
+          ltl."tokenId",
+          ltl."shares",
+          l."name" AS "leaderName"
+        FROM "LeaderTokenLedger" ltl
+        INNER JOIN "Leader" l ON l."id" = ltl."leaderId"
+        WHERE ltl."copyProfileId" = ${copyProfile.id}
+      `
+    )
 
     const leaderExposureMap = new Map<string, { leaderName: string; exposureUsd: number }>()
     for (const row of leaderLedgers) {
       const current = leaderExposureMap.get(row.leaderId) ?? {
-        leaderName: row.leader.name,
+        leaderName: row.leaderName,
         exposureUsd: 0
       }
       const markPrice = priceByToken.get(row.tokenId) ?? 0

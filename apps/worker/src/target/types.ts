@@ -1,15 +1,25 @@
+import type { ParsedLeaderSettings } from "../config/leader-settings.js";
+
 export type PendingDeltaSide = "BUY" | "SELL";
 export type PendingDeltaStatus = "PENDING" | "ELIGIBLE" | "BLOCKED";
 
 export interface ActiveCopyProfileLeader {
   leaderId: string;
   ratio: number;
+  settings: ParsedLeaderSettings;
+}
+
+export interface TargetGuardrailOverrides {
+  minNotionalUsd?: number;
+  maxRetriesPerAttempt?: number;
+  attemptExpirationSeconds?: number;
 }
 
 export interface ActiveCopyProfile {
   copyProfileId: string;
   defaultRatio: number;
   leaders: ActiveCopyProfileLeader[];
+  guardrailOverrides?: TargetGuardrailOverrides;
 }
 
 export interface LeaderPositionPoint {

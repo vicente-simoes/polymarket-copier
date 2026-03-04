@@ -336,7 +336,7 @@ With a small bankroll, we need to avoid death-by-a-thousand-cuts:
 - **Spend cap** per day and per hour
 - **Max exposure** per market
 - **Max number of open positions**
-- **Allow/deny lists** by market category/event/slug (future)
+- **Allow/deny lists** by market ID (implemented per leader); category/event/slug selectors are future
 - **Kill switch** from dashboard + env var “panic mode”
 - **Idempotency**: never execute the same rebalance decision twice
 - **Staleness guards**: don’t trade if price data is stale or book unavailable
@@ -358,7 +358,7 @@ This section turns the docs-driven order-type behavior into concrete rules so th
   - the intended `delta_shares`,
   - the computed `w[leader]` map (and any `UNATTRIBUTED` remainder),
   - and a stable internal idempotency key for retries.
-- When fills arrive (trade IDs from the user WS or REST), attribute each fill using the stored weights and write `copy_fill_allocation` rows; update the per-leader `leader_token_ledger`.
+- When fills arrive (trade IDs from the user WS or REST), attribute each fill using the stored weights and write `copy_fill_allocation` rows; update the per-leader `leader_token_ledger` scoped by `copyProfileId`.
 
 **Step 2 — Decide side and order type**
 - Default execution order type: **FAK**.
@@ -650,7 +650,7 @@ Access to dashboard pages and dashboard data APIs is restricted behind GitHub lo
 
 **Controls**
 - Activate / Pause copying for this leader
-- Edit ratio + per-leader rules (allow/deny markets, max exposure, min delta thresholds, slippage caps)
+- Edit ratio + per-leader rules (allow/deny by market ID, max exposure caps, daily turnover cap, min delta thresholds with OR semantics, slippage/max-price/min-notional overrides)
 
 **Leader stats**
 - Current target exposure vs current follower exposure attributable to this leader (and tracking error)
@@ -773,8 +773,8 @@ Unrealized PnL per leader at time `now`:
 **Data we must store (minimal, efficient)**
 - `copy_order` (one row per follower order attempt): includes `token_id`, `side`, intended size, `orderType`, timestamps, and `leader_weights` (JSON map `leader_id → weight`) + `unattributed_weight` if needed.
 - `copy_fill_allocation` (one row per fill per leader): `copy_order_id`, `trade_id`, `leader_id`, `token_id`, `shares_delta`, `usdc_delta`, `fee_usdc_delta`, `avg_price`, timestamp.
-- `leader_token_ledger` (one row per leader×token): `shares`, `cost_usdc`.
-- `leader_pnl_summary` (one row per leader): `realized_pnl_usdc` (unrealized computed on demand or cached in snapshots).
+- `leader_token_ledger` (one row per `copyProfileId`×leader×token): `shares`, `cost_usdc`.
+- `leader_pnl_summary` (one row per `copyProfileId`×leader): `realized_pnl_usdc` (unrealized computed on demand or cached in snapshots).
 
 **Positions table (current holdings)**
 
@@ -1023,7 +1023,11 @@ When the **copy system is disabled**, show additional switches directly below:
 At the top of this section:
 - Mode toggle: **Global guardrails** vs **Per-leader overrides**
   - Global values apply to all leaders by default.
-  - Per-leader overrides replace the global values only for that leader.
+  - Per-leader overrides replace global values for that leader; when one netted token has multiple contributing leaders, the strictest effective constraint is used.
+- Runtime precedence (implemented):
+  - Execution path: contributor per-leader override (for wired fields) → `copyProfile.config.guardrails` → env baseline.
+  - Target-netting path (`minNotionalPerOrderUsd`, `maxRetriesPerAttempt`, `attemptExpirationSeconds`): `copyProfile.config.guardrails` → env baseline.
+  - Config changes from the Config page apply on the next loop cycle (no worker restart required).
 
 Guardrails (with defaults):
 - **Max time before expiration**: default **2h**
@@ -1039,16 +1043,17 @@ Guardrails (with defaults):
   - If expected execution price for our size is worse than `mid ± slippage` (directional), block and retry later (until expiration).
 - **Max price per share**: default **OFF**
   - Optional cap (e.g., 97¢) to avoid buying very expensive YES/NO shares.
+  - Effective precedence: strictest contributor per-leader cap (lowest) → profile guardrail cap → env fallback (with existing `null` disable semantics).
 - **Max spread**: default **3¢**
   - If the bid/ask spread exceeds this, block execution and retry later (until expiration).
 - **Min notional per order**: default **$1.00** (Polymarket minimum)
 - **Min book depth for our size**: default **ON**
-  - Require that there is sufficient visible liquidity to fill our intended size within the computed price cap.
+  - Worker currently enforces depth checks in planning; the Config-page `minBookDepthForSizeEnabled` toggle is not yet wired (currently a no-op).
 
-Additional guardrails worth supporting (recommended):
-- **Max open orders (global)**: default **20**
-- **Cooldown per market** (seconds): default **5s** (avoid rapid retries on the same token)
-- **Max retries per attempt**: default **TBD** (or unlimited until expiration, with exponential backoff)
+Other guardrail controls:
+- **Max open orders (global)**: default **20** (Config-page field exists; currently not wired in worker execution).
+- **Cooldown per market** (seconds): default **5s** (wired; runtime-overridable from profile guardrails).
+- **Max retries per attempt**: wired from profile guardrails (env fallback used when unset).
 
 **Thin-book computation (how guards are evaluated)**
 - Use the current order book (best levels) to estimate the **VWAP** for our intended size.
@@ -1165,17 +1170,25 @@ These items were previously “open questions” and are now decided:
     - max slippage vs mid (**200 bps**),
     - and a thin-book rule that checks VWAP for our intended size before placing the order.
   - If a guardrail fails, we **retry with backoff until expiration** (default 2h).
+- **Config precedence / runtime behavior**
+  - Worker env values are fallback baselines.
+  - `copyProfile.config.guardrails` overrides env for wired fields in both execution and target netting.
+  - Per-leader settings override profile/global values where supported; updates are effective next loop cycle without restart.
 - **Multiple leaders**
   - Targets are combined by **summing per-leader scaled positions** into one net target portfolio.
   - Execution deltas are **netted per token** (if one leader is long and another is short, the net target reflects both).
+  - When a token has multiple contributing leaders, execution enforces strictest effective constraints deterministically.
 - **Fee handling**
   - Fees are captured on our fills and included in:
     - execution audit logs,
     - cost basis / PnL calculations,
     - and the **Copies page** (fee column in Executions).
+- **Leader attribution scope**
+  - Attribution ledger and realized PnL summaries are scoped by `copyProfileId` to avoid cross-profile contamination.
 - **Market selection**
-  - No special allowlist/cap is required for v0.1; we mirror whatever markets leaders hold/trade.
-  - We still avoid pathological markets via guardrails (spread/depth) and ignore resolved markets for new execution.
+  - Per-leader `allowList`/`denyList` are implemented and evaluated by **market ID** during target composition.
+  - Per-leader BUY caps are implemented (`maxDailyNotionalTurnoverUsd`, `maxExposurePerMarketOutcomeUsd`, `maxExposurePerLeaderUsd`); SELL is not blocked by these caps.
+  - BUY cap checks fail closed when required mark prices are unavailable/stale.
 - **On-chain trade detection**
   - We implement full ABI decoding for the exchange events and handle duplicates/reorgs correctly.
   - Dedupe is enforced both intra-source (`txHash + logIndex` for chain triggers) and cross-source (canonical trade key across WS + REST fallback).

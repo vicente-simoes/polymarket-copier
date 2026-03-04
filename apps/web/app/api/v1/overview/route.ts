@@ -1,4 +1,5 @@
 import { NextRequest } from 'next/server'
+import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { jsonContract, jsonError, parseNumber, toIso, toNumber } from '@/lib/server/api'
 import { resolveSystemConfig } from '@/lib/server/config'
@@ -182,35 +183,42 @@ export async function GET(request: NextRequest) {
               }
             })
           : Promise.resolve([]),
-        prisma.leaderTokenLedger.findMany({
-          select: {
-            leaderId: true,
-            tokenId: true,
-            shares: true,
-            costUsd: true,
-            leader: {
-              select: {
-                name: true
-              }
-            }
-          }
-        }),
-        prisma.leaderPnlSummary.findMany({
-          select: {
-            leaderId: true,
-            realizedPnlUsd: true,
-            leader: {
-              select: {
-                name: true
-              }
-            }
-          }
-        }),
+        copyProfile
+          ? prisma.$queryRaw<
+              Array<{ leaderId: string; tokenId: string; shares: Prisma.Decimal; costUsd: Prisma.Decimal; leaderName: string }>
+            >(
+              Prisma.sql`
+                SELECT
+                  ltl."leaderId",
+                  ltl."tokenId",
+                  ltl."shares",
+                  ltl."costUsd",
+                  l."name" AS "leaderName"
+                FROM "LeaderTokenLedger" ltl
+                INNER JOIN "Leader" l ON l."id" = ltl."leaderId"
+                WHERE ltl."copyProfileId" = ${copyProfile.id}
+              `
+            )
+          : Promise.resolve([]),
+        copyProfile
+          ? prisma.$queryRaw<Array<{ leaderId: string; realizedPnlUsd: Prisma.Decimal; leaderName: string }>>(
+              Prisma.sql`
+                SELECT
+                  lps."leaderId",
+                  lps."realizedPnlUsd",
+                  l."name" AS "leaderName"
+                FROM "LeaderPnlSummary" lps
+                INNER JOIN "Leader" l ON l."id" = lps."leaderId"
+                WHERE lps."copyProfileId" = ${copyProfile.id}
+              `
+            )
+          : Promise.resolve([]),
         prisma.copyOrder.findMany({
           where: {
             status: {
               in: ['PLACED', 'PARTIALLY_FILLED', 'FILLED']
-            }
+            },
+            ...(copyProfile ? { copyProfileId: copyProfile.id } : {})
           },
           orderBy: {
             attemptedAt: 'desc'
@@ -239,6 +247,7 @@ export async function GET(request: NextRequest) {
         }),
         prisma.copyAttempt.findMany({
           where: {
+            ...(copyProfile ? { copyProfileId: copyProfile.id } : {}),
             OR: [
               {
                 decision: 'SKIPPED'
@@ -364,7 +373,7 @@ export async function GET(request: NextRequest) {
 
     for (const row of leaderPnl) {
       leaderPnlMap.set(row.leaderId, {
-        leaderName: row.leader.name,
+        leaderName: row.leaderName,
         realizedPnlUsd: toNumber(row.realizedPnlUsd),
         unrealizedPnlUsd: 0,
         exposureUsd: 0
@@ -378,7 +387,7 @@ export async function GET(request: NextRequest) {
       const markValueUsd = shares * tokenPrice
 
       const current = leaderPnlMap.get(row.leaderId) ?? {
-        leaderName: row.leader.name,
+        leaderName: row.leaderName,
         realizedPnlUsd: 0,
         unrealizedPnlUsd: 0,
         exposureUsd: 0

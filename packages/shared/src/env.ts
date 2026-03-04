@@ -125,15 +125,18 @@ export const WorkerEnvSchema = z.object({
   MAX_SLIPPAGE_BPS: z.coerce.number().int().nonnegative().default(200),
   MAX_SPREAD_USD: z.coerce.number().nonnegative().default(0.03),
   MAX_PRICE_PER_SHARE_USD: optionalPositiveNumberFromEnv,
+  MIN_BOOK_DEPTH_FOR_SIZE_ENABLED: booleanFromEnv.default(true),
   ATTEMPT_EXPIRATION_SECONDS: z.coerce.number().int().positive().default(7200),
   COOLDOWN_PER_MARKET_SECONDS: z.coerce.number().int().nonnegative().default(5),
+  MAX_OPEN_ORDERS: z.coerce.number().int().positive().default(20),
   MAX_EXPOSURE_PER_LEADER_USD: z.coerce.number().positive().default(100),
   MAX_EXPOSURE_PER_MARKET_OUTCOME_USD: z.coerce.number().positive().default(50),
   MAX_HOURLY_NOTIONAL_TURNOVER_USD: z.coerce.number().positive().default(25),
   MAX_DAILY_NOTIONAL_TURNOVER_USD: z.coerce.number().positive().default(100),
   MAX_RETRIES_PER_ATTEMPT: z.coerce.number().int().nonnegative().default(20),
   WORKER_HEALTH_PORT: z.coerce.number().int().positive().default(4001),
-  WORKER_HEARTBEAT_INTERVAL_MS: z.coerce.number().int().positive().default(10000)
+  WORKER_HEARTBEAT_INTERVAL_MS: z.coerce.number().int().positive().default(10000),
+  WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS: z.coerce.number().int().positive().default(5000)
 });
 
 export type WorkerEnv = z.infer<typeof WorkerEnvSchema>;

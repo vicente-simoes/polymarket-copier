@@ -328,6 +328,43 @@ test("Parse starvation degrades health once and clears on recovery", async () =>
   assert.equal(recovered.degradedReason, undefined);
 });
 
+test("fill attribution runtime enable toggle delegates to start/stop", () => {
+  const store = new FakeFillStore();
+  const service = new FillAttributionService({
+    store,
+    config: {
+      enabled: false,
+      url: "wss://ws.example",
+      apiKey: "key",
+      apiSecret: "secret",
+      passphrase: "pass",
+      parseStarvationWindowMs: 5_000,
+      parseStarvationMinMessages: 3,
+      parseStarvationCheckIntervalMs: 1_000
+    },
+    now: () => 1_000
+  });
+
+  let starts = 0;
+  let stops = 0;
+  const mutable = service as unknown as { start: () => void; stop: () => void };
+  mutable.start = () => {
+    starts += 1;
+  };
+  mutable.stop = () => {
+    stops += 1;
+  };
+
+  service.setEnabled(true);
+  service.setEnabled(true);
+  service.setEnabled(false);
+  service.setEnabled(false);
+
+  assert.equal(starts, 1);
+  assert.equal(stops, 1);
+  assert.equal(service.getStatus().enabled, false);
+});
+
 function makeTradeEvent(overrides: Partial<UserTradeFillEvent>): UserTradeFillEvent {
   return {
     externalTradeId: overrides.externalTradeId ?? "trade-1",
