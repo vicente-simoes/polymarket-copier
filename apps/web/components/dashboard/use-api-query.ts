@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchApi } from '@/lib/api-client'
 
 interface QueryState<TData> {
@@ -18,6 +18,7 @@ interface ApiQueryOptions {
 export function useApiQuery<TData>(url: string, options?: ApiQueryOptions) {
   const enabled = options?.enabled ?? true
   const refreshIntervalMs = options?.refreshIntervalMs ?? 0
+  const inFlightRef = useRef(false)
   const [state, setState] = useState<QueryState<TData>>({
     data: null,
     generatedAt: null,
@@ -29,6 +30,10 @@ export function useApiQuery<TData>(url: string, options?: ApiQueryOptions) {
     if (!enabled) {
       return
     }
+    if (inFlightRef.current) {
+      return
+    }
+    inFlightRef.current = true
 
     setState((previous) => ({
       ...previous,
@@ -50,6 +55,8 @@ export function useApiQuery<TData>(url: string, options?: ApiQueryOptions) {
         isLoading: false,
         error: error instanceof Error ? error.message : String(error)
       }))
+    } finally {
+      inFlightRef.current = false
     }
   }, [enabled, url])
 

@@ -360,7 +360,7 @@ export default function CopiesPage() {
   }, [section, page, selectedSkippedToken])
 
   const { data, generatedAt, isLoading, error, refresh } = useApiQuery<CopiesData>(query, {
-    refreshIntervalMs: 10_000
+    refreshIntervalMs: 30_000
   })
 
   if (isLoading && !data) {

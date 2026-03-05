@@ -122,7 +122,7 @@ export default function TradesPage() {
     })
   }, [leaderFilter, sourceFilter, searchFilter, page])
 
-  const tradesState = useApiQuery<TradesData>(query, { refreshIntervalMs: 15_000 })
+  const tradesState = useApiQuery<TradesData>(query, { refreshIntervalMs: 30_000 })
   const leadersState = useApiQuery<LeaderListForFilter>('/api/v1/leaders?page=1&pageSize=200', {
     refreshIntervalMs: 30_000
   })

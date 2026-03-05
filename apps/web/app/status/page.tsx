@@ -170,7 +170,7 @@ const outlineButtonClass = 'rounded-xl border-white/10 bg-white/[0.02] text-[#E7
 
 export default function StatusPage() {
   const { data, generatedAt, isLoading, error, refresh } = useApiQuery<StatusData>('/api/v1/status', {
-    refreshIntervalMs: 10_000
+    refreshIntervalMs: 30_000
   })
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null)
 
