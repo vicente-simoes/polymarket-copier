@@ -1,26 +1,13 @@
 import { redirect } from 'next/navigation'
 import { auth, signIn } from '@/auth'
 
-type RawSearchParams = Record<string, string | string[] | undefined>
+type LoginSearchParams = {
+  next?: string | string[]
+  error?: string | string[]
+}
 
 interface LoginPageProps {
-  searchParams?: RawSearchParams | Promise<RawSearchParams>
-}
-
-function isPromiseLike<T>(value: unknown): value is Promise<T> {
-  return typeof value === 'object' && value !== null && 'then' in value
-}
-
-async function resolveSearchParams(input: LoginPageProps['searchParams']): Promise<RawSearchParams> {
-  if (!input) {
-    return {}
-  }
-
-  if (isPromiseLike<RawSearchParams>(input)) {
-    return input
-  }
-
-  return input
+  searchParams?: Promise<LoginSearchParams>
 }
 
 function firstParam(value: string | string[] | undefined): string | null {
@@ -64,7 +51,7 @@ function errorMessage(error: string | null): string | null {
 }
 
 export default async function LoginPage(props: LoginPageProps) {
-  const searchParams = await resolveSearchParams(props.searchParams)
+  const searchParams = (await props.searchParams) ?? {}
   const nextPath = sanitizeNextPath(firstParam(searchParams.next))
   const error = firstParam(searchParams.error)
   const session = await auth()
