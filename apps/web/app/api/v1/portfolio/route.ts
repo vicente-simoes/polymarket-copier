@@ -468,6 +468,7 @@ async function resolveMarketNamesByToken(tokenIds: string[]): Promise<Map<string
   if (uniqueTokenIds.length === 0) {
     return names
   }
+  const lookupTake = Math.max(200, uniqueTokenIds.length * 8)
 
   const leaderPositionRows = await prisma.leaderPositionSnapshot.findMany({
     where: {
@@ -481,7 +482,8 @@ async function resolveMarketNamesByToken(tokenIds: string[]): Promise<Map<string
     select: {
       tokenId: true,
       payload: true
-    }
+    },
+    take: lookupTake
   })
 
   for (const row of leaderPositionRows) {
@@ -511,7 +513,8 @@ async function resolveMarketNamesByToken(tokenIds: string[]): Promise<Map<string
     select: {
       tokenId: true,
       payload: true
-    }
+    },
+    take: lookupTake
   })
 
   for (const row of leaderTradeRows) {
