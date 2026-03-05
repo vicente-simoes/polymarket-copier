@@ -11,6 +11,7 @@ import {
   toNumber
 } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
+import { resolveTokenDisplayMetadata } from '@/lib/server/token-display-metadata'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -186,6 +187,8 @@ export async function GET(request: NextRequest) {
           })
         : []
 
+    const tokenMetadata = await resolveTokenDisplayMetadata(positions.map((row) => row.tokenId))
+
     const basePositions = positions
       .map((row) => {
         const shares = toNumber(row.shares)
@@ -197,7 +200,7 @@ export async function GET(request: NextRequest) {
         return {
           tokenId: row.tokenId,
           marketId: row.marketId,
-          marketName: extractMarketNameFromPayload(row.payload),
+          marketName: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
           outcome: row.outcome,
           shares,
           currentPrice,
@@ -206,15 +209,8 @@ export async function GET(request: NextRequest) {
           unrealizedPnlUsd
         }
       })
-    const fallbackMarketNames = await resolveMarketNamesByToken(
-      basePositions.filter((row) => !row.marketName).map((row) => row.tokenId)
-    )
 
     const sortedPositions = basePositions
-      .map((row) => ({
-        ...row,
-        marketName: row.marketName ?? fallbackMarketNames.get(row.tokenId) ?? null
-      }))
       .sort((a, b) => Math.abs(b.currentValueUsd) - Math.abs(a.currentValueUsd))
 
     const filteredPositions = tokenIdFilter
@@ -426,106 +422,4 @@ function toErrorMessage(error: unknown): string {
     return error.message
   }
   return String(error)
-}
-
-function asObject(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {}
-  }
-  return value as Record<string, unknown>
-}
-
-function readString(value: unknown): string | null {
-  if (typeof value !== 'string') {
-    return null
-  }
-  const trimmed = value.trim()
-  return trimmed.length > 0 ? trimmed : null
-}
-
-function extractMarketNameFromPayload(payload: unknown): string | null {
-  const obj = asObject(payload)
-  const direct =
-    readString(obj.marketTitle) ??
-    readString(obj.marketName) ??
-    readString(obj.title) ??
-    readString(obj.slug)
-  if (direct) {
-    return direct
-  }
-
-  const raw = asObject(obj.raw)
-  return (
-    readString(raw.title) ??
-    readString(raw.slug) ??
-    null
-  )
-}
-
-async function resolveMarketNamesByToken(tokenIds: string[]): Promise<Map<string, string>> {
-  const uniqueTokenIds = [...new Set(tokenIds.map((tokenId) => tokenId.trim()).filter((tokenId) => tokenId.length > 0))]
-  const names = new Map<string, string>()
-  if (uniqueTokenIds.length === 0) {
-    return names
-  }
-  const lookupTake = Math.max(200, uniqueTokenIds.length * 8)
-
-  const leaderPositionRows = await prisma.leaderPositionSnapshot.findMany({
-    where: {
-      tokenId: {
-        in: uniqueTokenIds
-      }
-    },
-    orderBy: {
-      snapshotAt: 'desc'
-    },
-    select: {
-      tokenId: true,
-      payload: true
-    },
-    take: lookupTake
-  })
-
-  for (const row of leaderPositionRows) {
-    if (names.has(row.tokenId)) {
-      continue
-    }
-    const name = extractMarketNameFromPayload(row.payload)
-    if (name) {
-      names.set(row.tokenId, name)
-    }
-  }
-
-  const unresolved = uniqueTokenIds.filter((tokenId) => !names.has(tokenId))
-  if (unresolved.length === 0) {
-    return names
-  }
-
-  const leaderTradeRows = await prisma.leaderTradeEvent.findMany({
-    where: {
-      tokenId: {
-        in: unresolved
-      }
-    },
-    orderBy: {
-      leaderFillAtMs: 'desc'
-    },
-    select: {
-      tokenId: true,
-      payload: true
-    },
-    take: lookupTake
-  })
-
-  for (const row of leaderTradeRows) {
-    if (names.has(row.tokenId)) {
-      continue
-    }
-    const name = extractMarketNameFromPayload(row.payload)
-    if (name) {
-      names.set(row.tokenId, name)
-    }
-  }
-
-  return names
 }

@@ -2,6 +2,7 @@ import { Prisma, PrismaClient } from "@copybot/db";
 import type { DataApiPosition } from "@copybot/shared";
 import type { LeaderDataApiClient } from "../leader/types.js";
 import type { ReconcileAuditRecord, ReconcileStore } from "./types.js";
+import { PrismaTokenMetadataStore } from "../token-metadata/store.js";
 
 interface PrismaReconcileStoreOptions {
   prisma: PrismaClient;
@@ -17,6 +18,7 @@ export class PrismaReconcileStore implements ReconcileStore {
   private readonly dataApiPageLimit: number;
   private readonly dataApiMaxPages: number;
   private readonly followerAddressFallback?: string;
+  private readonly tokenMetadataStore: PrismaTokenMetadataStore;
 
   constructor(prismaOrOptions: PrismaClient | PrismaReconcileStoreOptions) {
     if ("$connect" in prismaOrOptions) {
@@ -25,6 +27,7 @@ export class PrismaReconcileStore implements ReconcileStore {
       this.dataApiPageLimit = 100;
       this.dataApiMaxPages = 20;
       this.followerAddressFallback = undefined;
+      this.tokenMetadataStore = new PrismaTokenMetadataStore(prismaOrOptions);
       return;
     }
 
@@ -33,6 +36,7 @@ export class PrismaReconcileStore implements ReconcileStore {
     this.dataApiPageLimit = Math.max(1, prismaOrOptions.dataApiPageLimit ?? 100);
     this.dataApiMaxPages = Math.max(1, prismaOrOptions.dataApiMaxPages ?? 20);
     this.followerAddressFallback = normalizeAddress(prismaOrOptions.followerAddressFallback ?? undefined) ?? undefined;
+    this.tokenMetadataStore = new PrismaTokenMetadataStore(prismaOrOptions.prisma);
   }
 
   async listActiveCopyProfileIds(): Promise<string[]> {
@@ -149,6 +153,7 @@ export class PrismaReconcileStore implements ReconcileStore {
         rebuiltAtMs: args.snapshotAtMs
       }
     });
+    await this.tokenMetadataStore.upsertFromDataApiPositions(positions, args.snapshotAt);
 
     return {
       tokensSnapshotted: rows.length,

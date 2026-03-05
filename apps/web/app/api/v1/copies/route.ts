@@ -3,6 +3,7 @@ import { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { jsonContract, jsonError, paginationMeta, parsePagination, toIso, toNumber } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
+import { resolveTokenDisplayMetadata } from '@/lib/server/token-display-metadata'
 import { fetchWorkerHealth, fetchWorkerMarketBooks } from '@/lib/server/worker-health'
 
 export const runtime = 'nodejs'
@@ -342,7 +343,7 @@ export async function GET(request: NextRequest) {
           }
         })
       ])
-      const tokenMetadata = await resolveTokenMetadataByToken(rows.map((row) => row.tokenId))
+      const tokenMetadata = await resolveTokenDisplayMetadata(rows.map((row) => row.tokenId))
       const leaderNamesByRow = await resolveOpenLeaderNames(rows)
 
       return jsonContract(
@@ -446,7 +447,7 @@ export async function GET(request: NextRequest) {
         })
       ])
 
-      const tokenMetadata = await resolveTokenMetadataByToken(rows.map((row) => row.tokenId))
+      const tokenMetadata = await resolveTokenDisplayMetadata(rows.map((row) => row.tokenId))
       const spreadByToken = await resolveCurrentSpreadsByToken(rows.map((row) => row.tokenId))
       const leaderNamesByRow = await resolveOpenLeaderNames(
         rows.map((row) => ({
@@ -575,7 +576,7 @@ export async function GET(request: NextRequest) {
           }
         })
       ])
-      const tokenMetadata = await resolveTokenMetadataByToken(rows.map((row) => row.tokenId))
+      const tokenMetadata = await resolveTokenDisplayMetadata(rows.map((row) => row.tokenId))
 
       return jsonContract(
         CopiesDataSchema,
@@ -659,7 +660,7 @@ export async function GET(request: NextRequest) {
           }
         })
       ])
-      const tokenMetadata = await resolveTokenMetadataByToken(details.map((row) => row.tokenId))
+      const tokenMetadata = await resolveTokenDisplayMetadata(details.map((row) => row.tokenId))
 
       return jsonContract(
         CopiesDataSchema,
@@ -723,7 +724,7 @@ export async function GET(request: NextRequest) {
 
     const total = sortedGroups.length
     const paged = sortedGroups.slice(pagination.skip, pagination.skip + pagination.pageSize)
-    const tokenMetadata = await resolveTokenMetadataByToken(paged.map((row) => row.tokenId))
+    const tokenMetadata = await resolveTokenDisplayMetadata(paged.map((row) => row.tokenId))
 
     const topReasonByKey = new Map<string, string | null>()
     for (const group of reasonCounts) {
@@ -787,165 +788,11 @@ function asObject(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-type TokenMetadata = {
-  marketId: string | null
-  marketLabel: string | null
-  marketSlug: string | null
-  outcome: string | null
-}
-
 interface OpenRowLeaderMetaInput {
   id: string
   leaderId: string | null
   leader?: { name: string } | null
   metadata: unknown
-}
-
-async function resolveTokenMetadataByToken(tokenIds: string[]): Promise<Map<string, TokenMetadata>> {
-  const uniqueTokenIds = [...new Set(tokenIds.filter((value) => value.length > 0))]
-  if (uniqueTokenIds.length === 0) {
-    return new Map()
-  }
-
-  const metadata = new Map<string, TokenMetadata>()
-
-  const [tradeRows, leaderPositionRows, followerPositionRows] = await Promise.all([
-    prisma.leaderTradeEvent.findMany({
-      where: {
-        tokenId: { in: uniqueTokenIds }
-      },
-      orderBy: {
-        detectedAtMs: 'desc'
-      },
-      select: {
-        tokenId: true,
-        marketId: true,
-        outcome: true,
-        payload: true
-      },
-      take: Math.max(200, uniqueTokenIds.length * 8)
-    }),
-    prisma.leaderPositionSnapshot.findMany({
-      where: {
-        tokenId: { in: uniqueTokenIds }
-      },
-      orderBy: {
-        snapshotAt: 'desc'
-      },
-      select: {
-        tokenId: true,
-        marketId: true,
-        outcome: true,
-        payload: true
-      },
-      take: Math.max(200, uniqueTokenIds.length * 8)
-    }),
-    prisma.followerPositionSnapshot.findMany({
-      where: {
-        tokenId: { in: uniqueTokenIds }
-      },
-      orderBy: {
-        snapshotAt: 'desc'
-      },
-      select: {
-        tokenId: true,
-        marketId: true,
-        outcome: true,
-        payload: true
-      },
-      take: Math.max(200, uniqueTokenIds.length * 8)
-    })
-  ])
-
-  const applyRow = (row: { tokenId: string; marketId: string | null; outcome: string | null; payload: unknown }) => {
-    const current = metadata.get(row.tokenId) ?? {
-      marketId: null,
-      marketLabel: null,
-      marketSlug: null,
-      outcome: null
-    }
-
-    const payloadInfo = extractMarketMetadataFromPayload(row.payload)
-    const next: TokenMetadata = {
-      marketId: current.marketId ?? row.marketId ?? payloadInfo.marketId ?? null,
-      marketLabel: current.marketLabel ?? payloadInfo.marketLabel ?? null,
-      marketSlug: choosePreferredMarketSlug(current.marketSlug, payloadInfo.marketSlug) ?? null,
-      outcome: current.outcome ?? row.outcome ?? payloadInfo.outcome ?? null
-    }
-
-    if (next.marketId || next.marketLabel || next.outcome) {
-      metadata.set(row.tokenId, next)
-    }
-  }
-
-  for (const row of tradeRows) {
-    applyRow(row)
-  }
-  for (const row of leaderPositionRows) {
-    applyRow(row)
-  }
-  for (const row of followerPositionRows) {
-    applyRow(row)
-  }
-
-  return metadata
-}
-
-function extractMarketMetadataFromPayload(payload: unknown): Partial<TokenMetadata> {
-  const root = asObject(payload)
-  const raw = asObject(root.raw)
-
-  const title = readString(raw, 'title')
-  const slug = readString(raw, 'slug')
-  const eventSlug = readString(raw, 'eventSlug')
-  const marketSlug = buildPolymarketEventPath(eventSlug, slug)
-  const marketId = readString(raw, 'conditionId') ?? readString(raw, 'market')
-  const outcome = readString(raw, 'outcome')
-
-  return {
-    marketId: marketId ?? null,
-    marketLabel: title ?? slug ?? eventSlug ?? null,
-    marketSlug: marketSlug ?? null,
-    outcome: outcome ?? null
-  }
-}
-
-function buildPolymarketEventPath(eventSlug: string | undefined, marketSlug: string | undefined): string | undefined {
-  const normalizedEvent = normalizeSlugSegment(eventSlug)
-  const normalizedMarket = normalizeSlugSegment(marketSlug)
-
-  if (normalizedEvent && normalizedMarket && normalizedEvent !== normalizedMarket) {
-    return `${normalizedEvent}/${normalizedMarket}`
-  }
-
-  return normalizedMarket ?? normalizedEvent
-}
-
-function normalizeSlugSegment(value: string | undefined): string | undefined {
-  if (!value) {
-    return undefined
-  }
-  const normalized = value.trim().replace(/^\/+|\/+$/g, '')
-  return normalized.length > 0 ? normalized : undefined
-}
-
-function choosePreferredMarketSlug(
-  currentSlug: string | null | undefined,
-  nextSlug: string | null | undefined
-): string | undefined {
-  const normalizedCurrent = normalizeSlugSegment(currentSlug ?? undefined)
-  const normalizedNext = normalizeSlugSegment(nextSlug ?? undefined)
-
-  if (!normalizedCurrent) {
-    return normalizedNext
-  }
-  if (!normalizedNext) {
-    return normalizedCurrent
-  }
-  if (!normalizedCurrent.includes('/') && normalizedNext.includes('/')) {
-    return normalizedNext
-  }
-  return normalizedCurrent
 }
 
 function readString(record: Record<string, unknown>, key: string): string | undefined {

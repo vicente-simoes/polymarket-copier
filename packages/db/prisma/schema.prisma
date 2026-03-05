@@ -309,6 +309,21 @@ model FollowerPositionSnapshot {
   @@index([tokenId, snapshotAt])
 }
 
+model TokenMetadata {
+  tokenId     String   @id
+  marketId    String?
+  title       String?
+  slug        String?
+  eventSlug   String?
+  outcome     String?
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([marketId])
+}
+
 model PendingDelta {
   id                     String             @id @default(cuid())
   copyProfileId          String

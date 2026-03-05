@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "echo \"no lint config yet\"",
     "test": "node --import tsx --test test/**/*.test.ts",
+    "backfill:token-metadata": "node --import tsx src/scripts/backfill-token-metadata.ts",
     "fills:backfill": "node --import tsx src/scripts/fills-backfill.ts",
     "ledger:rebuild": "node --import tsx src/scripts/rebuild-leader-ledger.ts"
   },

@@ -71,3 +71,13 @@ export {
   type DataApiPosition,
   type ClobBookSummary
 } from "./schemas/external.js";
+
+export {
+  buildPolymarketMarketPath,
+  extractTokenDisplayMetadataFromPayload,
+  mergeTokenDisplayMetadata,
+  toTokenDisplayMetadataView,
+  type TokenDisplayMetadataObservation,
+  type TokenDisplayMetadataRecord,
+  type TokenDisplayMetadataView
+} from "./domain/token-display-metadata.js";

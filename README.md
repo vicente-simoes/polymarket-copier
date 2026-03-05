@@ -53,6 +53,8 @@ Dashboard preview:
    - `pnpm install`
 4. Start full stack with Docker Compose:
    - `pnpm compose:up`
+5. For Prisma DB operations in Docker, use the `worker` container as the runner:
+   - `docker compose --env-file .env -f docker/docker-compose.yml exec -T worker pnpm --filter @copybot/db migrate:deploy`
 
 ## Polymarket Trading Credentials
 
@@ -98,7 +100,7 @@ Compose and Docker assets live under `docker/`:
 - `worker` -> copy engine process with health endpoint on `/health`
 - `postgres` -> durable data store (named volume)
 - `redis` -> cache/ephemeral store (named volume)
-- `migrate` -> one-shot Prisma migration job that must complete before `worker` starts
+- `migrate` -> optional one-shot Prisma migration job; on long-lived Docker hosts, prefer running Prisma commands through `worker` because it uses the same image/env path already proven to talk to Postgres
 
 ## Dev Infra Commands
 
@@ -126,10 +128,13 @@ Compose and Docker assets live under `docker/`:
   - `pnpm --filter @copybot/db generate`
 - Apply migrations:
   - `pnpm --filter @copybot/db migrate:deploy`
+  - Docker/recommended: `docker compose --env-file .env -f docker/docker-compose.yml exec -T worker pnpm --filter @copybot/db migrate:deploy`
 - Check migration status:
   - `pnpm --filter @copybot/db migrate:status`
+  - Docker/recommended: `docker compose --env-file .env -f docker/docker-compose.yml exec -T worker pnpm --filter @copybot/db migrate:status`
 - Seed bootstrap data:
   - `pnpm --filter @copybot/db seed`
+  - Docker/recommended: `docker compose --env-file .env -f docker/docker-compose.yml exec -T worker pnpm --filter @copybot/db seed`
 - Run DB integration test:
   - `pnpm --filter @copybot/db test:integration`
 
@@ -267,17 +272,19 @@ Always pass `--env-file .env` to avoid shell-variable overrides:
 
 ```bash
 cd ~/apps/polymarket-copier
-docker compose --env-file .env -f docker/docker-compose.yml up -d --build
-docker compose --env-file .env -f docker/docker-compose.yml run --rm migrate pnpm --filter @copybot/db seed:global-runtime
-docker compose --env-file .env -f docker/docker-compose.yml up -d worker web
+docker compose --env-file .env -f docker/docker-compose.yml up -d postgres redis
+docker compose --env-file .env -f docker/docker-compose.yml build worker web
+docker compose --env-file .env -f docker/docker-compose.yml run --rm --no-deps worker pnpm --filter @copybot/db migrate:deploy
+docker compose --env-file .env -f docker/docker-compose.yml run --rm --no-deps worker pnpm --filter @copybot/db seed:global-runtime
+docker compose --env-file .env -f docker/docker-compose.yml up -d --no-deps worker web nginx
 docker compose --env-file .env -f docker/docker-compose.yml ps
 ```
 
 Notes:
 
-- `migrate` runs Prisma migrations automatically as part of `up -d --build`.
+- Use the `worker` image as the migration runner. It shares the same runtime image/env path as the live app containers, which is the most reliable way to reach Postgres on long-lived droplets with persisted volumes.
 - `seed:global-runtime` is idempotent and initializes/updates the singleton runtime-config row used for dynamic DB-driven runtime controls.
-- Running `up -d worker web` after seeding ensures both services are definitely on latest code/config state.
+- Running `up -d --no-deps worker web nginx` after DB ops keeps the deploy focused on live services and avoids re-triggering the standalone `migrate` service path.
 
 Verify resolved env values inside Compose:
 
@@ -293,6 +300,7 @@ Health checks:
 
 Important DB note:
 - If you change `POSTGRES_PASSWORD` after Postgres volume initialization, auth may fail.
+- If `docker compose ... run migrate ...` fails with `P1000` but the same Prisma command works through `worker`, keep using `worker` as the DB runner and treat the dedicated `migrate` service as drifted/non-authoritative.
 - Either restore old password or reset volumes:
   - `docker compose --env-file .env -f docker/docker-compose.yml down -v`
   - then `up -d --build` again.
@@ -439,14 +447,16 @@ Look for:
 cd ~/apps/polymarket-copier
 git fetch --all --prune
 git pull --ff-only
-docker compose --env-file .env -f docker/docker-compose.yml up -d --build
-docker compose --env-file .env -f docker/docker-compose.yml run --rm migrate pnpm --filter @copybot/db seed:global-runtime
-docker compose --env-file .env -f docker/docker-compose.yml up -d worker web
+docker compose --env-file .env -f docker/docker-compose.yml build worker web
+docker compose --env-file .env -f docker/docker-compose.yml run --rm --no-deps worker pnpm --filter @copybot/db migrate:deploy
+docker compose --env-file .env -f docker/docker-compose.yml run --rm --no-deps worker pnpm --filter @copybot/db seed:global-runtime
+docker compose --env-file .env -f docker/docker-compose.yml up -d --no-deps worker web
+docker compose --env-file .env -f docker/docker-compose.yml restart nginx
 docker compose --env-file .env -f docker/docker-compose.yml ps
 curl -sS http://127.0.0.1:8080/api/v1/config
 ```
 
-If your update does not change runtime-config schema/behavior, keeping the seed command is still safe because it is idempotent.
+If your update does not change runtime-config schema/behavior, keeping the seed command is still safe because it is idempotent. The same sequence is also the recommended hotfix path because it keeps Prisma work on the `worker` image instead of the standalone `migrate` service.
 
 Logs:
 

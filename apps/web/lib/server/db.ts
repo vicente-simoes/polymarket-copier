@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient } from '@copybot/db'
 
 declare global {
   // eslint-disable-next-line no-var

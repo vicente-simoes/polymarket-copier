@@ -6,14 +6,17 @@ import type {
   NormalizedTradeEvent
 } from "./types.js";
 import type { DataApiPosition } from "@copybot/shared";
+import { PrismaTokenMetadataStore } from "../token-metadata/store.js";
 
 const DATA_API_SOURCE = "DATA_API";
 
 export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
   private readonly prisma: PrismaClient;
+  private readonly tokenMetadataStore: PrismaTokenMetadataStore;
 
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
+    this.tokenMetadataStore = new PrismaTokenMetadataStore(prisma);
   }
 
   async listActiveLeaders(): Promise<LeaderRecord[]> {
@@ -115,6 +118,7 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
     const result = await this.prisma.leaderPositionSnapshot.createMany({
       data: args.positions.map((position) => this.toLeaderPositionRow(args.leaderId, args.snapshotAt, args.snapshotAtMs, position))
     });
+    await this.tokenMetadataStore.upsertFromDataApiPositions(args.positions, args.snapshotAt);
 
     return result.count;
   }
@@ -152,6 +156,7 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
         await this.mergeDataApiObservation(args.leaderId, event);
       }
     }
+    await this.tokenMetadataStore.upsertFromTradeEvents(args.events);
 
     return result.count;
   }

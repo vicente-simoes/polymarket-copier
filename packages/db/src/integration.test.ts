@@ -149,6 +149,34 @@ if (!DATABASE_URL) {
         }
       });
 
+      const tokenMetadata = await prisma.tokenMetadata.create({
+        data: {
+          tokenId: `token-${runId}`,
+          marketId: `market-${runId}`,
+          title: `Market ${runId}`,
+          slug: `slug-${runId}`,
+          eventSlug: `event-${runId}`,
+          outcome: "YES",
+          firstSeenAt: new Date(Date.now() - 10_000),
+          lastSeenAt: new Date(Date.now() - 5_000)
+        }
+      });
+
+      const updatedTokenMetadata = await prisma.tokenMetadata.update({
+        where: {
+          tokenId: tokenMetadata.tokenId
+        },
+        data: {
+          outcome: "NO",
+          lastSeenAt: new Date()
+        }
+      });
+
+      assert.equal(updatedTokenMetadata.tokenId, `token-${runId}`);
+      assert.equal(updatedTokenMetadata.marketId, `market-${runId}`);
+      assert.equal(updatedTokenMetadata.outcome, "NO");
+      assert.ok(updatedTokenMetadata.lastSeenAt.getTime() >= tokenMetadata.lastSeenAt.getTime());
+
       const pendingDelta = await prisma.pendingDelta.create({
         data: {
           copyProfileId: copyProfile.id,
@@ -373,6 +401,7 @@ if (!DATABASE_URL) {
         await prisma.copyProfile.deleteMany({ where: { id: createdIds.copyProfileId } });
       }
 
+      await prisma.tokenMetadata.deleteMany({ where: { tokenId: `token-${runId}` } });
       await prisma.heartbeat.deleteMany({ where: { payload: { path: ["source"], equals: "integration-test" } } });
       await prisma.systemStatus.deleteMany({ where: { details: { path: ["source"], equals: "integration-test" } } });
       await prisma.$disconnect();
