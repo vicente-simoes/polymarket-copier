@@ -1,4 +1,6 @@
 import { Prisma } from '@copybot/db'
+import { prisma } from '@/lib/server/db'
+import { webLogger } from '@/lib/server/logger'
 import {
   extractTokenDisplayMetadataFromPayload,
   mergeTokenDisplayMetadata,
@@ -6,9 +8,7 @@ import {
   type TokenDisplayMetadataObservation,
   type TokenDisplayMetadataRecord,
   type TokenDisplayMetadataView
-} from '@copybot/shared'
-import { prisma } from '@/lib/server/db'
-import { webLogger } from '@/lib/server/logger'
+} from '@/lib/server/token-display-metadata-domain'
 
 type MetadataHistoryRow = {
   tokenId: string
