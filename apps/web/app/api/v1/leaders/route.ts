@@ -153,17 +153,14 @@ export async function GET(request: NextRequest) {
     const [latestSnapshots, profileLinks, pendingByLeader, attemptByLeaderDecision, pnlSummaries] = await Promise.all([
       leaderIds.length === 0
         ? Promise.resolve([])
-        : prisma.leaderPositionSnapshot.groupBy({
-            by: ['leaderId'],
-            where: {
-              leaderId: {
-                in: leaderIds
-              }
-            },
-            _max: {
-              snapshotAt: true
-            }
-          }),
+        : prisma.$queryRaw<Array<{ leaderId: string; snapshotAt: Date }>>(
+            Prisma.sql`
+              SELECT DISTINCT ON ("leaderId") "leaderId", "snapshotAt"
+              FROM "LeaderPositionSnapshot"
+              WHERE "leaderId" IN (${Prisma.join(leaderIds)})
+              ORDER BY "leaderId", "snapshotAt" DESC
+            `
+          ),
       leaderIds.length === 0
         ? Promise.resolve([])
         : prisma.copyProfileLeader.findMany({
@@ -223,19 +220,12 @@ export async function GET(request: NextRequest) {
           )
     ])
 
-    const latestSnapshotPairs = latestSnapshots
-      .filter((row) => row._max.snapshotAt)
-      .map((row) => ({
-        leaderId: row.leaderId,
-        snapshotAt: row._max.snapshotAt as Date
-      }))
-
     const exposureRows =
-      latestSnapshotPairs.length === 0
+      latestSnapshots.length === 0
         ? []
         : await prisma.leaderPositionSnapshot.findMany({
             where: {
-              OR: latestSnapshotPairs.map((row) => ({
+              OR: latestSnapshots.map((row) => ({
                 leaderId: row.leaderId,
                 snapshotAt: row.snapshotAt
               }))

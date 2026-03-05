@@ -149,7 +149,8 @@ export async function GET(_request: NextRequest) {
       errorCount15m,
       errorCount1h,
       errorCount24h,
-      counts,
+      exactCounts,
+      estimatedSnapshotCounts,
       fallbackUsage1h,
       fallbackUsage24h,
       latestMigration,
@@ -227,12 +228,11 @@ export async function GET(_request: NextRequest) {
       }),
       Promise.all([
         prisma.leader.count(),
-        prisma.leaderPositionSnapshot.count(),
-        prisma.followerPositionSnapshot.count(),
         prisma.copyOrder.count(),
         prisma.copyAttempt.count(),
         prisma.errorEvent.count()
       ]),
+      fetchEstimatedSnapshotCounts(),
       prisma.leaderTradeEvent.count({
         where: {
           source: 'DATA_API',
@@ -455,12 +455,12 @@ export async function GET(_request: NextRequest) {
               latestAppliedAt: latestMigration?.finishedAt?.toISOString() ?? null
             },
             tableCounts: {
-              leaders: counts[0],
-              leaderPositionSnapshots: counts[1],
-              followerPositionSnapshots: counts[2],
-              copyOrders: counts[3],
-              copyAttempts: counts[4],
-              errors: counts[5]
+              leaders: exactCounts[0],
+              leaderPositionSnapshots: estimatedSnapshotCounts.leaderPositionSnapshots,
+              followerPositionSnapshots: estimatedSnapshotCounts.followerPositionSnapshots,
+              copyOrders: exactCounts[1],
+              copyAttempts: exactCounts[2],
+              errors: exactCounts[3]
             }
           },
           redis: {
@@ -515,6 +515,38 @@ async function fetchLatestMigration(): Promise<{ migrationName: string; finished
     }
   } catch {
     return null
+  }
+}
+
+async function fetchEstimatedSnapshotCounts(): Promise<{
+  leaderPositionSnapshots: number
+  followerPositionSnapshots: number
+}> {
+  try {
+    const rows = await prisma.$queryRaw<Array<{ relname: string; estimated_rows: bigint | number }>>(
+      Prisma.sql`
+        SELECT relname, GREATEST(n_live_tup, 0)::bigint AS estimated_rows
+        FROM pg_stat_user_tables
+        WHERE relname IN ('LeaderPositionSnapshot', 'FollowerPositionSnapshot')
+      `
+    )
+
+    const counts = new Map(rows.map((row) => [row.relname, Number(row.estimated_rows)]))
+
+    return {
+      leaderPositionSnapshots: counts.get('LeaderPositionSnapshot') ?? 0,
+      followerPositionSnapshots: counts.get('FollowerPositionSnapshot') ?? 0
+    }
+  } catch {
+    const [leaderPositionSnapshots, followerPositionSnapshots] = await Promise.all([
+      prisma.leaderPositionSnapshot.count(),
+      prisma.followerPositionSnapshot.count()
+    ])
+
+    return {
+      leaderPositionSnapshots,
+      followerPositionSnapshots
+    }
   }
 }
 
