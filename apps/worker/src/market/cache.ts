@@ -73,19 +73,19 @@ export class MarketCache {
       try {
         const books = await this.restClient.fetchBooks(batch);
         await Promise.all(books.map((book) => this.ingestRestBook(book)));
+        const hydratedTokenIds = new Set(books.map((book) => book.asset_id));
+        const missingTokenIds = batch.filter((tokenId) => !hydratedTokenIds.has(tokenId));
+        if (missingTokenIds.length === 0) {
+          continue;
+        }
+
+        await this.warmTokensIndividually(missingTokenIds);
         continue;
       } catch {
         // Some CLOB deployments reject oversized or mixed batches. Fall back to per-token hydration.
       }
 
-      for (const tokenId of batch) {
-        try {
-          const book = await this.restClient.fetchBook(tokenId);
-          await this.ingestRestBook(book);
-        } catch {
-          // Best-effort warm-up: leave token unresolved and let stale guards handle it upstream.
-        }
-      }
+      await this.warmTokensIndividually(batch);
     }
   }
 
@@ -306,6 +306,17 @@ export class MarketCache {
     const created: MarketCacheEntry = { tokenId };
     this.entries.set(tokenId, created);
     return created;
+  }
+
+  private async warmTokensIndividually(tokenIds: Iterable<string>): Promise<void> {
+    for (const tokenId of tokenIds) {
+      try {
+        const book = await this.restClient.fetchBook(tokenId);
+        await this.ingestRestBook(book);
+      } catch {
+        // Best-effort warm-up: leave token unresolved and let stale guards handle it upstream.
+      }
+    }
   }
 
   private toState(entry: MarketCacheEntry, now = this.now()): MarketBookState {

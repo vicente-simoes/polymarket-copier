@@ -212,6 +212,48 @@ test("MarketCache prefers WS price, falls back to REST, and marks stale when ref
   assert.ok(stale.staleReasons.includes("STALE_PRICE") || stale.staleReasons.includes("MISSING_PRICE"));
 });
 
+test("MarketCache falls back to per-token hydration when /books omits requested tokens", async () => {
+  const fetchBookCalls: string[] = [];
+
+  const cache = new MarketCache({
+    restClient: {
+      async fetchBook(tokenId: string) {
+        fetchBookCalls.push(tokenId);
+        return {
+          ...makeParsedBook(tokenId, 0.41, 0.59),
+          market: `market-${tokenId}`,
+          asset_id: tokenId
+        };
+      },
+      async fetchBooks(tokenIds: string[]) {
+        return tokenIds
+          .filter((tokenId) => tokenId !== "token-missing-from-batch")
+          .map((tokenId) => ({
+            ...makeParsedBook(tokenId, 0.4, 0.6),
+            market: `market-${tokenId}`,
+            asset_id: tokenId
+          }));
+      }
+    } as ClobRestClient,
+    config: {
+      metadataTtlMs: 60_000,
+      wsPriceTtlMs: 10_000,
+      restPriceTtlMs: 30_000,
+      redisMetadataTtlSeconds: 1800
+    }
+  });
+
+  cache.setWatchedTokenIds(["token-present-in-batch", "token-missing-from-batch"]);
+  await cache.warmWatchedBooks();
+
+  const metrics = cache.getFreshnessMetrics();
+  assert.equal(metrics.restBackedTokenCount, 2);
+  assert.equal(metrics.staleTokenCount, 0);
+  assert.equal(metrics.staleMetadataCount, 0);
+  assert.equal(metrics.stalePriceCount, 0);
+  assert.deepEqual(fetchBookCalls, ["token-missing-from-batch"]);
+});
+
 test("MarketCache persists metadata in Redis layer and can hydrate it later", async () => {
   let nowMs = 10_000;
   const redisStore = new InMemoryMarketMetadataStore(() => nowMs);
