@@ -31,6 +31,7 @@ Dashboard preview:
    - `POLYMARKET_FUNDER_ADDRESS=0x...`
 5. Optional execution cap:
    - set `MAX_PRICE_PER_SHARE_USD` to block BUY attempts above your chosen per-share price (leave blank to disable)
+   - set `BUY_IMPROVEMENT_GUARD_ENABLED=true` and `MAX_BUY_IMPROVEMENT_BPS=5000` to block BUY attempts that are too far below the leader baseline (leave the bps value blank to disable)
    - optional per-leader override: on the Leader detail page, set `maxPricePerShareUsd` to override (or clear) the global cap for that leader only
 6. Install dependencies:
    - `pnpm install`

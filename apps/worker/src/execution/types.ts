@@ -67,6 +67,8 @@ export interface ExecutionGuardrailOverrides {
   minNotionalUsd?: number;
   maxWorseningBuyUsd?: number;
   maxWorseningSellUsd?: number;
+  buyImprovementGuardEnabled?: boolean;
+  maxBuyImprovementBps?: number | null;
   maxSlippageBps?: number;
   maxSpreadUsd?: number;
   minBookDepthForSizeEnabled?: boolean;
@@ -220,6 +222,8 @@ export interface ExecutionEngineConfig {
   minNotionalUsd: number;
   maxWorseningBuyUsd: number;
   maxWorseningSellUsd: number;
+  buyImprovementGuardEnabled: boolean;
+  maxBuyImprovementBps?: number | null;
   maxSlippageBps: number;
   maxSpreadUsd: number;
   maxPricePerShare?: number;

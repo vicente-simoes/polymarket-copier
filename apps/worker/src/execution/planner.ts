@@ -26,6 +26,8 @@ export interface PlannedExecutionInput {
   tickSize: number;
   maxWorseningBuyUsd: number;
   maxWorseningSellUsd: number;
+  buyImprovementGuardEnabled?: boolean;
+  maxBuyImprovementBps?: number;
   maxSlippageBps: number;
   maxSpreadUsd: number;
   maxPricePerShare?: number;
@@ -108,6 +110,8 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
     tickSize: input.tickSize,
     maxWorseningBuyUsd: input.maxWorseningBuyUsd,
     maxWorseningSellUsd: input.maxWorseningSellUsd,
+    buyImprovementGuardEnabled: input.buyImprovementGuardEnabled,
+    maxBuyImprovementBps: input.maxBuyImprovementBps,
     maxSlippageBps: input.maxSlippageBps,
     maxSpreadUsd: input.maxSpreadUsd,
     maxPricePerShare: input.maxPricePerShare,
@@ -124,6 +128,8 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
     config: {
       maxWorseningBuyUsd: input.maxWorseningBuyUsd,
       maxWorseningSellUsd: input.maxWorseningSellUsd,
+      buyImprovementGuardEnabled: input.buyImprovementGuardEnabled,
+      maxBuyImprovementBps: input.maxBuyImprovementBps,
       maxSlippageBps: input.maxSlippageBps,
       maxSpreadUsd: input.maxSpreadUsd,
       maxPricePerShare: input.maxPricePerShare
@@ -208,7 +214,11 @@ function mapGuardrailReason(reason: GuardrailFailureReason | undefined): Executi
     return "SLIPPAGE";
   }
 
-  if (reason === "WORSENING_EXCEEDED" || reason === "PRICE_CAP_EXCEEDED") {
+  if (
+    reason === "WORSENING_EXCEEDED" ||
+    reason === "IMPROVEMENT_EXCEEDED" ||
+    reason === "PRICE_CAP_EXCEEDED"
+  ) {
     return "PRICE_GUARD";
   }
 

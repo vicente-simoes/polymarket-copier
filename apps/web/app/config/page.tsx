@@ -29,6 +29,8 @@ interface SystemConfig {
     attemptExpirationSeconds: number
     maxWorseningBuyUsd: number
     maxWorseningSellUsd: number
+    buyImprovementGuardEnabled: boolean
+    maxBuyImprovementBps: number | null
     maxSlippageBps: number
     maxSpreadUsd: number
     maxPricePerShareUsd: number | null
@@ -112,6 +114,8 @@ interface ConfigFormState {
   attemptExpirationSeconds: string
   maxWorseningBuyUsd: string
   maxWorseningSellUsd: string
+  buyImprovementGuardEnabled: boolean
+  maxBuyImprovementBps: string
   maxSlippageBps: string
   maxSpreadUsd: string
   maxPricePerShareUsd: string
@@ -199,6 +203,8 @@ export default function ConfigPage() {
       attemptExpirationSeconds: toStringValue(config.guardrails.attemptExpirationSeconds),
       maxWorseningBuyUsd: toStringValue(config.guardrails.maxWorseningBuyUsd),
       maxWorseningSellUsd: toStringValue(config.guardrails.maxWorseningSellUsd),
+      buyImprovementGuardEnabled: config.guardrails.buyImprovementGuardEnabled,
+      maxBuyImprovementBps: toStringValue(config.guardrails.maxBuyImprovementBps),
       maxSlippageBps: toStringValue(config.guardrails.maxSlippageBps),
       maxSpreadUsd: toStringValue(config.guardrails.maxSpreadUsd),
       maxPricePerShareUsd: toStringValue(config.guardrails.maxPricePerShareUsd),
@@ -269,6 +275,8 @@ export default function ConfigPage() {
           attemptExpirationSeconds: Number(form.attemptExpirationSeconds),
           maxWorseningBuyUsd: Number(form.maxWorseningBuyUsd),
           maxWorseningSellUsd: Number(form.maxWorseningSellUsd),
+          buyImprovementGuardEnabled: form.buyImprovementGuardEnabled,
+          maxBuyImprovementBps: numberValue(form.maxBuyImprovementBps),
           maxSlippageBps: Number(form.maxSlippageBps),
           maxSpreadUsd: Number(form.maxSpreadUsd),
           maxPricePerShareUsd: numberValue(form.maxPricePerShareUsd),
@@ -458,6 +466,17 @@ export default function ConfigPage() {
             <InputField label="Reconcile interval (seconds)" value={form.intervalSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, intervalSeconds: value } : prev)} />
             <InputField label="Attempt expiration (seconds)" value={form.attemptExpirationSeconds} onChange={(value) => setForm((prev) => prev ? { ...prev, attemptExpirationSeconds: value } : prev)} />
             <InputField label="Max worsening buy (USD)" value={form.maxWorseningBuyUsd} onChange={(value) => setForm((prev) => prev ? { ...prev, maxWorseningBuyUsd: value } : prev)} />
+            <ToggleRow
+              label="Block buys too far below leader"
+              description="Treat sharply cheaper buys as suspicious when market moved strongly against leader baseline."
+              checked={form.buyImprovementGuardEnabled}
+              onCheckedChange={(checked) => setForm((previous) => previous ? { ...previous, buyImprovementGuardEnabled: checked } : previous)}
+            />
+            <InputField
+              label="Max buy improvement vs leader (bps, blank=off)"
+              value={form.maxBuyImprovementBps}
+              onChange={(value) => setForm((prev) => prev ? { ...prev, maxBuyImprovementBps: value } : prev)}
+            />
             <InputField label="Max worsening sell (USD)" value={form.maxWorseningSellUsd} onChange={(value) => setForm((prev) => prev ? { ...prev, maxWorseningSellUsd: value } : prev)} />
             <InputField label="Max slippage (bps)" value={form.maxSlippageBps} onChange={(value) => setForm((prev) => prev ? { ...prev, maxSlippageBps: value } : prev)} />
             <InputField label="Max spread (USD)" value={form.maxSpreadUsd} onChange={(value) => setForm((prev) => prev ? { ...prev, maxSpreadUsd: value } : prev)} />

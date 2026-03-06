@@ -339,6 +339,8 @@ async function bootstrap(): Promise<void> {
       minNotionalUsd: env.MIN_NOTIONAL_PER_ORDER_USD,
       maxWorseningBuyUsd: env.MAX_WORSENING_BUY_USD,
       maxWorseningSellUsd: env.MAX_WORSENING_SELL_USD,
+      buyImprovementGuardEnabled: env.BUY_IMPROVEMENT_GUARD_ENABLED,
+      maxBuyImprovementBps: env.MAX_BUY_IMPROVEMENT_BPS,
       maxSlippageBps: env.MAX_SLIPPAGE_BPS,
       maxSpreadUsd: env.MAX_SPREAD_USD,
       maxPricePerShare: env.MAX_PRICE_PER_SHARE_USD,

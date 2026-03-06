@@ -122,6 +122,8 @@ export const WorkerEnvSchema = z.object({
   MIN_NOTIONAL_PER_ORDER_USD: z.coerce.number().positive().default(1),
   MAX_WORSENING_BUY_USD: z.coerce.number().nonnegative().default(0.03),
   MAX_WORSENING_SELL_USD: z.coerce.number().nonnegative().default(0.06),
+  BUY_IMPROVEMENT_GUARD_ENABLED: booleanFromEnv.default(false),
+  MAX_BUY_IMPROVEMENT_BPS: z.coerce.number().int().positive().optional(),
   MAX_SLIPPAGE_BPS: z.coerce.number().int().nonnegative().default(200),
   MAX_SPREAD_USD: z.coerce.number().nonnegative().default(0.03),
   MAX_PRICE_PER_SHARE_USD: optionalPositiveNumberFromEnv,

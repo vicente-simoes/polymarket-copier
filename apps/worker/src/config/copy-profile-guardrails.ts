@@ -2,6 +2,8 @@ export interface ProfileGuardrailOverrides {
   attemptExpirationSeconds?: number;
   maxWorseningBuyUsd?: number;
   maxWorseningSellUsd?: number;
+  buyImprovementGuardEnabled?: boolean;
+  maxBuyImprovementBps?: number | null;
   maxSlippageBps?: number;
   maxSpreadUsd?: number;
   maxPricePerShareUsd?: number | null;
@@ -27,6 +29,8 @@ export function readProfileGuardrailOverrides(configValue: unknown): ProfileGuar
     attemptExpirationSeconds: readPositiveInteger(guardrails.attemptExpirationSeconds),
     maxWorseningBuyUsd: readNonNegativeNumber(guardrails.maxWorseningBuyUsd),
     maxWorseningSellUsd: readNonNegativeNumber(guardrails.maxWorseningSellUsd),
+    buyImprovementGuardEnabled: readBoolean(guardrails.buyImprovementGuardEnabled),
+    maxBuyImprovementBps: readOptionalPositiveIntegerOverride(guardrails.maxBuyImprovementBps),
     maxSlippageBps: readNonNegativeInteger(guardrails.maxSlippageBps),
     maxSpreadUsd: readNonNegativeNumber(guardrails.maxSpreadUsd),
     maxPricePerShareUsd: readOptionalPositiveNumberOverride(guardrails.maxPricePerShareUsd),

@@ -436,7 +436,7 @@ test("Stage 9 guardrail failures stay pending and do not place orders", async ()
   assert.equal(store.failures.length, 0);
 });
 
-test("Stage 9 max-worsening override can tighten price cap and defer on thin books", async () => {
+test("Stage 9 max-worsening override can tighten price cap and classify as price guard", async () => {
   const store = new FakeExecutionStore();
   const nowMs = 2_050_000;
   store.attempts.set("attempt-override-worsening", makeAttempt({
@@ -484,7 +484,116 @@ test("Stage 9 max-worsening override can tighten price cap and defer on thin boo
   await engine.run();
   assert.equal(venue.requests.length, 0);
   assert.equal(store.deferred.length, 1);
-  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+  assert.equal(store.deferred[0]?.reason, "PRICE_GUARD");
+});
+
+test("Stage 9 buy-improvement guard blocks collapsed catch-up buys as price guard", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_060_000;
+  store.attempts.set("attempt-improvement-guard", makeAttempt({
+    id: "attempt-improvement-guard",
+    tokenId: "token-improvement-guard",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-improvement-guard", makeContext("attempt-improvement-guard", {
+    tokenPrice: 0.5
+  }));
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "should-not-place" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      buyImprovementGuardEnabled: true,
+      maxBuyImprovementBps: 5000,
+      maxSlippageBps: 1000
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-improvement-guard",
+      bestBid: 0.19,
+      bestAsk: 0.2,
+      midPrice: 0.195,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-improvement-guard",
+      bids: [{ price: 0.19, size: 100 }],
+      asks: [{ price: 0.2, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(venue.requests.length, 0);
+  assert.equal(store.deferred.length, 1);
+  assert.equal(store.deferred[0]?.reason, "PRICE_GUARD");
+  assert.match(store.deferred[0]?.message ?? "", /IMPROVEMENT_EXCEEDED/);
+});
+
+test("Stage 9 profile null improvement threshold disables env improvement guard", async () => {
+  const store = new FakeExecutionStore();
+  const nowMs = 2_065_000;
+  store.attempts.set("attempt-improvement-null", makeAttempt({
+    id: "attempt-improvement-null",
+    tokenId: "token-improvement-null",
+    side: "BUY",
+    accumulatedDeltaShares: 2,
+    accumulatedDeltaNotionalUsd: 1
+  }));
+  store.contexts.set("attempt-improvement-null", {
+    ...makeContext("attempt-improvement-null", {
+      tokenPrice: 0.5
+    }),
+    guardrailOverrides: {
+      maxBuyImprovementBps: null
+    }
+  });
+
+  const venue = new FakeVenueClient([{ status: "PLACED", externalOrderId: "order-improvement-null" }]);
+  const engine = new ExecutionEngine({
+    store,
+    venueClient: venue,
+    config: {
+      ...baseConfig(),
+      buyImprovementGuardEnabled: true,
+      maxBuyImprovementBps: 5000,
+      maxSlippageBps: 1000
+    },
+    now: () => nowMs,
+    getMarketSnapshot: async (tokenId) => ({
+      tokenId,
+      marketId: "market-improvement-null",
+      bestBid: 0.19,
+      bestAsk: 0.2,
+      midPrice: 0.195,
+      tickSize: 0.01,
+      minOrderSize: 1,
+      negRisk: false,
+      isStale: false,
+      priceSource: "WS" as const
+    }),
+    fetchOrderBook: async (tokenId) => ({
+      tokenId,
+      marketId: "market-improvement-null",
+      bids: [{ price: 0.19, size: 100 }],
+      asks: [{ price: 0.2, size: 100 }]
+    })
+  });
+
+  await engine.run();
+
+  assert.equal(store.deferred.length, 0);
+  assert.equal(venue.requests.length, 1);
 });
 
 test("Stage 9 spread override blocks execution even when env spread would allow", async () => {
@@ -1485,7 +1594,7 @@ test("Stage 9 BUY worsening baseline uses weighted leader entry metadata before 
   await engine.run();
   assert.equal(venue.requests.length, 0);
   assert.equal(store.deferred.length, 1);
-  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+  assert.equal(store.deferred[0]?.reason, "PRICE_GUARD");
   assert.equal(
     (store.deferred[0]?.context?.leaderBaseline as { source?: string } | undefined)?.source,
     "baseline.v1.buy.weighted"
@@ -1546,7 +1655,7 @@ test("Stage 9 SELL worsening baseline uses weighted last-sell metadata before le
   await engine.run();
   assert.equal(venue.requests.length, 0);
   assert.equal(store.deferred.length, 1);
-  assert.equal(store.deferred[0]?.reason, "THIN_BOOK");
+  assert.equal(store.deferred[0]?.reason, "PRICE_GUARD");
   assert.equal(
     (store.deferred[0]?.context?.leaderBaseline as { source?: string } | undefined)?.source,
     "baseline.v1.sell.weighted"
@@ -2411,6 +2520,8 @@ function baseConfig() {
     minNotionalUsd: 1,
     maxWorseningBuyUsd: 0.03,
     maxWorseningSellUsd: 0.06,
+    buyImprovementGuardEnabled: false,
+    maxBuyImprovementBps: null,
     maxSlippageBps: 200,
     maxSpreadUsd: 0.03,
     minBookDepthForSizeEnabled: true,

@@ -162,6 +162,122 @@ test("Guardrails classify best ask beyond allowed worsening as worsening exceede
   assert.deepEqual(evaluation.reasons, ["WORSENING_EXCEEDED", "PRICE_CAP_EXCEEDED", "THIN_BOOK"]);
 });
 
+test("Guardrails classify buys far below leader as improvement exceeded", () => {
+  const evaluation = evaluateGuardrails({
+    side: "BUY",
+    config: {
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      buyImprovementGuardEnabled: true,
+      maxBuyImprovementBps: 5000,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03
+    },
+    prices: {
+      leaderPrice: 0.5,
+      midPrice: 0.02,
+      bestBid: 0.01,
+      bestAsk: 0.02,
+      tickSize: 0.01,
+      depthSufficient: false
+    }
+  });
+
+  assert.equal(evaluation.ok, false);
+  assert.deepEqual(evaluation.reasons, ["IMPROVEMENT_EXCEEDED", "THIN_BOOK"]);
+});
+
+test("Guardrails classify fill price far below leader as improvement exceeded", () => {
+  const evaluation = evaluateGuardrails({
+    side: "BUY",
+    config: {
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      buyImprovementGuardEnabled: true,
+      maxBuyImprovementBps: 5000,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03
+    },
+    prices: {
+      leaderPrice: 0.5,
+      midPrice: 0.04,
+      bestBid: 0.039,
+      bestAsk: 0.041,
+      expectedPrice: 0.04,
+      tickSize: 0.01,
+      depthSufficient: true
+    }
+  });
+
+  assert.equal(evaluation.ok, false);
+  assert.deepEqual(evaluation.reasons, ["IMPROVEMENT_EXCEEDED"]);
+});
+
+test("Improvement guard is ignored when disabled, unset, or on sells", () => {
+  const disabled = evaluateGuardrails({
+    side: "BUY",
+    config: {
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      buyImprovementGuardEnabled: false,
+      maxBuyImprovementBps: 5000,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03
+    },
+    prices: {
+      leaderPrice: 0.5,
+      midPrice: 0.02,
+      bestBid: 0.01,
+      bestAsk: 0.02,
+      tickSize: 0.01,
+      depthSufficient: true
+    }
+  });
+  assert.equal(disabled.reasons.includes("IMPROVEMENT_EXCEEDED"), false);
+
+  const unsetThreshold = evaluateGuardrails({
+    side: "BUY",
+    config: {
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      buyImprovementGuardEnabled: true,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03
+    },
+    prices: {
+      leaderPrice: 0.5,
+      midPrice: 0.02,
+      bestBid: 0.01,
+      bestAsk: 0.02,
+      tickSize: 0.01,
+      depthSufficient: true
+    }
+  });
+  assert.equal(unsetThreshold.reasons.includes("IMPROVEMENT_EXCEEDED"), false);
+
+  const sell = evaluateGuardrails({
+    side: "SELL",
+    config: {
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      buyImprovementGuardEnabled: true,
+      maxBuyImprovementBps: 5000,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03
+    },
+    prices: {
+      leaderPrice: 0.5,
+      midPrice: 0.02,
+      bestBid: 0.01,
+      bestAsk: 0.02,
+      expectedPrice: 0.01,
+      tickSize: 0.01,
+      depthSufficient: true
+    }
+  });
+  assert.equal(sell.reasons.includes("IMPROVEMENT_EXCEEDED"), false);
+});
+
 test("Live execution diagnostics compute BUY and SELL depth within cap/floor", () => {
   const buy = computeLiveExecutionDiagnostics({
     side: "BUY",

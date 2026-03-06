@@ -8,6 +8,7 @@ export type GuardrailFailureReason =
   | "MISSING_MID_PRICE"
   | "SPREAD_TOO_WIDE"
   | "WORSENING_EXCEEDED"
+  | "IMPROVEMENT_EXCEEDED"
   | "SLIPPAGE_EXCEEDED"
   | "PRICE_CAP_EXCEEDED"
   | "THIN_BOOK";
@@ -15,6 +16,8 @@ export type GuardrailFailureReason =
 export interface GuardrailConfig {
   maxWorseningBuyUsd: DecimalLike;
   maxWorseningSellUsd: DecimalLike;
+  buyImprovementGuardEnabled?: boolean;
+  maxBuyImprovementBps?: DecimalLike;
   maxSlippageBps: DecimalLike;
   maxSpreadUsd: DecimalLike;
   maxPricePerShare?: DecimalLike;
@@ -82,6 +85,20 @@ export function directionalSlippageBps(params: {
   return safeDiv(mid.minus(expected), mid, 0).mul(10_000).toNumber();
 }
 
+export function buyImprovementBps(params: {
+  leaderPrice: DecimalLike;
+  candidatePrice: DecimalLike;
+}): number {
+  const leader = d(params.leaderPrice);
+  const candidate = d(params.candidatePrice);
+
+  if (leader.lte(0) || candidate.lte(0) || candidate.gte(leader)) {
+    return 0;
+  }
+
+  return safeDiv(leader.minus(candidate), leader, 0).mul(10_000).toNumber();
+}
+
 export function evaluateGuardrails(params: {
   side: TradeSide;
   config: GuardrailConfig;
@@ -113,6 +130,16 @@ export function evaluateGuardrails(params: {
       }
 
       if (
+        config.buyImprovementGuardEnabled === true &&
+        config.maxBuyImprovementBps !== undefined &&
+        d(buyImprovementBps({ leaderPrice: prices.leaderPrice, candidatePrice: prices.bestAsk })).greaterThan(
+          d(config.maxBuyImprovementBps)
+        )
+      ) {
+        reasons.push("IMPROVEMENT_EXCEEDED");
+      }
+
+      if (
         config.maxPricePerShare !== undefined &&
         d(prices.bestAsk).greaterThan(d(config.maxPricePerShare))
       ) {
@@ -133,6 +160,16 @@ export function evaluateGuardrails(params: {
       const worsening = d(prices.expectedPrice).minus(d(prices.leaderPrice));
       if (worsening.greaterThan(d(config.maxWorseningBuyUsd))) {
         reasons.push("WORSENING_EXCEEDED");
+      }
+
+      if (
+        config.buyImprovementGuardEnabled === true &&
+        config.maxBuyImprovementBps !== undefined &&
+        d(
+          buyImprovementBps({ leaderPrice: prices.leaderPrice, candidatePrice: prices.expectedPrice })
+        ).greaterThan(d(config.maxBuyImprovementBps))
+      ) {
+        reasons.push("IMPROVEMENT_EXCEEDED");
       }
 
       if (

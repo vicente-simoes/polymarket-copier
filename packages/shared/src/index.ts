@@ -27,6 +27,7 @@ export {
   computeBuyPriceCap,
   computeSellPriceFloor,
   directionalSlippageBps,
+  buyImprovementBps,
   evaluateGuardrails,
   type TradeSide,
   type GuardrailConfig,

@@ -49,10 +49,20 @@ test('copies route and page expose live attempting diagnostics', () => {
   assert.match(routeSource, /liveLeaderPriceUsd/)
   assert.match(routeSource, /livePriceLimitKind/)
   assert.match(routeSource, /liveDepthSufficient/)
+  assert.match(routeSource, /IMPROVEMENT_EXCEEDED/)
+  assert.match(routeSource, /price is too far below leader baseline/)
 
   const pageSource = readWorkspaceFile('app/copies/page.tsx')
   assert.match(pageSource, /Leader \/ Mid/)
   assert.match(pageSource, /Cap\/Floor/)
   assert.match(pageSource, /Depth within limit/)
   assert.match(pageSource, /Depth sufficient:/)
+})
+
+test('config page exposes buy-improvement guardrail controls', () => {
+  const pageSource = readWorkspaceFile('app/config/page.tsx')
+  assert.match(pageSource, /buyImprovementGuardEnabled/)
+  assert.match(pageSource, /maxBuyImprovementBps/)
+  assert.match(pageSource, /Block buys too far below leader/)
+  assert.match(pageSource, /Max buy improvement vs leader \(bps, blank=off\)/)
 })

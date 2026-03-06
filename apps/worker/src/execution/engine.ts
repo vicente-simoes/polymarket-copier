@@ -48,6 +48,8 @@ interface EffectiveExecutionGuardrails {
   minNotionalUsd: number;
   maxWorseningBuyUsd: number;
   maxWorseningSellUsd: number;
+  buyImprovementGuardEnabled: boolean;
+  maxBuyImprovementBps?: number | null;
   maxSlippageBps: number;
   maxSpreadUsd: number;
   minBookDepthForSizeEnabled: boolean;
@@ -453,6 +455,11 @@ export class ExecutionEngine {
       tickSize: market.tickSize,
       maxWorseningBuyUsd: effectiveGuardrails.maxWorseningBuyUsd,
       maxWorseningSellUsd: effectiveGuardrails.maxWorseningSellUsd,
+      buyImprovementGuardEnabled: effectiveGuardrails.buyImprovementGuardEnabled,
+      maxBuyImprovementBps:
+        effectiveGuardrails.buyImprovementGuardEnabled === true
+          ? effectiveGuardrails.maxBuyImprovementBps ?? undefined
+          : undefined,
       maxSlippageBps: effectiveGuardrails.maxSlippageBps,
       maxSpreadUsd: effectiveGuardrails.maxSpreadUsd,
       maxPricePerShare: effectiveMaxPricePerShare,
@@ -1149,10 +1156,21 @@ function resolveEffectiveGuardrails(
   overrides: ExecutionGuardrailOverrides | undefined
 ): EffectiveExecutionGuardrails {
   const maxOpenOrdersOverride = overrides?.maxOpenOrders;
+  const buyImprovementGuardEnabled = overrides?.buyImprovementGuardEnabled ?? defaults.buyImprovementGuardEnabled;
+  const maxBuyImprovementBps =
+    overrides?.maxBuyImprovementBps !== undefined
+      ? overrides.maxBuyImprovementBps
+      : defaults.maxBuyImprovementBps;
+
   return {
     minNotionalUsd: overrides?.minNotionalUsd ?? defaults.minNotionalUsd,
     maxWorseningBuyUsd: overrides?.maxWorseningBuyUsd ?? defaults.maxWorseningBuyUsd,
     maxWorseningSellUsd: overrides?.maxWorseningSellUsd ?? defaults.maxWorseningSellUsd,
+    buyImprovementGuardEnabled,
+    maxBuyImprovementBps:
+      buyImprovementGuardEnabled === true && maxBuyImprovementBps !== null
+        ? maxBuyImprovementBps
+        : null,
     maxSlippageBps: overrides?.maxSlippageBps ?? defaults.maxSlippageBps,
     maxSpreadUsd: overrides?.maxSpreadUsd ?? defaults.maxSpreadUsd,
     minBookDepthForSizeEnabled:
