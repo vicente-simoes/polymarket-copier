@@ -47,6 +47,26 @@ function unauthorizedApiResponse() {
   )
 }
 
+function notFoundApiResponse() {
+  return NextResponse.json(
+    {
+      apiVersion: 'v1',
+      generatedAt: new Date().toISOString(),
+      error: {
+        code: 'NOT_FOUND',
+        message: 'Route not found.',
+        details: {}
+      }
+    },
+    {
+      status: 404,
+      headers: {
+        'Cache-Control': 'no-store'
+      }
+    }
+  )
+}
+
 function redirectToLogin(requestUrl: URL, pathname: string, search: string) {
   const nextPath = `${pathname}${search}` || '/'
   const url = new URL('/login', requestUrl)
@@ -63,6 +83,10 @@ export default auth((req) => {
 
   const isProtectedApi = pathname === '/api/v1' || pathname.startsWith('/api/v1/')
   const isProtectedPage = !pathname.startsWith('/api/')
+
+  if (pathname === '/api' || (pathname.startsWith('/api/') && !isProtectedApi)) {
+    return notFoundApiResponse()
+  }
 
   if (!isProtectedApi && !isProtectedPage) {
     return NextResponse.next()
