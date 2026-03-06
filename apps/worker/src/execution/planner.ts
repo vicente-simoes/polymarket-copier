@@ -1,4 +1,5 @@
 import {
+  computeLiveExecutionDiagnostics,
   computeBuyPriceCap,
   computeSellPriceFloor,
   evaluateGuardrails,
@@ -44,13 +45,6 @@ export interface PlannedExecution {
   guardrailReasons: GuardrailFailureReason[];
   blockReason?: ExecutionSkipReason;
   blockMessage?: string;
-}
-
-interface BookFillEstimate {
-  expectedPrice?: number;
-  estimatedShares: number;
-  estimatedNotionalUsd: number;
-  depthSufficient: boolean;
 }
 
 export function planExecution(input: PlannedExecutionInput): PlannedExecution {
@@ -103,14 +97,27 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
     );
   }
 
-  const fillEstimate = estimateBookFill({
+  const diagnostics = computeLiveExecutionDiagnostics({
     side: input.side,
-    amountKind: sizing.amountKind,
-    amount: sizing.amount,
-    priceLimit,
-    asks: input.book.asks,
-    bids: input.book.bids
+    deltaShares: input.deltaShares,
+    minNotionalUsd: input.minNotionalUsd,
+    leaderPrice: input.leaderPrice,
+    midPrice: input.midPrice,
+    bestBid: input.bestBid,
+    bestAsk: input.bestAsk,
+    tickSize: input.tickSize,
+    maxWorseningBuyUsd: input.maxWorseningBuyUsd,
+    maxWorseningSellUsd: input.maxWorseningSellUsd,
+    maxSlippageBps: input.maxSlippageBps,
+    maxSpreadUsd: input.maxSpreadUsd,
+    maxPricePerShare: input.maxPricePerShare,
+    bids: input.book.bids,
+    asks: input.book.asks
   });
+
+  if (!diagnostics) {
+    return blocked(input.side, "UNKNOWN", "execution diagnostics unavailable");
+  }
 
   const guardrail = evaluateGuardrails({
     side: input.side,
@@ -126,9 +133,9 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
       midPrice: input.midPrice,
       bestBid: input.bestBid,
       bestAsk: input.bestAsk,
-      expectedPrice: fillEstimate.expectedPrice,
+      expectedPrice: diagnostics.expectedPriceUsd ?? undefined,
       tickSize: input.tickSize,
-      depthSufficient: input.enforceMinBookDepth ? fillEstimate.depthSufficient : undefined
+      depthSufficient: input.enforceMinBookDepth ? diagnostics.depthSufficient : undefined
     }
   });
 
@@ -139,9 +146,9 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
       amountKind: sizing.amountKind,
       amount: sizing.amount,
       priceLimit,
-      estimatedShares: fillEstimate.estimatedShares,
-      estimatedNotionalUsd: fillEstimate.estimatedNotionalUsd,
-      expectedPrice: fillEstimate.expectedPrice,
+      estimatedShares: diagnostics.intendedShares - diagnostics.remainingShares,
+      estimatedNotionalUsd: diagnostics.intendedNotionalUsd - diagnostics.remainingNotionalUsd,
+      expectedPrice: diagnostics.expectedPriceUsd ?? undefined,
       guardrailReasons: guardrail.reasons,
       blockReason: mapGuardrailReason(guardrail.reasons[0]),
       blockMessage: `guardrail blocked: ${guardrail.reasons.join(",")}`
@@ -154,86 +161,10 @@ export function planExecution(input: PlannedExecutionInput): PlannedExecution {
     amountKind: sizing.amountKind,
     amount: roundTo(sizing.amount, 8),
     priceLimit: roundTo(priceLimit, 8),
-    estimatedShares: roundTo(fillEstimate.estimatedShares, 8),
-    estimatedNotionalUsd: roundTo(fillEstimate.estimatedNotionalUsd, 8),
-    expectedPrice: fillEstimate.expectedPrice !== undefined ? roundTo(fillEstimate.expectedPrice, 8) : undefined,
+    estimatedShares: roundTo(diagnostics.intendedShares - diagnostics.remainingShares, 8),
+    estimatedNotionalUsd: roundTo(diagnostics.intendedNotionalUsd - diagnostics.remainingNotionalUsd, 8),
+    expectedPrice: diagnostics.expectedPriceUsd !== null ? roundTo(diagnostics.expectedPriceUsd, 8) : undefined,
     guardrailReasons: []
-  };
-}
-
-function estimateBookFill(args: {
-  side: ExecutionSide;
-  amountKind: ExecutionOrderAmountKind;
-  amount: number;
-  priceLimit: number;
-  bids: ExecutionBookLevel[];
-  asks: ExecutionBookLevel[];
-}): BookFillEstimate {
-  if (args.amount <= 0) {
-    return {
-      expectedPrice: undefined,
-      estimatedShares: 0,
-      estimatedNotionalUsd: 0,
-      depthSufficient: false
-    };
-  }
-
-  if (args.side === "BUY") {
-    const levels = sortAsks(args.asks);
-    let remainingUsd = args.amount;
-    let consumedShares = 0;
-    let consumedUsd = 0;
-
-    for (const level of levels) {
-      if (level.price > args.priceLimit) {
-        break;
-      }
-
-      const maxUsdAtLevel = level.price * level.size;
-      const takeUsd = Math.min(remainingUsd, maxUsdAtLevel);
-      const takeShares = takeUsd / level.price;
-      consumedUsd += takeUsd;
-      consumedShares += takeShares;
-      remainingUsd -= takeUsd;
-
-      if (remainingUsd <= 1e-9) {
-        break;
-      }
-    }
-
-    return {
-      expectedPrice: consumedShares > 0 ? consumedUsd / consumedShares : undefined,
-      estimatedShares: consumedShares,
-      estimatedNotionalUsd: consumedUsd,
-      depthSufficient: remainingUsd <= 1e-9
-    };
-  }
-
-  const levels = sortBids(args.bids);
-  let remainingShares = args.amount;
-  let soldShares = 0;
-  let soldUsd = 0;
-
-  for (const level of levels) {
-    if (level.price < args.priceLimit) {
-      break;
-    }
-
-    const takeShares = Math.min(remainingShares, level.size);
-    soldShares += takeShares;
-    soldUsd += takeShares * level.price;
-    remainingShares -= takeShares;
-
-    if (remainingShares <= 1e-9) {
-      break;
-    }
-  }
-
-  return {
-    expectedPrice: soldShares > 0 ? soldUsd / soldShares : undefined,
-    estimatedShares: soldShares,
-    estimatedNotionalUsd: soldUsd,
-    depthSufficient: remainingShares <= 1e-9
   };
 }
 
@@ -299,20 +230,4 @@ function mapGuardrailReason(reason: GuardrailFailureReason | undefined): Executi
 function roundTo(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
-}
-
-function sortBids(levels: ExecutionBookLevel[]): ExecutionBookLevel[] {
-  return levels
-    .filter(isFiniteLevel)
-    .sort((left, right) => right.price - left.price);
-}
-
-function sortAsks(levels: ExecutionBookLevel[]): ExecutionBookLevel[] {
-  return levels
-    .filter(isFiniteLevel)
-    .sort((left, right) => left.price - right.price);
-}
-
-function isFiniteLevel(level: ExecutionBookLevel): boolean {
-  return Number.isFinite(level.price) && Number.isFinite(level.size) && level.price > 0 && level.size > 0;
 }

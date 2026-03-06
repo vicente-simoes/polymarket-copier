@@ -8,6 +8,7 @@ import {
   copyDecisionKey,
   computeAttributionWeights,
   computeBuyPriceCap,
+  computeLiveExecutionDiagnostics,
   computeSellPriceFloor,
   directionalSlippageBps,
   evaluateGuardrails,
@@ -134,6 +135,111 @@ test("Step 4/6 guardrails block on spread, slippage, worsening, and thin book", 
   assert.deepEqual(
     evaluation.reasons.sort(),
     ["SPREAD_TOO_WIDE", "WORSENING_EXCEEDED", "SLIPPAGE_EXCEEDED", "PRICE_CAP_EXCEEDED", "THIN_BOOK"].sort()
+  );
+});
+
+test("Guardrails classify best ask beyond allowed worsening as worsening exceeded even without an expected fill", () => {
+  const evaluation = evaluateGuardrails({
+    side: "BUY",
+    config: {
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03,
+      maxPricePerShare: 0.59
+    },
+    prices: {
+      leaderPrice: 0.57,
+      midPrice: 0.58,
+      bestBid: 0.60,
+      bestAsk: 0.62,
+      tickSize: 0.01,
+      depthSufficient: false
+    }
+  });
+
+  assert.equal(evaluation.ok, false);
+  assert.deepEqual(evaluation.reasons, ["WORSENING_EXCEEDED", "PRICE_CAP_EXCEEDED", "THIN_BOOK"]);
+});
+
+test("Live execution diagnostics compute BUY and SELL depth within cap/floor", () => {
+  const buy = computeLiveExecutionDiagnostics({
+    side: "BUY",
+    deltaShares: 2,
+    minNotionalUsd: 1,
+    leaderPrice: 0.57,
+    midPrice: 0.58,
+    bestBid: 0.57,
+    bestAsk: 0.59,
+    tickSize: 0.01,
+    maxWorseningBuyUsd: 0.04,
+    maxWorseningSellUsd: 0.06,
+    maxSlippageBps: 400,
+    maxSpreadUsd: 0.03,
+    maxPricePerShare: 0.61,
+    bids: [{ price: 0.57, size: 10 }],
+    asks: [
+      { price: 0.59, size: 1 },
+      { price: 0.6, size: 1 },
+      { price: 0.62, size: 10 }
+    ]
+  });
+
+  assert.ok(buy);
+  assert.equal(buy?.priceLimitKind, "CAP");
+  assert.equal(buy?.depthSufficient, true);
+  assert.equal(buy?.usableDepthShares, 2);
+  assert.equal(buy?.remainingNotionalUsd, 0);
+  assert.equal(buy?.expectedPriceUsd, 0.59487179);
+
+  const sell = computeLiveExecutionDiagnostics({
+    side: "SELL",
+    deltaShares: 3,
+    minNotionalUsd: 1,
+    leaderPrice: 0.57,
+    midPrice: 0.58,
+    bestBid: 0.57,
+    bestAsk: 0.59,
+    tickSize: 0.01,
+    maxWorseningBuyUsd: 0.03,
+    maxWorseningSellUsd: 0.03,
+    maxSlippageBps: 400,
+    maxSpreadUsd: 0.03,
+    bids: [
+      { price: 0.57, size: 1 },
+      { price: 0.56, size: 1 },
+      { price: 0.54, size: 10 }
+    ],
+    asks: [{ price: 0.59, size: 10 }]
+  });
+
+  assert.ok(sell);
+  assert.equal(sell?.priceLimitKind, "FLOOR");
+  assert.equal(sell?.depthSufficient, false);
+  assert.equal(sell?.usableDepthShares, 2);
+  assert.equal(sell?.remainingShares, 1);
+  assert.equal(sell?.remainingNotionalUsd, 0.56);
+});
+
+test("Live execution diagnostics return null when leader or mid price is missing", () => {
+  assert.equal(
+    computeLiveExecutionDiagnostics({
+      side: "BUY",
+      deltaShares: 2,
+      minNotionalUsd: 1,
+      leaderPrice: undefined,
+      midPrice: 0.58,
+      bestBid: 0.57,
+      bestAsk: 0.59,
+      tickSize: 0.01,
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03,
+      bids: [{ price: 0.57, size: 10 }],
+      asks: [{ price: 0.59, size: 10 }]
+    }),
+    null
   );
 });
 

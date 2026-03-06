@@ -35,6 +35,13 @@ export {
   type GuardrailFailureReason
 } from "./domain/guardrails.js";
 
+export {
+  computeLiveExecutionDiagnostics,
+  type ExecutionBookLevel,
+  type LiveExecutionDiagnostics,
+  type LiveExecutionDiagnosticsInput
+} from "./domain/execution-diagnostics.js";
+
 export { sizeFAKOrder, type FAKOrderSizingInput, type FAKOrderSizingResult } from "./domain/order.js";
 
 export {

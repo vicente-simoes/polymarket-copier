@@ -103,7 +103,7 @@ test("ClobRestClient supports /book and /books response parsing", async () => {
   assert.equal(seen.length, 2);
   assert.equal(seen[0]?.method, "GET");
   assert.equal(seen[1]?.method, "POST");
-  assert.match(seen[1]?.body ?? "", /tokenA/);
+  assert.equal(seen[1]?.body, JSON.stringify([{ token_id: "tokenA" }, { token_id: "tokenB" }]));
 });
 
 test("ClobRestClient normalizes top-of-book when payload levels are reverse-ordered", async () => {

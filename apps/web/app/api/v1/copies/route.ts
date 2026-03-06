@@ -1,11 +1,13 @@
 import { Prisma } from '@prisma/client'
+import { computeLiveExecutionDiagnostics } from '@copybot/shared'
 import { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { jsonContract, jsonError, paginationMeta, parsePagination, toIso, toNumber } from '@/lib/server/api'
+import { DEFAULT_SYSTEM_CONFIG } from '@/lib/server/config'
 import { prisma } from '@/lib/server/db'
 import { memoizeAsync } from '@/lib/server/memo'
 import { resolveTokenDisplayMetadata } from '@/lib/server/token-display-metadata'
-import { fetchWorkerHealth, fetchWorkerMarketBooks } from '@/lib/server/worker-health'
+import { fetchWorkerHealth, fetchWorkerMarketBooks, type WorkerMarketBookSnapshot } from '@/lib/server/worker-health'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -82,6 +84,16 @@ const CopiesDataSchema = z.object({
           spreadState: SpreadStateSchema,
           spreadAgeMs: z.number().int().nonnegative().nullable(),
           currentSpreadUsd: z.number().nullable(),
+          liveLeaderPriceUsd: z.number().nullable(),
+          liveMidPriceUsd: z.number().nullable(),
+          livePriceLimitUsd: z.number().nullable(),
+          livePriceLimitKind: z.enum(['CAP', 'FLOOR']).nullable(),
+          liveUsableDepthShares: z.number().nullable(),
+          liveUsableDepthNotionalUsd: z.number().nullable(),
+          liveRemainingShares: z.number().nullable(),
+          liveRemainingNotionalUsd: z.number().nullable(),
+          liveDepthSufficient: z.boolean().nullable(),
+          liveExpectedPriceUsd: z.number().nullable(),
           retries: z.number().int().nonnegative(),
           maxRetries: z.number().int().nonnegative(),
           status: z.enum(['PENDING', 'RETRYING', 'EXECUTING']),
@@ -420,6 +432,11 @@ export async function GET(request: NextRequest) {
                 name: true
               }
             },
+            copyProfile: {
+              select: {
+                config: true
+              }
+            },
             pendingDelta: {
               select: {
                 status: true,
@@ -443,16 +460,23 @@ export async function GET(request: NextRequest) {
         })
       ])
 
-      const tokenMetadata = await resolveTokenDisplayMetadata(rows.map((row) => row.tokenId))
-      const spreadByToken = await resolveCurrentSpreadsByToken(rows.map((row) => row.tokenId))
-      const leaderNamesByRow = await resolveOpenLeaderNames(
-        rows.map((row) => ({
-          id: row.id,
-          leaderId: row.leaderId,
-          leader: row.leader,
-          metadata: row.pendingDelta?.metadata
-        }))
-      )
+      const attemptTokenIds = rows.map((row) => row.tokenId)
+      const [tokenMetadata, spreadBooks, depthBooks, leaderNamesByRow] = await Promise.all([
+        resolveTokenDisplayMetadata(attemptTokenIds),
+        fetchWorkerMarketBooks(attemptTokenIds, 1_500),
+        fetchWorkerMarketBooks(attemptTokenIds, 3_000, { includeDepth: true }),
+        resolveOpenLeaderNames(
+          rows.map((row) => ({
+            id: row.id,
+            leaderId: row.leaderId,
+            leader: row.leader,
+            metadata: row.pendingDelta?.metadata
+          }))
+        )
+      ])
+      const spreadByToken = resolveCurrentSpreadsByToken(spreadBooks ?? depthBooks)
+      const spreadBookByToken = new Map((spreadBooks ?? []).map((book) => [book.tokenId, book]))
+      const depthBookByToken = new Map((depthBooks ?? []).map((book) => [book.tokenId, book]))
 
         return {
           section,
@@ -480,6 +504,15 @@ export async function GET(request: NextRequest) {
                   : null
               const attemptShares =
                 row.accumulatedDeltaShares !== null && row.accumulatedDeltaShares !== undefined ? toNumber(row.accumulatedDeltaShares) : null
+              const book = mergeWorkerMarketBooks(spreadBookByToken.get(row.tokenId), depthBookByToken.get(row.tokenId))
+              const liveDiagnostics = computeAttemptLiveDiagnostics({
+                side: row.side,
+                pendingMetadata: row.pendingDelta?.metadata,
+                copyProfileConfig: row.copyProfile?.config,
+                currentNotionalUsd: pendingNotionalUsd ?? attemptNotionalUsd ?? 0,
+                currentShares: pendingShares ?? attemptShares ?? 0,
+                book
+              })
               return {
                 id: row.id,
                 createdAt: row.createdAt.toISOString(),
@@ -498,6 +531,16 @@ export async function GET(request: NextRequest) {
                 spreadState: spreadInfo.spreadState,
                 spreadAgeMs: spreadInfo.spreadAgeMs,
                 currentSpreadUsd: spreadInfo.currentSpreadUsd,
+                liveLeaderPriceUsd: liveDiagnostics?.leaderPriceUsd ?? null,
+                liveMidPriceUsd: liveDiagnostics?.midPriceUsd ?? null,
+                livePriceLimitUsd: liveDiagnostics?.priceLimitUsd ?? null,
+                livePriceLimitKind: liveDiagnostics?.priceLimitKind ?? null,
+                liveUsableDepthShares: liveDiagnostics?.usableDepthShares ?? null,
+                liveUsableDepthNotionalUsd: liveDiagnostics?.usableDepthNotionalUsd ?? null,
+                liveRemainingShares: liveDiagnostics?.remainingShares ?? null,
+                liveRemainingNotionalUsd: liveDiagnostics?.remainingNotionalUsd ?? null,
+                liveDepthSufficient: liveDiagnostics?.depthSufficient ?? null,
+                liveExpectedPriceUsd: liveDiagnostics?.expectedPriceUsd ?? null,
                 retries: row.retries,
                 maxRetries: row.maxRetries,
                 status: toAttemptingStatus(row.status),
@@ -872,10 +915,9 @@ function extractMinOrderSizeShares(metadata: unknown): number | null {
   return minOrderSize > 0 ? minOrderSize : null
 }
 
-async function resolveCurrentSpreadsByToken(
-  tokenIds: string[]
-): Promise<Map<string, { spreadState: 'LIVE' | 'STALE' | 'UNAVAILABLE'; spreadAgeMs: number | null; currentSpreadUsd: number | null }>> {
-  const books = await fetchWorkerMarketBooks(tokenIds)
+function resolveCurrentSpreadsByToken(
+  books: Awaited<ReturnType<typeof fetchWorkerMarketBooks>>
+): Map<string, { spreadState: 'LIVE' | 'STALE' | 'UNAVAILABLE'; spreadAgeMs: number | null; currentSpreadUsd: number | null }> {
   if (!books || books.length === 0) {
     return new Map()
   }
@@ -926,6 +968,173 @@ async function resolveCurrentSpreadsByToken(
   }
 
   return spreads
+}
+
+function mergeWorkerMarketBooks(
+  spreadBook: WorkerMarketBookSnapshot | undefined,
+  depthBook: WorkerMarketBookSnapshot | undefined
+): WorkerMarketBookSnapshot | undefined {
+  if (!spreadBook && !depthBook) {
+    return undefined
+  }
+
+  return {
+    ...(spreadBook ?? {}),
+    ...(depthBook ?? {}),
+    bids: depthBook?.bids ?? spreadBook?.bids,
+    asks: depthBook?.asks ?? spreadBook?.asks
+  }
+}
+
+function computeAttemptLiveDiagnostics(args: {
+  side: 'BUY' | 'SELL'
+  pendingMetadata: unknown
+  copyProfileConfig: unknown
+  currentNotionalUsd: number
+  currentShares: number
+  book?: NonNullable<Awaited<ReturnType<typeof fetchWorkerMarketBooks>>>[number]
+}) {
+  if (!args.book?.bids || !args.book?.asks) {
+    return null
+  }
+
+  const metadata = asObject(args.pendingMetadata)
+  const leaderPrice = resolveAttemptLeaderPrice(metadata, args.side, args.currentNotionalUsd, args.currentShares)
+  if (!leaderPrice || leaderPrice <= 0) {
+    return null
+  }
+
+  const profileGuardrails = readProfileGuardrails(args.copyProfileConfig)
+  const bestBid = pickBestBid(args.book)
+  const bestAsk = pickBestAsk(args.book)
+  const midPrice =
+    bestBid !== undefined && bestAsk !== undefined
+      ? (bestBid + bestAsk) / 2
+      : positiveNumber(args.book.midPrice)
+
+  const tickSize = positiveNumber(args.book.tickSize)
+  if (!midPrice || midPrice <= 0 || !tickSize || tickSize <= 0 || args.currentShares <= 0 || args.currentNotionalUsd <= 0) {
+    return null
+  }
+
+  return computeLiveExecutionDiagnostics({
+    side: args.side,
+    deltaShares: args.currentShares,
+    minNotionalUsd:
+      positiveNumber(readNumber(metadata, 'effectiveMinNotionalUsd')) ??
+      profileGuardrails.minNotionalPerOrderUsd ??
+      DEFAULT_SYSTEM_CONFIG.guardrails.minNotionalPerOrderUsd,
+    leaderPrice,
+    midPrice,
+    bestBid,
+    bestAsk,
+    tickSize,
+    maxWorseningBuyUsd:
+      profileGuardrails.maxWorseningBuyUsd ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxWorseningBuyUsd,
+    maxWorseningSellUsd:
+      profileGuardrails.maxWorseningSellUsd ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxWorseningSellUsd,
+    maxSlippageBps: profileGuardrails.maxSlippageBps ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxSlippageBps,
+    maxSpreadUsd: profileGuardrails.maxSpreadUsd ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxSpreadUsd,
+    maxPricePerShare:
+      profileGuardrails.maxPricePerShareUsd === null
+        ? undefined
+        : profileGuardrails.maxPricePerShareUsd ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxPricePerShareUsd ?? undefined,
+    bids: args.book.bids,
+    asks: args.book.asks
+  })
+}
+
+function resolveAttemptLeaderPrice(
+  metadata: Record<string, unknown>,
+  side: 'BUY' | 'SELL',
+  currentNotionalUsd: number,
+  currentShares: number
+): number | null {
+  const baseline = readObject(metadata.baseline)
+  if (baseline) {
+    const sideNode = readObject(baseline[side === 'BUY' ? 'buy' : 'sell'])
+    const weighted = sideNode ? readNumber(sideNode, 'weighted') : undefined
+    if (weighted && weighted > 0) {
+      return weighted
+    }
+  }
+
+  const legacyLeaderPrice = readNumber(metadata, 'leaderPrice')
+  if (legacyLeaderPrice && legacyLeaderPrice > 0) {
+    return legacyLeaderPrice
+  }
+
+  const tokenPrice = readNumber(metadata, 'tokenPrice')
+  if (tokenPrice && tokenPrice > 0) {
+    return tokenPrice
+  }
+
+  if (currentNotionalUsd > 0 && currentShares > 0) {
+    return currentNotionalUsd / currentShares
+  }
+
+  return null
+}
+
+function readProfileGuardrails(configValue: unknown): {
+  maxWorseningBuyUsd?: number
+  maxWorseningSellUsd?: number
+  maxSlippageBps?: number
+  maxSpreadUsd?: number
+  maxPricePerShareUsd?: number | null
+  minNotionalPerOrderUsd?: number
+} {
+  const config = asObject(configValue)
+  const guardrails = asObject(config.guardrails)
+
+  return {
+    maxWorseningBuyUsd: positiveNumber(readNumber(guardrails, 'maxWorseningBuyUsd')),
+    maxWorseningSellUsd: positiveNumber(readNumber(guardrails, 'maxWorseningSellUsd')),
+    maxSlippageBps: nonNegativeNumber(readNumber(guardrails, 'maxSlippageBps')),
+    maxSpreadUsd: nonNegativeNumber(readNumber(guardrails, 'maxSpreadUsd')),
+    maxPricePerShareUsd: readNullablePositiveNumber(guardrails.maxPricePerShareUsd),
+    minNotionalPerOrderUsd: positiveNumber(readNumber(guardrails, 'minNotionalPerOrderUsd'))
+  }
+}
+
+function readNullablePositiveNumber(value: unknown): number | null | undefined {
+  if (value === null) {
+    return null
+  }
+  const parsed = toNumber(value)
+  if (parsed > 0) {
+    return parsed
+  }
+  return undefined
+}
+
+function readObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null
+  }
+  return value as Record<string, unknown>
+}
+
+function positiveNumber(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+function nonNegativeNumber(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function pickBestBid(book: NonNullable<Awaited<ReturnType<typeof fetchWorkerMarketBooks>>>[number]): number | undefined {
+  if (book.bids && book.bids.length > 0) {
+    return book.bids[0]?.price
+  }
+  return positiveNumber(book.bestBid)
+}
+
+function pickBestAsk(book: NonNullable<Awaited<ReturnType<typeof fetchWorkerMarketBooks>>>[number]): number | undefined {
+  if (book.asks && book.asks.length > 0) {
+    return book.asks[0]?.price
+  }
+  return positiveNumber(book.bestAsk)
 }
 
 function extractAttemptMessage(payload: unknown, reason?: string | null): string | null {
@@ -989,6 +1198,10 @@ function normalizeOrderErrorMessage(errorMessage: string | null | undefined): st
   }
 
   const withoutPrefix = trimmed.replace(/^CLOB order submit failed:\s*/i, '').replace(/^Error:\s*/i, '').trim()
+  const guardrailMessage = normalizeGuardrailBlockedMessage(withoutPrefix)
+  if (guardrailMessage) {
+    return guardrailMessage
+  }
   const extractedFromJson = extractMessageFromJsonBlob(withoutPrefix)
   if (extractedFromJson) {
     return extractedFromJson
@@ -1000,6 +1213,40 @@ function normalizeOrderErrorMessage(errorMessage: string | null | undefined): st
   }
 
   return withoutPrefix
+}
+
+function normalizeGuardrailBlockedMessage(text: string): string | null {
+  const guardrailMatch = text.match(/^guardrail blocked:\s*(.+)$/i)
+  if (!guardrailMatch) {
+    return null
+  }
+
+  const reasons = guardrailMatch[1]
+    ?.split(',')
+    .map((value) => value.trim().toUpperCase())
+    .filter((value) => value.length > 0) ?? []
+
+  if (reasons.includes('PRICE_CAP_EXCEEDED')) {
+    return 'price exceeds max price/share cap'
+  }
+
+  if (reasons.includes('WORSENING_EXCEEDED')) {
+    return 'price worsened more than max allowed'
+  }
+
+  if (reasons.includes('SLIPPAGE_EXCEEDED')) {
+    return 'expected fill exceeds max slippage'
+  }
+
+  if (reasons.includes('SPREAD_TOO_WIDE')) {
+    return 'spread is wider than max allowed'
+  }
+
+  if (reasons.includes('THIN_BOOK')) {
+    return 'order book too thin within allowed price'
+  }
+
+  return null
 }
 
 function extractMessageFromJsonBlob(blob: string): string | null {
