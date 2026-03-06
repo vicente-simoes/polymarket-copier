@@ -135,10 +135,10 @@ export class PrismaCurrentStateStore {
             UPDATE "LeaderCurrentPosition"
             SET
               "marketId" = ${row.marketId ?? null},
-              "shares" = ${toDbNumber(row.shares)},
-              "avgPrice" = ${toDbNullableNumber(row.avgPrice)},
-              "currentPrice" = ${toDbNullableNumber(row.currentPrice)},
-              "currentValueUsd" = ${toDbNullableNumber(row.currentValueUsd)},
+              "shares" = CAST(${toDbNumber(row.shares)} AS numeric),
+              "avgPrice" = CAST(${toDbNullableNumber(row.avgPrice)} AS numeric),
+              "currentPrice" = CAST(${toDbNullableNumber(row.currentPrice)} AS numeric),
+              "currentValueUsd" = CAST(${toDbNullableNumber(row.currentValueUsd)} AS numeric),
               "snapshotAt" = ${snapshotAt},
               "updatedAt" = ${snapshotAt}
             WHERE "leaderId" = ${leaderId} AND "tokenId" = ${row.tokenId}
@@ -222,10 +222,10 @@ export class PrismaCurrentStateStore {
             SET
               "marketId" = ${row.marketId ?? null},
               "outcome" = ${row.outcome ?? null},
-              "shares" = ${toDbNumber(row.shares)},
-              "costBasisUsd" = ${toDbNullableNumber(row.costBasisUsd)},
-              "currentPrice" = ${toDbNullableNumber(row.currentPrice)},
-              "currentValueUsd" = ${toDbNullableNumber(row.currentValueUsd)},
+              "shares" = CAST(${toDbNumber(row.shares)} AS numeric),
+              "costBasisUsd" = CAST(${toDbNullableNumber(row.costBasisUsd)} AS numeric),
+              "currentPrice" = CAST(${toDbNullableNumber(row.currentPrice)} AS numeric),
+              "currentValueUsd" = CAST(${toDbNullableNumber(row.currentValueUsd)} AS numeric),
               "source" = ${source},
               "snapshotAt" = ${snapshotAt},
               "updatedAt" = ${snapshotAt}
@@ -261,11 +261,13 @@ export class PrismaCurrentStateStore {
       };
     }
 
-    const keys = normalized.map((point) => Prisma.sql`(${point.leaderId}, ${point.tokenId}, ${point.side})`);
+    const leaderIds = [...new Set(normalized.map((point) => point.leaderId))];
+    const tokenIds = [...new Set(normalized.map((point) => point.tokenId))];
     const existingRows = await this.prisma.$queryRaw<LeaderLatestTradePriceRow[]>(Prisma.sql`
       SELECT "leaderId", "tokenId", "side", "price", "leaderFillAtMs"
       FROM "LeaderLatestTradePrice"
-      WHERE ("leaderId", "tokenId", "side") IN (${Prisma.join(keys)})
+      WHERE "leaderId" IN (${Prisma.join(leaderIds)})
+        AND "tokenId" IN (${Prisma.join(tokenIds)})
     `);
     const existingByKey = new Map(existingRows.map((row) => [leaderLatestTradePriceKey(row.leaderId, row.tokenId, row.side), row]));
     const creates: LeaderLatestTradePriceInput[] = [];
@@ -304,13 +306,13 @@ export class PrismaCurrentStateStore {
           return this.prisma.$executeRaw(Prisma.sql`
             UPDATE "LeaderLatestTradePrice"
             SET
-              "price" = ${toDbNumber(point.price)},
-              "leaderFillAtMs" = ${BigInt(point.leaderFillAtMs)},
-              "source" = ${point.source},
+              "price" = CAST(${toDbNumber(point.price)} AS numeric),
+              "leaderFillAtMs" = CAST(${String(point.leaderFillAtMs)} AS bigint),
+              "source" = CAST(${point.source} AS "LeaderTradeSource"),
               "updatedAt" = ${eventAt}
             WHERE "leaderId" = ${point.leaderId}
               AND "tokenId" = ${point.tokenId}
-              AND "side" = ${point.side}
+              AND "side" = CAST(${point.side} AS "DeltaSide")
           `);
         })
       );
@@ -546,10 +548,10 @@ async function insertLeaderCurrentPositions(
         ${leaderId},
         ${row.tokenId},
         ${row.marketId ?? null},
-        ${toDbNumber(row.shares)},
-        ${toDbNullableNumber(row.avgPrice)},
-        ${toDbNullableNumber(row.currentPrice)},
-        ${toDbNullableNumber(row.currentValueUsd)},
+        CAST(${toDbNumber(row.shares)} AS numeric),
+        CAST(${toDbNullableNumber(row.avgPrice)} AS numeric),
+        CAST(${toDbNullableNumber(row.currentPrice)} AS numeric),
+        CAST(${toDbNullableNumber(row.currentValueUsd)} AS numeric),
         ${snapshotAt},
         ${snapshotAt}
       )`
@@ -587,10 +589,10 @@ async function insertFollowerCurrentPositions(
         ${row.tokenId},
         ${row.marketId ?? null},
         ${row.outcome ?? null},
-        ${toDbNumber(row.shares)},
-        ${toDbNullableNumber(row.costBasisUsd)},
-        ${toDbNullableNumber(row.currentPrice)},
-        ${toDbNullableNumber(row.currentValueUsd)},
+        CAST(${toDbNumber(row.shares)} AS numeric),
+        CAST(${toDbNullableNumber(row.costBasisUsd)} AS numeric),
+        CAST(${toDbNullableNumber(row.currentPrice)} AS numeric),
+        CAST(${toDbNullableNumber(row.currentValueUsd)} AS numeric),
         ${source},
         ${snapshotAt},
         ${snapshotAt}
@@ -627,10 +629,10 @@ async function insertLeaderLatestTradePrices(
       return Prisma.sql`(
         ${point.leaderId},
         ${point.tokenId},
-        ${point.side},
-        ${toDbNumber(point.price)},
-        ${BigInt(point.leaderFillAtMs)},
-        ${point.source},
+        CAST(${point.side} AS "DeltaSide"),
+        CAST(${toDbNumber(point.price)} AS numeric),
+        CAST(${String(point.leaderFillAtMs)} AS bigint),
+        CAST(${point.source} AS "LeaderTradeSource"),
         ${eventAt},
         ${eventAt}
       )`;
