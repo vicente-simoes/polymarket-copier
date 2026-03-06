@@ -181,14 +181,14 @@ export async function writeDashboardStatusSummary(
   const detailsJson = JSON.stringify(toJsonValue(details));
 
   await prisma.$executeRaw(Prisma.sql`
-    INSERT INTO "SystemStatus" ("component", "status", "lastEventAt", "details", "updatedAt")
+    INSERT INTO "SystemStatus" ("component", "status", "lastEventAt", "details", "lastUpdatedAt")
     VALUES ('DASHBOARD_STATUS'::"ComponentType", 'OK'::"HealthStatus", ${lastEventAt}, ${detailsJson}::jsonb, ${lastEventAt})
     ON CONFLICT ("component")
     DO UPDATE SET
       "status" = 'OK'::"HealthStatus",
       "lastEventAt" = EXCLUDED."lastEventAt",
       "details" = EXCLUDED."details",
-      "updatedAt" = EXCLUDED."updatedAt"
+      "lastUpdatedAt" = EXCLUDED."lastUpdatedAt"
   `);
 
   return details;
