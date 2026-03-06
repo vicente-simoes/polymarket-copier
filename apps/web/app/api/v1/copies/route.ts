@@ -1198,6 +1198,10 @@ function normalizeOrderErrorMessage(errorMessage: string | null | undefined): st
   }
 
   const withoutPrefix = trimmed.replace(/^CLOB order submit failed:\s*/i, '').replace(/^Error:\s*/i, '').trim()
+  const guardrailMessage = normalizeGuardrailBlockedMessage(withoutPrefix)
+  if (guardrailMessage) {
+    return guardrailMessage
+  }
   const extractedFromJson = extractMessageFromJsonBlob(withoutPrefix)
   if (extractedFromJson) {
     return extractedFromJson
@@ -1209,6 +1213,40 @@ function normalizeOrderErrorMessage(errorMessage: string | null | undefined): st
   }
 
   return withoutPrefix
+}
+
+function normalizeGuardrailBlockedMessage(text: string): string | null {
+  const guardrailMatch = text.match(/^guardrail blocked:\s*(.+)$/i)
+  if (!guardrailMatch) {
+    return null
+  }
+
+  const reasons = guardrailMatch[1]
+    ?.split(',')
+    .map((value) => value.trim().toUpperCase())
+    .filter((value) => value.length > 0) ?? []
+
+  if (reasons.includes('PRICE_CAP_EXCEEDED')) {
+    return 'price exceeds max price/share cap'
+  }
+
+  if (reasons.includes('WORSENING_EXCEEDED')) {
+    return 'price worsened more than max allowed'
+  }
+
+  if (reasons.includes('SLIPPAGE_EXCEEDED')) {
+    return 'expected fill exceeds max slippage'
+  }
+
+  if (reasons.includes('SPREAD_TOO_WIDE')) {
+    return 'spread is wider than max allowed'
+  }
+
+  if (reasons.includes('THIN_BOOK')) {
+    return 'order book too thin within allowed price'
+  }
+
+  return null
 }
 
 function extractMessageFromJsonBlob(blob: string): string | null {

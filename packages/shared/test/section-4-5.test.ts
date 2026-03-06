@@ -138,6 +138,30 @@ test("Step 4/6 guardrails block on spread, slippage, worsening, and thin book", 
   );
 });
 
+test("Guardrails classify best ask beyond allowed worsening as worsening exceeded even without an expected fill", () => {
+  const evaluation = evaluateGuardrails({
+    side: "BUY",
+    config: {
+      maxWorseningBuyUsd: 0.03,
+      maxWorseningSellUsd: 0.06,
+      maxSlippageBps: 200,
+      maxSpreadUsd: 0.03,
+      maxPricePerShare: 0.59
+    },
+    prices: {
+      leaderPrice: 0.57,
+      midPrice: 0.58,
+      bestBid: 0.60,
+      bestAsk: 0.62,
+      tickSize: 0.01,
+      depthSufficient: false
+    }
+  });
+
+  assert.equal(evaluation.ok, false);
+  assert.deepEqual(evaluation.reasons, ["WORSENING_EXCEEDED", "PRICE_CAP_EXCEEDED", "THIN_BOOK"]);
+});
+
 test("Live execution diagnostics compute BUY and SELL depth within cap/floor", () => {
   const buy = computeLiveExecutionDiagnostics({
     side: "BUY",

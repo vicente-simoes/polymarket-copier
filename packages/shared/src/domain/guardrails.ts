@@ -105,6 +105,29 @@ export function evaluateGuardrails(params: {
     }
   }
 
+  if (prices.leaderPrice !== undefined) {
+    if (side === "BUY" && prices.bestAsk !== undefined) {
+      const worsening = d(prices.bestAsk).minus(d(prices.leaderPrice));
+      if (worsening.greaterThan(d(config.maxWorseningBuyUsd))) {
+        reasons.push("WORSENING_EXCEEDED");
+      }
+
+      if (
+        config.maxPricePerShare !== undefined &&
+        d(prices.bestAsk).greaterThan(d(config.maxPricePerShare))
+      ) {
+        reasons.push("PRICE_CAP_EXCEEDED");
+      }
+    }
+
+    if (side === "SELL" && prices.bestBid !== undefined) {
+      const worsening = d(prices.leaderPrice).minus(d(prices.bestBid));
+      if (worsening.greaterThan(d(config.maxWorseningSellUsd))) {
+        reasons.push("WORSENING_EXCEEDED");
+      }
+    }
+  }
+
   if (prices.expectedPrice !== undefined && prices.leaderPrice !== undefined) {
     if (side === "BUY") {
       const worsening = d(prices.expectedPrice).minus(d(prices.leaderPrice));
@@ -142,8 +165,10 @@ export function evaluateGuardrails(params: {
     reasons.push("THIN_BOOK");
   }
 
+  const dedupedReasons = [...new Set(reasons)];
+
   return {
-    ok: reasons.length === 0,
-    reasons
+    ok: dedupedReasons.length === 0,
+    reasons: dedupedReasons
   };
 }
