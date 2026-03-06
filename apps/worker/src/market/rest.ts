@@ -38,9 +38,7 @@ export class ClobRestClient {
         "content-type": "application/json",
         accept: "application/json"
       },
-      body: JSON.stringify({
-        token_ids: tokenIds
-      })
+      body: JSON.stringify(tokenIds.map((tokenId) => ({ token_id: tokenId })))
     });
 
     const payload = await this.parseJson(response);
