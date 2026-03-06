@@ -25,6 +25,9 @@ export interface WorkerMarketBookSnapshot {
   spreadUsd?: number
   spreadState?: 'LIVE' | 'STALE' | 'UNAVAILABLE'
   wsConnected?: boolean
+  bids?: Array<{ price: number; size: number }>
+  asks?: Array<{ price: number; size: number }>
+  depthFetchedAtMs?: number
 }
 
 const DEFAULT_WORKER_HEALTH_BASES = ['http://worker:4001', 'http://127.0.0.1:4001', 'http://localhost:4001']
@@ -65,7 +68,8 @@ export async function fetchWorkerHealth(timeoutMs = 1_500): Promise<WorkerHealth
 
 export async function fetchWorkerMarketBooks(
   tokenIds: string[],
-  timeoutMs = 1_500
+  timeoutMs = 1_500,
+  options?: { includeDepth?: boolean }
 ): Promise<WorkerMarketBookSnapshot[] | null> {
   const uniqueTokenIds = [...new Set(tokenIds.map((value) => value.trim()).filter((value) => value.length > 0))]
   if (uniqueTokenIds.length === 0) {
@@ -82,7 +86,8 @@ export async function fetchWorkerMarketBooks(
 
       for (const baseUrl of candidates) {
         const normalizedBase = baseUrl.replace(/\/+$/g, '')
-        const booksUrl = `${normalizedBase}/market/books?token_ids=${tokenQuery}`
+        const includeDepthQuery = options?.includeDepth ? '&include_depth=1' : ''
+        const booksUrl = `${normalizedBase}/market/books?token_ids=${tokenQuery}${includeDepthQuery}`
 
         try {
           const response = await fetch(booksUrl, {
@@ -116,7 +121,10 @@ export async function fetchWorkerMarketBooks(
               quoteUpdatedAtMs: readNumber(record, 'quoteUpdatedAtMs'),
               spreadUsd: readNumber(record, 'spreadUsd'),
               spreadState: readSpreadState(record, 'spreadState'),
-              wsConnected: readBoolean(record, 'wsConnected')
+              wsConnected: readBoolean(record, 'wsConnected'),
+              bids: readBookLevels(record, 'bids'),
+              asks: readBookLevels(record, 'asks'),
+              depthFetchedAtMs: readNumber(record, 'depthFetchedAtMs')
             })
           }
 
@@ -173,4 +181,25 @@ function readSpreadState(
 ): 'LIVE' | 'STALE' | 'UNAVAILABLE' | undefined {
   const value = record[key]
   return value === 'LIVE' || value === 'STALE' || value === 'UNAVAILABLE' ? value : undefined
+}
+
+function readBookLevels(record: Record<string, unknown>, key: string): Array<{ price: number; size: number }> | undefined {
+  const value = record[key]
+  if (!Array.isArray(value)) {
+    return undefined
+  }
+
+  const levels = value
+    .map((entry) => {
+      const item = asObject(entry)
+      const price = readNumber(item, 'price')
+      const size = readNumber(item, 'size')
+      if (price === undefined || size === undefined) {
+        return null
+      }
+      return { price, size }
+    })
+    .filter((entry): entry is { price: number; size: number } => entry !== null)
+
+  return levels
 }

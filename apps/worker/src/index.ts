@@ -873,17 +873,52 @@ async function bootstrap(): Promise<void> {
 
     if (url.pathname === "/market/books") {
       const tokenIds = parseTokenList(url.searchParams.get("token_ids") ?? "");
+      const includeDepth = url.searchParams.get("include_depth") === "1";
       const books =
         tokenIds.length > 0
           ? [...(await marketData.getBookStates(tokenIds)).values()]
           : await marketData.getWatchedBookStates();
+      const depthFetchedAtMs = includeDepth ? Date.now() : undefined;
+      let depthByToken = new Map<string, { bids: Array<{ price: number; size: number }>; asks: Array<{ price: number; size: number }> }>();
+
+      if (includeDepth && tokenIds.length > 0) {
+        try {
+          const fullBooks = await clobRestClient.fetchBooks(tokenIds);
+          depthByToken = new Map(
+            fullBooks.map((book) => [
+              book.asset_id,
+              {
+                bids: book.bids,
+                asks: book.asks
+              }
+            ])
+          );
+        } catch (error) {
+          workerLogger.warn("worker.market_books_depth_fetch_failed", {
+            tokenIds,
+            error: toErrorMessage(error)
+          });
+        }
+      }
 
       res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
       res.end(
         JSON.stringify({
           status: "ok",
           count: books.length,
-          books
+          books: books.map((book) => {
+            const depth = depthByToken.get(book.tokenId);
+            return {
+              ...book,
+              ...(depth
+                ? {
+                    bids: depth.bids,
+                    asks: depth.asks,
+                    depthFetchedAtMs
+                  }
+                : {})
+            };
+          })
         })
       );
       return;

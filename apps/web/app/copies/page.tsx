@@ -79,6 +79,16 @@ interface CopiesData {
       spreadState: 'LIVE' | 'STALE' | 'UNAVAILABLE'
       spreadAgeMs: number | null
       currentSpreadUsd: number | null
+      liveLeaderPriceUsd: number | null
+      liveMidPriceUsd: number | null
+      livePriceLimitUsd: number | null
+      livePriceLimitKind: 'CAP' | 'FLOOR' | null
+      liveUsableDepthShares: number | null
+      liveUsableDepthNotionalUsd: number | null
+      liveRemainingShares: number | null
+      liveRemainingNotionalUsd: number | null
+      liveDepthSufficient: boolean | null
+      liveExpectedPriceUsd: number | null
       retries: number
       maxRetries: number
       status: 'PENDING' | 'RETRYING' | 'EXECUTING'
@@ -293,6 +303,47 @@ function attemptingSpreadDetail(row: AttemptingRow): string | null {
     return null
   }
   return `${Math.max(1, Math.trunc(row.spreadAgeMs / 1000))}s old`
+}
+
+function attemptingLeaderMidLabel(row: AttemptingRow): { leader: string; mid: string } {
+  return {
+    leader: row.liveLeaderPriceUsd === null ? 'n/a' : formatCurrencyDetailed(row.liveLeaderPriceUsd, 6),
+    mid: row.liveMidPriceUsd === null ? 'n/a' : formatCurrencyDetailed(row.liveMidPriceUsd, 6)
+  }
+}
+
+function attemptingCapFloorLabel(row: AttemptingRow): { limit: string; expected: string } {
+  const limitPrefix = row.livePriceLimitKind === 'FLOOR' ? 'floor' : 'cap'
+  return {
+    limit: row.livePriceLimitUsd === null ? 'n/a' : `${limitPrefix} ${formatCurrencyDetailed(row.livePriceLimitUsd, 6)}`,
+    expected: row.liveExpectedPriceUsd === null ? 'expected n/a' : `expected ${formatCurrencyDetailed(row.liveExpectedPriceUsd, 6)}`
+  }
+}
+
+function attemptingDepthLines(row: AttemptingRow): { usable: string; shares: string; remaining: string; sufficient: string } {
+  const usableDepthUsd =
+    row.liveUsableDepthNotionalUsd === null ? 'n/a' : formatCurrencyDetailed(row.liveUsableDepthNotionalUsd, 6)
+  const usableDepthShares =
+    row.liveUsableDepthShares === null ? 'n/a' : `${formatNumber(row.liveUsableDepthShares, 6)} shares`
+  const remainingUsd =
+    row.liveDepthSufficient
+      ? formatCurrencyDetailed(0, 6)
+      : row.liveRemainingNotionalUsd === null
+        ? 'n/a'
+        : formatCurrencyDetailed(row.liveRemainingNotionalUsd, 6)
+  const remainingShares =
+    row.liveDepthSufficient
+      ? `${formatNumber(0, 6)} shares`
+      : row.liveRemainingShares === null
+        ? 'n/a'
+        : `${formatNumber(row.liveRemainingShares, 6)} shares`
+
+  return {
+    usable: row.side === 'BUY' ? usableDepthUsd : usableDepthShares,
+    shares: row.side === 'BUY' ? usableDepthShares : usableDepthUsd,
+    remaining: `${remainingUsd} · ${remainingShares}`,
+    sufficient: row.liveDepthSufficient === null ? 'n/a' : row.liveDepthSufficient ? 'Yes' : 'No'
+  }
 }
 
 function toPolymarketMarketUrl(marketSlug: string | null | undefined): string | null {
@@ -664,6 +715,9 @@ function AttemptingSection({ data }: { data: CopiesData }) {
               <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Side</TableHead>
               <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Attempt size</TableHead>
               <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Price/share</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Leader / Mid</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Cap/Floor</TableHead>
+              <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Depth within limit</TableHead>
               <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Spread</TableHead>
               <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Status</TableHead>
               <TableHead className="px-3 text-xs uppercase tracking-[0.16em] text-[#919191]">Why delayed/blocked</TableHead>
@@ -690,6 +744,19 @@ function AttemptingSection({ data }: { data: CopiesData }) {
                 </TableCell>
                 <TableCell className="px-3 text-[#E7E7E7]">
                   {attemptingPricePerShareUsd(row) === null ? 'n/a' : formatCurrencyDetailed(attemptingPricePerShareUsd(row) ?? 0, 6)}
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">
+                  <p>{attemptingLeaderMidLabel(row).leader}</p>
+                  <p className="text-xs text-[#919191]">mid {attemptingLeaderMidLabel(row).mid}</p>
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">
+                  <p>{attemptingCapFloorLabel(row).limit}</p>
+                  <p className="text-xs text-[#919191]">{attemptingCapFloorLabel(row).expected}</p>
+                </TableCell>
+                <TableCell className="px-3 text-[#E7E7E7]">
+                  <p>{attemptingDepthLines(row).usable}</p>
+                  <p className="text-xs text-[#919191]">{attemptingDepthLines(row).shares}</p>
+                  <p className="text-xs text-[#919191]">remaining {attemptingDepthLines(row).remaining}</p>
                 </TableCell>
                 <TableCell className="px-3 text-[#E7E7E7]">
                   <p>{attemptingSpreadLabel(row)}</p>
@@ -745,6 +812,14 @@ function AttemptingSection({ data }: { data: CopiesData }) {
                 Price/share:{' '}
                 {attemptingPricePerShareUsd(row) === null ? 'n/a' : formatCurrencyDetailed(attemptingPricePerShareUsd(row) ?? 0, 6)}
               </p>
+              <p>Leader price: {attemptingLeaderMidLabel(row).leader}</p>
+              <p>Mid price: {attemptingLeaderMidLabel(row).mid}</p>
+              <p>Cap/Floor: {attemptingCapFloorLabel(row).limit}</p>
+              <p>Expected price: {attemptingCapFloorLabel(row).expected.replace(/^expected /, '')}</p>
+              <p>Usable depth: {attemptingDepthLines(row).usable}</p>
+              <p>Usable depth detail: {attemptingDepthLines(row).shares}</p>
+              <p>Remaining within limit: {attemptingDepthLines(row).remaining}</p>
+              <p>Depth sufficient: {attemptingDepthLines(row).sufficient}</p>
               <p>Current spread: {attemptingSpreadLabel(row)}</p>
               {attemptingSpreadDetail(row) ? <p>Spread age: {attemptingSpreadDetail(row)}</p> : null}
             </div>

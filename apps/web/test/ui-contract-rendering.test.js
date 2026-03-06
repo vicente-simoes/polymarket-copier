@@ -42,3 +42,17 @@ test('api routes use contract envelope helpers', () => {
     assert.match(source, /jsonError\(/)
   }
 })
+
+test('copies route and page expose live attempting diagnostics', () => {
+  const routeSource = readWorkspaceFile('app/api/v1/copies/route.ts')
+  assert.match(routeSource, /includeDepth:\s*true/)
+  assert.match(routeSource, /liveLeaderPriceUsd/)
+  assert.match(routeSource, /livePriceLimitKind/)
+  assert.match(routeSource, /liveDepthSufficient/)
+
+  const pageSource = readWorkspaceFile('app/copies/page.tsx')
+  assert.match(pageSource, /Leader \/ Mid/)
+  assert.match(pageSource, /Cap\/Floor/)
+  assert.match(pageSource, /Depth within limit/)
+  assert.match(pageSource, /Depth sufficient:/)
+})

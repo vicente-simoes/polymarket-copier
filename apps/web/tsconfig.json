@@ -21,7 +21,8 @@
     ],
     "paths": {
       "@/*": ["./*"],
-      "@copybot/db": ["../../packages/db/src/index.ts"]
+      "@copybot/db": ["../../packages/db/src/index.ts"],
+      "@copybot/shared": ["../../packages/shared/src/index.ts"]
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
