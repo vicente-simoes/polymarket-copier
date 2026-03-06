@@ -3,6 +3,7 @@ import { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { jsonContract, jsonError, paginationMeta, parsePagination, toIso, toNumber } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
+import { memoizeAsync } from '@/lib/server/memo'
 import { resolveTokenDisplayMetadata } from '@/lib/server/token-display-metadata'
 import { fetchWorkerHealth, fetchWorkerMarketBooks } from '@/lib/server/worker-health'
 
@@ -185,107 +186,108 @@ const CopiesDataSchema = z.object({
 export async function GET(request: NextRequest) {
   try {
     const url = new URL(request.url)
-    const pagination = parsePagination(url)
-    const section = SectionSchema.safeParse(url.searchParams.get('section')).success
-      ? (url.searchParams.get('section') as z.infer<typeof SectionSchema>)
-      : 'open'
-    const tokenId = url.searchParams.get('tokenId')?.trim()
+    const data = await memoizeAsync<z.input<typeof CopiesDataSchema>>(`route:copies:${url.searchParams.toString()}`, 3_000, async () => {
+      const pagination = parsePagination(url)
+      const section = SectionSchema.safeParse(url.searchParams.get('section')).success
+        ? (url.searchParams.get('section') as z.infer<typeof SectionSchema>)
+        : 'open'
+      const tokenId = url.searchParams.get('tokenId')?.trim()
 
-    const skippedWhere: Prisma.CopyAttemptWhereInput = {
-      OR: [
-        {
-          decision: 'SKIPPED'
-        },
-        {
-          status: {
-            in: ['EXPIRED', 'FAILED']
-          }
-        }
-      ]
-    }
-
-    const [pendingBelowMinCount, openOrdersCount, workerStatusRow, workerHealth] = await Promise.all([
-      prisma.pendingDelta.count({
-        where: {
-          status: {
-            in: ['PENDING', 'BLOCKED']
+      const skippedWhere: Prisma.CopyAttemptWhereInput = {
+        OR: [
+          {
+            decision: 'SKIPPED'
           },
-          OR: [
-            {
-              blockReason: 'MIN_NOTIONAL'
-            },
-            {
-              pendingDeltaNotionalUsd: {
-                lt: '1'
-              }
+          {
+            status: {
+              in: ['EXPIRED', 'FAILED']
             }
-          ]
-        }
-      }),
-      prisma.copyOrder.count({
-        where: {
-          status: {
-            in: ['PLACED', 'PARTIALLY_FILLED', 'RETRYING']
-          },
-          externalOrderId: {
-            not: null
           }
-        }
-      }),
-      prisma.systemStatus.findUnique({
-        where: {
-          component: 'WORKER'
-        },
-        select: {
-          details: true
-        }
-      }),
-      fetchWorkerHealth()
-    ])
+        ]
+      }
 
-    const systemReconcile = asObject(asObject(workerStatusRow?.details).reconcile)
-    const lastReconcileAt =
-      workerHealth && typeof workerHealth.reconcile?.lastSuccessAtMs === 'number'
-        ? new Date(workerHealth.reconcile.lastSuccessAtMs).toISOString()
-        : (typeof systemReconcile.cycleAt === 'string' ? systemReconcile.cycleAt : null)
+      const [pendingBelowMinCount, openOrdersCount, workerStatusRow, workerHealth] = await Promise.all([
+        prisma.pendingDelta.count({
+          where: {
+            status: {
+              in: ['PENDING', 'BLOCKED']
+            },
+            OR: [
+              {
+                blockReason: 'MIN_NOTIONAL'
+              },
+              {
+                pendingDeltaNotionalUsd: {
+                  lt: '1'
+                }
+              }
+            ]
+          }
+        }),
+        prisma.copyOrder.count({
+          where: {
+            status: {
+              in: ['PLACED', 'PARTIALLY_FILLED', 'RETRYING']
+            },
+            externalOrderId: {
+              not: null
+            }
+          }
+        }),
+        prisma.systemStatus.findUnique({
+          where: {
+            component: 'WORKER'
+          },
+          select: {
+            details: true
+          }
+        }),
+        fetchWorkerHealth()
+      ])
 
-    const timeSinceLastReconcileSeconds =
-      lastReconcileAt !== null ? Math.max(0, Math.trunc((Date.now() - new Date(lastReconcileAt).getTime()) / 1_000)) : null
+      const systemReconcile = asObject(asObject(workerStatusRow?.details).reconcile)
+      const lastReconcileAt =
+        workerHealth && typeof workerHealth.reconcile?.lastSuccessAtMs === 'number'
+          ? new Date(workerHealth.reconcile.lastSuccessAtMs).toISOString()
+          : (typeof systemReconcile.cycleAt === 'string' ? systemReconcile.cycleAt : null)
 
-    const executionStatus = asObject(workerHealth?.execution)
-    const userChannelStatus = asObject(workerHealth?.userChannel)
-    const clobAuthStatus = workerHealth
-      ? executionStatus.lastError
-        ? 'ERROR'
-        : 'OK'
-      : 'UNKNOWN'
-    const userChannelConnection =
-      typeof userChannelStatus.connected === 'boolean'
-        ? userChannelStatus.connected
-          ? 'CONNECTED'
-          : 'DISCONNECTED'
+      const timeSinceLastReconcileSeconds =
+        lastReconcileAt !== null ? Math.max(0, Math.trunc((Date.now() - new Date(lastReconcileAt).getTime()) / 1_000)) : null
+
+      const executionStatus = asObject(workerHealth?.execution)
+      const userChannelStatus = asObject(workerHealth?.userChannel)
+      const clobAuthStatus = workerHealth
+        ? executionStatus.lastError
+          ? 'ERROR'
+          : 'OK'
         : 'UNKNOWN'
-    const userChannelLastMessageAt =
-      typeof userChannelStatus.lastMessageAtMs === 'number'
-        ? new Date(userChannelStatus.lastMessageAtMs).toISOString()
-        : null
+      const userChannelConnection =
+        typeof userChannelStatus.connected === 'boolean'
+          ? userChannelStatus.connected
+            ? 'CONNECTED'
+            : 'DISCONNECTED'
+          : 'UNKNOWN'
+      const userChannelLastMessageAt =
+        typeof userChannelStatus.lastMessageAtMs === 'number'
+          ? new Date(userChannelStatus.lastMessageAtMs).toISOString()
+          : null
 
-    const summary = {
-      clobAuthentication: {
-        status: clobAuthStatus as 'OK' | 'ERROR' | 'UNKNOWN',
-        lastCheckedAt: workerHealth?.now ?? null
-      },
-      userChannel: {
-        status: userChannelConnection as 'CONNECTED' | 'DISCONNECTED' | 'UNKNOWN',
-        lastMessageAt: userChannelLastMessageAt
-      },
-      lastReconcileAt,
-      timeSinceLastReconcileSeconds,
-      pendingBelowMinCount,
-      openOrdersCount
-    }
+      const summary = {
+        clobAuthentication: {
+          status: clobAuthStatus as 'OK' | 'ERROR' | 'UNKNOWN',
+          lastCheckedAt: workerHealth?.now ?? null
+        },
+        userChannel: {
+          status: userChannelConnection as 'CONNECTED' | 'DISCONNECTED' | 'UNKNOWN',
+          lastMessageAt: userChannelLastMessageAt
+        },
+        lastReconcileAt,
+        timeSinceLastReconcileSeconds,
+        pendingBelowMinCount,
+        openOrdersCount
+      }
 
-    if (section === 'open') {
+      if (section === 'open') {
       const openWhere: Prisma.PendingDeltaWhereInput = {
         status: {
           in: ['PENDING', 'BLOCKED', 'ELIGIBLE']
@@ -346,9 +348,7 @@ export async function GET(request: NextRequest) {
       const tokenMetadata = await resolveTokenDisplayMetadata(rows.map((row) => row.tokenId))
       const leaderNamesByRow = await resolveOpenLeaderNames(rows)
 
-      return jsonContract(
-        CopiesDataSchema,
-        {
+        return {
           section,
           summary,
           open: {
@@ -377,14 +377,10 @@ export async function GET(request: NextRequest) {
           attempting: null,
           executions: null,
           skipped: null
-        },
-        {
-          cacheSeconds: 5
         }
-      )
-    }
+      }
 
-    if (section === 'attempting') {
+      if (section === 'attempting') {
       const attemptingWhere: Prisma.CopyAttemptWhereInput = {
         status: {
           in: ['PENDING', 'RETRYING', 'EXECUTING']
@@ -458,9 +454,7 @@ export async function GET(request: NextRequest) {
         }))
       )
 
-      return jsonContract(
-        CopiesDataSchema,
-        {
+        return {
           section,
           summary,
           open: null,
@@ -519,14 +513,10 @@ export async function GET(request: NextRequest) {
           },
           executions: null,
           skipped: null
-        },
-        {
-          cacheSeconds: 5
         }
-      )
-    }
+      }
 
-    if (section === 'executions') {
+      if (section === 'executions') {
       const executionWhere: Prisma.CopyOrderWhereInput = {
         externalOrderId: {
           not: null
@@ -578,9 +568,7 @@ export async function GET(request: NextRequest) {
       ])
       const tokenMetadata = await resolveTokenDisplayMetadata(rows.map((row) => row.tokenId))
 
-      return jsonContract(
-        CopiesDataSchema,
-        {
+        return {
           section,
           summary,
           open: null,
@@ -617,14 +605,10 @@ export async function GET(request: NextRequest) {
             pagination: paginationMeta(pagination, total)
           },
           skipped: null
-        },
-        {
-          cacheSeconds: 5
         }
-      )
-    }
+      }
 
-    if (tokenId) {
+      if (tokenId) {
       const [total, details] = await Promise.all([
         prisma.copyAttempt.count({
           where: {
@@ -662,16 +646,14 @@ export async function GET(request: NextRequest) {
       ])
       const tokenMetadata = await resolveTokenDisplayMetadata(details.map((row) => row.tokenId))
 
-      return jsonContract(
-        CopiesDataSchema,
-        {
+        return {
           section,
           summary,
           open: null,
           attempting: null,
           executions: null,
           skipped: {
-            mode: 'details',
+            mode: 'details' as const,
             groups: null,
             details: details.map((row) => ({
               id: row.id,
@@ -690,14 +672,10 @@ export async function GET(request: NextRequest) {
             })),
             pagination: paginationMeta(pagination, total)
           }
-        },
-        {
-          cacheSeconds: 5
         }
-      )
-    }
+      }
 
-    const grouped = await prisma.copyAttempt.groupBy({
+      const grouped = await prisma.copyAttempt.groupBy({
       by: ['tokenId', 'marketId'],
       where: skippedWhere,
       _count: {
@@ -743,16 +721,14 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    return jsonContract(
-      CopiesDataSchema,
-      {
+      return {
         section,
         summary,
         open: null,
         attempting: null,
         executions: null,
         skipped: {
-          mode: 'groups',
+          mode: 'groups' as const,
           groups: paged.map((row) => ({
             tokenId: row.tokenId,
             marketId: row.marketId ?? tokenMetadata.get(row.tokenId)?.marketId ?? null,
@@ -766,11 +742,12 @@ export async function GET(request: NextRequest) {
           details: null,
           pagination: paginationMeta(pagination, total)
         }
-      },
-      {
-        cacheSeconds: 5
       }
-    )
+    })
+
+    return jsonContract(CopiesDataSchema, data, {
+      cacheSeconds: 5
+    })
   } catch (error) {
     if (error instanceof z.ZodError) {
       return jsonError(500, 'COPIES_CONTRACT_FAILED', 'Copies response failed contract validation.', {

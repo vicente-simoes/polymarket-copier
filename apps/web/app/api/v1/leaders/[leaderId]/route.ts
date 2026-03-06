@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { jsonContract, jsonError, parseLeaderProfileAddress, toIso, toNumber } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
 import { LeaderSettingsSchema, normalizeLeaderSettings } from '@/lib/server/leader-settings'
+import { memoizeAsync } from '@/lib/server/memo'
 import { resolveTokenDisplayMetadata } from '@/lib/server/token-display-metadata'
 
 export const runtime = 'nodejs'
@@ -158,250 +159,259 @@ const LeaderMutationDataSchema = z.object({
   status: LeaderStatusSchema
 })
 
+interface LeaderCurrentPositionRow {
+  currentValueUsd: Prisma.Decimal | null
+  snapshotAt: Date
+}
+
+interface FollowerCurrentPositionRow {
+  tokenId: string
+  currentPrice: Prisma.Decimal | null
+  currentValueUsd: Prisma.Decimal | null
+  shares: Prisma.Decimal
+}
+
 export async function GET(_request: NextRequest, context: { params: Promise<{ leaderId: string }> }) {
   try {
     const params = await context.params
-    const leaderId = params.leaderId
+    const data = await memoizeAsync(`route:leader-detail:${params.leaderId}`, 5_000, () => buildLeaderDetailData(params.leaderId))
 
-    const leader = await prisma.leader.findUnique({
-      where: {
-        id: leaderId
-      },
-      select: {
-        id: true,
-        name: true,
-        profileAddress: true,
-        status: true,
-        createdAt: true,
-        updatedAt: true,
-        wallets: {
-          where: {
-            isActive: true
-          },
-          orderBy: [
-            {
-              isPrimary: 'desc'
-            },
-            {
-              createdAt: 'asc'
-            }
-          ],
-          select: {
-            walletAddress: true,
-            isPrimary: true,
-            isActive: true,
-            firstSeenAt: true,
-            lastSeenAt: true
-          }
-        },
-        profileLinks: {
-          orderBy: {
-            createdAt: 'asc'
-          },
-          select: {
-            copyProfileId: true,
-            ratio: true,
-            status: true,
-            settings: true
-          }
-        }
-      }
+    return jsonContract(LeaderDetailDataSchema, data, {
+      cacheSeconds: 5
     })
-
-    if (!leader) {
+  } catch (error) {
+    if ((error as { code?: unknown })?.code === 'LEADER_NOT_FOUND') {
       return jsonError(404, 'LEADER_NOT_FOUND', 'Leader not found.')
     }
+    return jsonError(500, 'LEADER_DETAIL_FAILED', toErrorMessage(error))
+  }
+}
 
-    const latestLeaderSnapshot = await prisma.leaderPositionSnapshot.findFirst({
-      where: {
-        leaderId
+async function buildLeaderDetailData(leaderId: string): Promise<z.input<typeof LeaderDetailDataSchema>> {
+  const leader = await prisma.leader.findUnique({
+    where: {
+      id: leaderId
+    },
+    select: {
+      id: true,
+      name: true,
+      profileAddress: true,
+      status: true,
+      createdAt: true,
+      updatedAt: true,
+      metadata: true,
+      wallets: {
+        where: {
+          isActive: true
+        },
+        orderBy: [
+          {
+            isPrimary: 'desc'
+          },
+          {
+            createdAt: 'asc'
+          }
+        ],
+        select: {
+          walletAddress: true,
+          isPrimary: true,
+          isActive: true,
+          firstSeenAt: true,
+          lastSeenAt: true
+        }
       },
-      orderBy: {
-        snapshotAt: 'desc'
-      },
-      select: {
-        snapshotAt: true
+      profileLinks: {
+        orderBy: {
+          createdAt: 'asc'
+        },
+        select: {
+          copyProfileId: true,
+          ratio: true,
+          status: true,
+          settings: true
+        }
       }
-    })
+    }
+  })
 
-    const [latestLeaderRows, tradeEventCounts, executedCount, skippedCount, skipReasonCounts, recentTriggers, recentExecutions, recentSkips, recentErrors] =
-      await Promise.all([
-        latestLeaderSnapshot
-          ? prisma.leaderPositionSnapshot.findMany({
-              where: {
-                leaderId,
-                snapshotAt: latestLeaderSnapshot.snapshotAt
-              },
-              select: {
-                currentValueUsd: true
-              }
-            })
-          : Promise.resolve([]),
-        prisma.leaderTradeEvent.groupBy({
-          by: ['source'],
-          where: {
-            leaderId
-          },
-          _count: {
-            _all: true
-          }
-        }),
-        prisma.copyAttempt.count({
-          where: {
-            leaderId,
-            decision: 'EXECUTED'
-          }
-        }),
-        prisma.copyAttempt.count({
-          where: {
-            leaderId,
-            OR: [
-              {
-                decision: 'SKIPPED'
-              },
-              {
-                status: {
-                  in: ['EXPIRED', 'FAILED']
-                }
-              }
-            ]
-          }
-        }),
-        prisma.copyAttempt.groupBy({
-          by: ['reason'],
-          where: {
-            leaderId,
-            reason: {
-              not: null
+  if (!leader) {
+    const error = new Error('Leader not found.')
+    ;(error as { code?: string }).code = 'LEADER_NOT_FOUND'
+    throw error
+  }
+
+  const activeProfileId = leader.profileLinks.find((link) => link.status === 'ACTIVE')?.copyProfileId ?? null
+
+  const [leaderCurrentRows, tradeEventCounts, executedCount, skippedCount, skipReasonCounts, recentTriggers, recentExecutions, recentSkips, recentErrors, followerRows, ledgers, workerStatus] =
+    await Promise.all([
+      prisma.$queryRaw<LeaderCurrentPositionRow[]>(
+        Prisma.sql`
+          SELECT "currentValueUsd", "snapshotAt"
+          FROM "LeaderCurrentPosition"
+          WHERE "leaderId" = ${leaderId}
+        `
+      ),
+      prisma.leaderTradeEvent.groupBy({
+        by: ['source'],
+        where: {
+          leaderId
+        },
+        _count: {
+          _all: true
+        }
+      }),
+      prisma.copyAttempt.count({
+        where: {
+          leaderId,
+          decision: 'EXECUTED'
+        }
+      }),
+      prisma.copyAttempt.count({
+        where: {
+          leaderId,
+          OR: [
+            {
+              decision: 'SKIPPED'
             },
-            OR: [
-              {
-                decision: 'SKIPPED'
-              },
-              {
-                status: {
-                  in: ['EXPIRED', 'FAILED']
-                }
+            {
+              status: {
+                in: ['EXPIRED', 'FAILED']
               }
-            ]
+            }
+          ]
+        }
+      }),
+      prisma.copyAttempt.groupBy({
+        by: ['reason'],
+        where: {
+          leaderId,
+          reason: {
+            not: null
           },
-          _count: {
-            _all: true
-          }
-        }),
-        prisma.leaderTradeEvent.findMany({
-          where: {
+          OR: [
+            {
+              decision: 'SKIPPED'
+            },
+            {
+              status: {
+                in: ['EXPIRED', 'FAILED']
+              }
+            }
+          ]
+        },
+        _count: {
+          _all: true
+        }
+      }),
+      prisma.leaderTradeEvent.findMany({
+        where: {
+          leaderId
+        },
+        orderBy: {
+          detectedAtMs: 'desc'
+        },
+        take: 20,
+        select: {
+          id: true,
+          source: true,
+          tokenId: true,
+          marketId: true,
+          outcome: true,
+          side: true,
+          shares: true,
+          price: true,
+          notionalUsd: true,
+          leaderFillAtMs: true,
+          detectedAtMs: true
+        }
+      }),
+      prisma.copyOrder.findMany({
+        where: {
+          copyAttempt: {
             leaderId
-          },
-          orderBy: {
-            detectedAtMs: 'desc'
-          },
-          take: 20,
-          select: {
-            id: true,
-            source: true,
-            tokenId: true,
-            marketId: true,
-            outcome: true,
-            side: true,
-            shares: true,
-            price: true,
-            notionalUsd: true,
-            leaderFillAtMs: true,
-            detectedAtMs: true
           }
-        }),
-        prisma.copyOrder.findMany({
-          where: {
-            copyAttempt: {
-              leaderId
-            }
-          },
-          orderBy: {
-            attemptedAt: 'desc'
-          },
-          take: 20,
-          select: {
-            id: true,
-            copyAttemptId: true,
-            tokenId: true,
-            marketId: true,
-            side: true,
-            status: true,
-            intendedNotionalUsd: true,
-            intendedShares: true,
-            priceLimit: true,
-            attemptedAt: true,
-            errorMessage: true,
-            copyAttempt: {
-              select: {
-                reason: true
-              }
+        },
+        orderBy: {
+          attemptedAt: 'desc'
+        },
+        take: 20,
+        select: {
+          id: true,
+          copyAttemptId: true,
+          tokenId: true,
+          marketId: true,
+          side: true,
+          status: true,
+          intendedNotionalUsd: true,
+          intendedShares: true,
+          priceLimit: true,
+          attemptedAt: true,
+          errorMessage: true,
+          copyAttempt: {
+            select: {
+              reason: true
             }
           }
-        }),
-        prisma.copyAttempt.findMany({
-          where: {
-            leaderId,
-            OR: [
-              {
-                decision: 'SKIPPED'
-              },
-              {
-                status: {
-                  in: ['EXPIRED', 'FAILED']
-                }
+        }
+      }),
+      prisma.copyAttempt.findMany({
+        where: {
+          leaderId,
+          OR: [
+            {
+              decision: 'SKIPPED'
+            },
+            {
+              status: {
+                in: ['EXPIRED', 'FAILED']
               }
-            ]
-          },
-          orderBy: {
-            createdAt: 'desc'
-          },
-          take: 20,
-          select: {
-            id: true,
-            tokenId: true,
-            marketId: true,
-            side: true,
-            status: true,
-            reason: true,
-            decision: true,
-            createdAt: true,
-            attemptedAt: true,
-            accumulatedDeltaNotionalUsd: true
-          }
-        }),
-        prisma.errorEvent.findMany({
-          where: {
-            relatedLeaderId: leaderId
-          },
-          orderBy: {
-            occurredAt: 'desc'
-          },
-          take: 20,
-          select: {
-            id: true,
-            severity: true,
-            code: true,
-            message: true,
-            occurredAt: true
-          }
-        })
-      ])
-
-    const targetExposureUsd = latestLeaderRows.reduce((sum, row) => sum + Math.abs(toNumber(row.currentValueUsd)), 0)
-    const tokenMetadata = await resolveTokenDisplayMetadata([
-      ...new Set([
-        ...recentTriggers.map((row) => row.tokenId),
-        ...recentExecutions.map((row) => row.tokenId),
-        ...recentSkips.map((row) => row.tokenId)
-      ])
-    ])
-
-    const activeProfileId = leader.profileLinks.find((link) => link.status === 'ACTIVE')?.copyProfileId ?? null
-    const ledgers =
+            }
+          ]
+        },
+        orderBy: {
+          createdAt: 'desc'
+        },
+        take: 20,
+        select: {
+          id: true,
+          tokenId: true,
+          marketId: true,
+          side: true,
+          status: true,
+          reason: true,
+          decision: true,
+          createdAt: true,
+          attemptedAt: true,
+          accumulatedDeltaNotionalUsd: true
+        }
+      }),
+      prisma.errorEvent.findMany({
+        where: {
+          relatedLeaderId: leaderId
+        },
+        orderBy: {
+          occurredAt: 'desc'
+        },
+        take: 20,
+        select: {
+          id: true,
+          severity: true,
+          code: true,
+          message: true,
+          occurredAt: true
+        }
+      }),
       activeProfileId
-        ? await prisma.$queryRaw<Array<{ tokenId: string; shares: Prisma.Decimal }>>(
+        ? prisma.$queryRaw<FollowerCurrentPositionRow[]>(
+            Prisma.sql`
+              SELECT "tokenId", "currentPrice", "currentValueUsd", "shares"
+              FROM "FollowerCurrentPosition"
+              WHERE "copyProfileId" = ${activeProfileId}
+            `
+          )
+        : Promise.resolve([]),
+      activeProfileId
+        ? prisma.$queryRaw<Array<{ tokenId: string; shares: Prisma.Decimal }>>(
             Prisma.sql`
               SELECT "tokenId", "shares"
               FROM "LeaderTokenLedger"
@@ -409,198 +419,178 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ le
                 AND "leaderId" = ${leaderId}
             `
           )
-        : []
-
-    const latestFollowerSnapshotAt = activeProfileId
-      ? await prisma.followerPositionSnapshot.findFirst({
-          where: {
-            copyProfileId: activeProfileId
-          },
-          orderBy: {
-            snapshotAt: 'desc'
-          },
-          select: {
-            snapshotAt: true
-          }
-        })
-      : null
-
-    const followerRows =
-      activeProfileId && latestFollowerSnapshotAt
-        ? await prisma.followerPositionSnapshot.findMany({
-            where: {
-              copyProfileId: activeProfileId,
-              snapshotAt: latestFollowerSnapshotAt.snapshotAt
-            },
-            select: {
-              tokenId: true,
-              currentPrice: true,
-              currentValueUsd: true,
-              shares: true
-            }
-          })
-        : []
-
-    const tokenPriceById = new Map<string, number>()
-    for (const row of followerRows) {
-      const fallbackPrice =
-        Math.abs(toNumber(row.shares)) > 0 ? Math.abs(toNumber(row.currentValueUsd)) / Math.abs(toNumber(row.shares)) : 0
-      tokenPriceById.set(row.tokenId, toNumber(row.currentPrice) || fallbackPrice)
-    }
-
-    const followerAttributedExposureUsd = ledgers.reduce((sum, row) => {
-      const markPrice = tokenPriceById.get(row.tokenId) ?? 0
-      return sum + Math.abs(toNumber(row.shares) * markPrice)
-    }, 0)
-
-    const tradeCountMap = new Map<string, number>()
-    for (const row of tradeEventCounts) {
-      tradeCountMap.set(row.source, row._count._all)
-    }
-
-    const skipReasonBreakdown = skipReasonCounts
-      .filter((row) => row.reason !== null)
-      .map((row) => ({
-        reason: row.reason as string,
-        count: row._count._all
-      }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10)
-
-    const workerStatus = await prisma.systemStatus.findUnique({
-      where: {
-        component: 'WORKER'
-      },
-      select: {
-        details: true
-      }
-    })
-
-    const reconcile = asObject(workerStatus?.details).reconcile
-    const reconcileObject = asObject(reconcile)
-    const reconcileIssues = Array.isArray(reconcileObject.issues)
-      ? reconcileObject.issues.filter((entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null)
-      : []
-
-    return jsonContract(
-      LeaderDetailDataSchema,
-      {
-        id: leader.id,
-        name: leader.name,
-        profileAddress: leader.profileAddress,
-        status: leader.status,
-        createdAt: leader.createdAt.toISOString(),
-        updatedAt: leader.updatedAt.toISOString(),
-        wallets: leader.wallets.map((wallet) => ({
-          walletAddress: wallet.walletAddress,
-          isPrimary: wallet.isPrimary,
-          isActive: wallet.isActive,
-          firstSeenAt: wallet.firstSeenAt.toISOString(),
-          lastSeenAt: wallet.lastSeenAt.toISOString()
-        })),
-        profileLinks: leader.profileLinks.map((link) => ({
-          copyProfileId: link.copyProfileId,
-          ratio: toNumber(link.ratio),
-          status: link.status,
-          settings: normalizeLeaderSettings(link.settings)
-        })),
-        stats: {
-          targetExposureUsd,
-          followerAttributedExposureUsd,
-          trackingErrorUsd: Math.abs(targetExposureUsd - followerAttributedExposureUsd),
-          counters: {
-            triggersReceived: tradeCountMap.get('CHAIN') ?? 0,
-            tradesDetected: recentTriggers.length,
-            tradesExecuted: executedCount,
-            skips: skippedCount,
-            skipReasons: skipReasonBreakdown
-          }
+        : Promise.resolve([]),
+      prisma.systemStatus.findUnique({
+        where: {
+          component: 'WORKER'
         },
-        recent: {
-          triggers: recentTriggers.map((row) => ({
-            ...tokenMetadataForRow(tokenMetadata, row.tokenId, row.marketId, row.outcome),
-            id: row.id,
-            source: row.source,
-            tokenId: row.tokenId,
-            side: row.side,
-            shares: toNumber(row.shares),
-            price: toNumber(row.price),
-            notionalUsd: toNumber(row.notionalUsd),
-            leaderFillAtMs: row.leaderFillAtMs.toString(),
-            detectedAtMs: row.detectedAtMs.toString()
-          })),
-          executions: recentExecutions.map((row) => ({
-            ...tokenMetadataForRow(tokenMetadata, row.tokenId, row.marketId),
-            id: row.id,
-            copyAttemptId: row.copyAttemptId,
-            tokenId: row.tokenId,
-            side: row.side,
-            status: row.status,
-            intendedNotionalUsd: toNumber(row.intendedNotionalUsd),
-            intendedShares: toNumber(row.intendedShares),
-            priceLimit: toNumber(row.priceLimit),
-            attemptedAt: row.attemptedAt.toISOString(),
-            reason: row.copyAttempt?.reason ?? null,
-            errorMessage: row.errorMessage
-          })),
-          skips: recentSkips.map((row) => ({
-            ...tokenMetadataForRow(tokenMetadata, row.tokenId, row.marketId),
-            id: row.id,
-            tokenId: row.tokenId,
-            side: row.side,
-            status: row.status,
-            reason: row.reason,
-            decision: row.decision,
-            createdAt: row.createdAt.toISOString(),
-            attemptedAt: toIso(row.attemptedAt),
-            accumulatedDeltaNotionalUsd: toNumber(row.accumulatedDeltaNotionalUsd)
-          })),
-          errors: recentErrors.map((row) => ({
-            id: row.id,
-            severity: row.severity,
-            code: row.code,
-            message: row.message,
-            occurredAt: row.occurredAt.toISOString()
-          }))
-        },
-        diagnostics: {
-          lastAuthoritativePositionsSnapshotAt: toIso(latestLeaderSnapshot?.snapshotAt ?? null),
-          lastReconcile: reconcileObject && Object.keys(reconcileObject).length > 0
-            ? {
-                cycleAt: typeof reconcileObject.cycleAt === 'string' ? reconcileObject.cycleAt : null,
-                status: typeof reconcileObject.status === 'string' ? reconcileObject.status : null,
-                deltasConsidered: firstNumber(
-                  reconcileObject.deltasConsidered,
-                  reconcileObject.considered,
-                  reconcileObject.tokensEvaluated
-                ),
-                deltasExecuted: firstNumber(
-                  reconcileObject.deltasExecuted,
-                  reconcileObject.executed,
-                  reconcileObject.executedCount
-                ),
-                deltasSkipped: firstNumber(
-                  reconcileObject.deltasSkipped,
-                  reconcileObject.skipped,
-                  reconcileObject.skippedCount
-                ),
-                integrityViolations:
-                  typeof reconcileObject.integrityViolations === 'number' ? reconcileObject.integrityViolations : null,
-                issues: reconcileIssues.map((issue) => ({
-                  code: typeof issue.code === 'string' ? issue.code : 'UNKNOWN',
-                  message: typeof issue.message === 'string' ? issue.message : 'n/a',
-                  severity: typeof issue.severity === 'string' ? issue.severity : 'n/a'
-                }))
-              }
-            : null
+        select: {
+          details: true
         }
-      },
-      {
-        cacheSeconds: 5
+      })
+    ])
+
+  const latestLeaderSnapshotAt = leaderCurrentRows.reduce<Date | null>((latest: Date | null, row: LeaderCurrentPositionRow) => {
+    if (!latest || row.snapshotAt.getTime() > latest.getTime()) {
+      return row.snapshotAt
+    }
+    return latest
+  }, null)
+
+  const targetExposureUsd = leaderCurrentRows.reduce(
+    (sum: number, row: LeaderCurrentPositionRow) => sum + Math.abs(toNumber(row.currentValueUsd)),
+    0
+  )
+  const tokenMetadata = await resolveTokenDisplayMetadata([
+    ...new Set([
+      ...recentTriggers.map((row) => row.tokenId),
+      ...recentExecutions.map((row) => row.tokenId),
+      ...recentSkips.map((row) => row.tokenId)
+    ])
+  ])
+
+  const tokenPriceById = new Map<string, number>()
+  for (const row of followerRows) {
+    const shares = toNumber(row.shares)
+    const fallbackPrice = Math.abs(shares) > 0 ? Math.abs(toNumber(row.currentValueUsd)) / Math.abs(shares) : 0
+    tokenPriceById.set(row.tokenId, toNumber(row.currentPrice) || fallbackPrice)
+  }
+
+  const followerAttributedExposureUsd = ledgers.reduce((sum: number, row) => {
+    const markPrice = tokenPriceById.get(row.tokenId) ?? 0
+    return sum + Math.abs(toNumber(row.shares) * markPrice)
+  }, 0)
+
+  const tradeCountMap = new Map<string, number>()
+  for (const row of tradeEventCounts) {
+    tradeCountMap.set(row.source, row._count._all)
+  }
+
+  const skipReasonBreakdown = skipReasonCounts
+    .filter((row) => row.reason !== null)
+    .map((row) => ({
+      reason: row.reason as string,
+      count: row._count._all
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10)
+
+  const reconcileObject = asObject(asObject(workerStatus?.details).reconcile)
+  const reconcileIssues = Array.isArray(reconcileObject.issues)
+    ? reconcileObject.issues.filter((entry): entry is Record<string, unknown> => typeof entry === 'object' && entry !== null)
+    : []
+
+  return {
+    id: leader.id,
+    name: leader.name,
+    profileAddress: leader.profileAddress,
+    status: leader.status,
+    createdAt: leader.createdAt.toISOString(),
+    updatedAt: leader.updatedAt.toISOString(),
+    wallets: leader.wallets.map((wallet) => ({
+      walletAddress: wallet.walletAddress,
+      isPrimary: wallet.isPrimary,
+      isActive: wallet.isActive,
+      firstSeenAt: wallet.firstSeenAt.toISOString(),
+      lastSeenAt: wallet.lastSeenAt.toISOString()
+    })),
+    profileLinks: leader.profileLinks.map((link) => ({
+      copyProfileId: link.copyProfileId,
+      ratio: toNumber(link.ratio),
+      status: link.status,
+      settings: normalizeLeaderSettings(link.settings)
+    })),
+    stats: {
+      targetExposureUsd,
+      followerAttributedExposureUsd,
+      trackingErrorUsd: Math.abs(targetExposureUsd - followerAttributedExposureUsd),
+      counters: {
+        triggersReceived: tradeCountMap.get('CHAIN') ?? 0,
+        tradesDetected: recentTriggers.length,
+        tradesExecuted: executedCount,
+        skips: skippedCount,
+        skipReasons: skipReasonBreakdown
       }
-    )
-  } catch (error) {
-    return jsonError(500, 'LEADER_DETAIL_FAILED', toErrorMessage(error))
+    },
+    recent: {
+      triggers: recentTriggers.map((row) => ({
+        ...tokenMetadataForRow(tokenMetadata, row.tokenId, row.marketId, row.outcome),
+        id: row.id,
+        source: row.source,
+        tokenId: row.tokenId,
+        side: row.side,
+        shares: toNumber(row.shares),
+        price: toNumber(row.price),
+        notionalUsd: toNumber(row.notionalUsd),
+        leaderFillAtMs: row.leaderFillAtMs.toString(),
+        detectedAtMs: row.detectedAtMs.toString()
+      })),
+      executions: recentExecutions.map((row) => ({
+        ...tokenMetadataForRow(tokenMetadata, row.tokenId, row.marketId),
+        id: row.id,
+        copyAttemptId: row.copyAttemptId,
+        tokenId: row.tokenId,
+        side: row.side,
+        status: row.status,
+        intendedNotionalUsd: toNumber(row.intendedNotionalUsd),
+        intendedShares: toNumber(row.intendedShares),
+        priceLimit: toNumber(row.priceLimit),
+        attemptedAt: row.attemptedAt.toISOString(),
+        reason: row.copyAttempt?.reason ?? null,
+        errorMessage: row.errorMessage
+      })),
+      skips: recentSkips.map((row) => ({
+        ...tokenMetadataForRow(tokenMetadata, row.tokenId, row.marketId),
+        id: row.id,
+        tokenId: row.tokenId,
+        side: row.side,
+        status: row.status,
+        reason: row.reason,
+        decision: row.decision,
+        createdAt: row.createdAt.toISOString(),
+        attemptedAt: toIso(row.attemptedAt),
+        accumulatedDeltaNotionalUsd: toNumber(row.accumulatedDeltaNotionalUsd)
+      })),
+      errors: recentErrors.map((row) => ({
+        id: row.id,
+        severity: row.severity,
+        code: row.code,
+        message: row.message,
+        occurredAt: row.occurredAt.toISOString()
+      }))
+    },
+    diagnostics: {
+      lastAuthoritativePositionsSnapshotAt: toIso(latestLeaderSnapshotAt ?? readLeaderLastSnapshotAt(leader.metadata)),
+      lastReconcile:
+        reconcileObject && Object.keys(reconcileObject).length > 0
+          ? {
+              cycleAt: typeof reconcileObject.cycleAt === 'string' ? reconcileObject.cycleAt : null,
+              status: typeof reconcileObject.status === 'string' ? reconcileObject.status : null,
+              deltasConsidered: firstNumber(
+                reconcileObject.deltasConsidered,
+                reconcileObject.considered,
+                reconcileObject.tokensEvaluated
+              ),
+              deltasExecuted: firstNumber(
+                reconcileObject.deltasExecuted,
+                reconcileObject.executed,
+                reconcileObject.executedCount
+              ),
+              deltasSkipped: firstNumber(
+                reconcileObject.deltasSkipped,
+                reconcileObject.skipped,
+                reconcileObject.skippedCount
+              ),
+              integrityViolations:
+                typeof reconcileObject.integrityViolations === 'number' ? reconcileObject.integrityViolations : null,
+              issues: reconcileIssues.map((issue) => ({
+                code: typeof issue.code === 'string' ? issue.code : 'UNKNOWN',
+                message: typeof issue.message === 'string' ? issue.message : 'n/a',
+                severity: typeof issue.severity === 'string' ? issue.severity : 'n/a'
+              }))
+            }
+          : null
+    }
   }
 }
 
@@ -853,6 +843,18 @@ function isUniqueConstraintError(error: unknown): boolean {
 
 function toJsonValue(value: Record<string, unknown>): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue
+}
+
+function readLeaderLastSnapshotAt(value: unknown): Date | null {
+  const metadata = asObject(value)
+  const ingestion = asObject(metadata.ingestion)
+  const positions = asObject(ingestion.positions)
+  const raw = positions.lastSnapshotAt
+  if (typeof raw !== 'string') {
+    return null
+  }
+  const parsed = new Date(raw)
+  return Number.isFinite(parsed.getTime()) ? parsed : null
 }
 
 function toErrorMessage(error: unknown): string {

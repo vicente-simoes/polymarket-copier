@@ -1,6 +1,8 @@
 import { copyDecisionKey } from "@copybot/shared";
 import type {
   ActiveCopyProfile,
+  FollowerPositionPoint,
+  LeaderPositionPoint,
   PendingDeltaSide,
   PendingDeltaStatus,
   PriceSnapshot,
@@ -13,6 +15,9 @@ export interface TargetNettingEngineDeps {
   store: TargetNettingStore;
   config: TargetNettingConfig;
   resolvePriceSnapshot: (tokenId: string, marketId?: string) => Promise<PriceSnapshot | null>;
+  resolvePriceSnapshots?: (
+    requests: Array<{ tokenId: string; marketId?: string }>
+  ) => Promise<Map<string, PriceSnapshot>>;
   now?: () => number;
 }
 
@@ -20,6 +25,9 @@ export class TargetNettingEngine {
   private readonly store: TargetNettingStore;
   private readonly config: TargetNettingConfig;
   private readonly resolvePriceSnapshot: (tokenId: string, marketId?: string) => Promise<PriceSnapshot | null>;
+  private readonly resolvePriceSnapshots?: (
+    requests: Array<{ tokenId: string; marketId?: string }>
+  ) => Promise<Map<string, PriceSnapshot>>;
   private readonly now: () => number;
   private interval?: NodeJS.Timeout;
   private inFlight = false;
@@ -29,6 +37,7 @@ export class TargetNettingEngine {
     this.store = deps.store;
     this.config = deps.config;
     this.resolvePriceSnapshot = deps.resolvePriceSnapshot;
+    this.resolvePriceSnapshots = deps.resolvePriceSnapshots;
     this.now = deps.now ?? Date.now;
     this.status = {
       enabled: deps.config.enabled,
@@ -180,6 +189,8 @@ export class TargetNettingEngine {
       this.store.getLatestFollowerPositions(profile.copyProfileId),
       this.store.listOpenPendingTokenIds(profile.copyProfileId)
     ]);
+    const prefetchRequests = buildPricePrefetchRequests(leaderPositions, followerPositions, openPendingTokenIds);
+    const prefetchedPriceSnapshots = await this.resolvePriceSnapshotsForRequests(prefetchRequests);
     const baselineTokenIds = [...new Set([...leaderPositions.map((position) => position.tokenId), ...openPendingTokenIds])];
     const latestLeaderTradePrices = await this.store.getLatestLeaderTradePrices({
       leaderIds,
@@ -217,7 +228,9 @@ export class TargetNettingEngine {
         continue;
       }
 
-      const priceSnapshot = await this.resolvePriceSnapshot(position.tokenId, position.marketId);
+      const priceSnapshot =
+        prefetchedPriceSnapshots.get(position.tokenId) ??
+        (await this.resolvePriceSnapshot(position.tokenId, position.marketId));
       const chosenPrice = choosePrice(position.currentPrice, priceSnapshot);
       if (!chosenPrice || chosenPrice <= 0) {
         continue;
@@ -295,7 +308,8 @@ export class TargetNettingEngine {
       let priceSource = targetPriceByToken.get(tokenId)?.source ?? "UNKNOWN";
       let minOrderSize = targetPriceByToken.get(tokenId)?.minOrderSize ?? 0;
       if (!tokenPrice || tokenPrice <= 0) {
-        const snapshot = await this.resolvePriceSnapshot(tokenId, marketId);
+        const snapshot =
+          prefetchedPriceSnapshots.get(tokenId) ?? (await this.resolvePriceSnapshot(tokenId, marketId));
         const fallbackPrice = choosePrice(undefined, snapshot);
         if (!fallbackPrice || fallbackPrice <= 0) {
           continue;
@@ -403,6 +417,63 @@ export class TargetNettingEngine {
       attemptsCreated
     };
   }
+
+  private async resolvePriceSnapshotsForRequests(
+    requests: Array<{ tokenId: string; marketId?: string }>
+  ): Promise<Map<string, PriceSnapshot>> {
+    if (requests.length === 0) {
+      return new Map<string, PriceSnapshot>();
+    }
+
+    if (this.resolvePriceSnapshots) {
+      return this.resolvePriceSnapshots(requests);
+    }
+
+    const resolved = await Promise.all(
+      requests.map(async (request) => [request.tokenId, await this.resolvePriceSnapshot(request.tokenId, request.marketId)] as const)
+    );
+
+    const byToken = new Map<string, PriceSnapshot>();
+    for (const [tokenId, snapshot] of resolved) {
+      if (snapshot) {
+        byToken.set(tokenId, snapshot);
+      }
+    }
+    return byToken;
+  }
+}
+
+function buildPricePrefetchRequests(
+  leaderPositions: LeaderPositionPoint[],
+  followerPositions: FollowerPositionPoint[],
+  openPendingTokenIds: string[]
+): Array<{ tokenId: string; marketId?: string }> {
+  const byToken = new Map<string, { tokenId: string; marketId?: string }>();
+
+  for (const position of leaderPositions) {
+    if (!byToken.has(position.tokenId)) {
+      byToken.set(position.tokenId, {
+        tokenId: position.tokenId,
+        marketId: position.marketId
+      });
+    }
+  }
+
+  for (const position of followerPositions) {
+    if (!byToken.has(position.tokenId)) {
+      byToken.set(position.tokenId, {
+        tokenId: position.tokenId
+      });
+    }
+  }
+
+  for (const tokenId of openPendingTokenIds) {
+    if (!byToken.has(tokenId)) {
+      byToken.set(tokenId, { tokenId });
+    }
+  }
+
+  return [...byToken.values()];
 }
 
 function choosePrice(currentPrice: number | undefined, snapshot: PriceSnapshot | null): number | undefined {

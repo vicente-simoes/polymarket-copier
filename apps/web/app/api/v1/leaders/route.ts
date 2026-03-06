@@ -12,6 +12,7 @@ import {
 } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
 import { LeaderSettingsSchema, normalizeLeaderSettings } from '@/lib/server/leader-settings'
+import { memoizeAsync } from '@/lib/server/memo'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -77,238 +78,238 @@ const CreatedLeaderDataSchema = z.object({
 export async function GET(request: NextRequest) {
   try {
     const url = new URL(request.url)
-    const pagination = parsePagination(url)
-    const search = url.searchParams.get('search')?.trim() ?? ''
-    const statusFilter = url.searchParams.get('status')
+    const data = await memoizeAsync(`route:leaders:${url.searchParams.toString()}`, 5_000, () => buildLeaderListData(url))
 
-    const where: Prisma.LeaderWhereInput = {}
-    if (statusFilter && LeaderStatusSchema.safeParse(statusFilter).success) {
-      where.status = statusFilter as z.infer<typeof LeaderStatusSchema>
-    }
-    if (search.length > 0) {
-      where.OR = [
-        {
-          name: {
-            contains: search,
-            mode: 'insensitive'
-          }
-        },
-        {
-          profileAddress: {
-            contains: search,
-            mode: 'insensitive'
-          }
-        },
-        {
-          wallets: {
-            some: {
-              walletAddress: {
-                contains: search.toLowerCase(),
-                mode: 'insensitive'
-              }
-            }
-          }
-        }
-      ]
-    }
-
-    const [total, leaders] = await Promise.all([
-      prisma.leader.count({ where }),
-      prisma.leader.findMany({
-        where,
-        orderBy: {
-          createdAt: 'asc'
-        },
-        skip: pagination.skip,
-        take: pagination.pageSize,
-        select: {
-          id: true,
-          name: true,
-          profileAddress: true,
-          status: true,
-          createdAt: true,
-          wallets: {
-            where: {
-              isActive: true
-            },
-            orderBy: [
-              {
-                isPrimary: 'desc'
-              },
-              {
-                createdAt: 'asc'
-              }
-            ],
-            select: {
-              walletAddress: true,
-              isPrimary: true
-            }
-          }
-        }
-      })
-    ])
-
-    const leaderIds = leaders.map((leader) => leader.id)
-
-    const [latestSnapshots, profileLinks, pendingByLeader, attemptByLeaderDecision, pnlSummaries] = await Promise.all([
-      leaderIds.length === 0
-        ? Promise.resolve([])
-        : prisma.$queryRaw<Array<{ leaderId: string; snapshotAt: Date }>>(
-            Prisma.sql`
-              SELECT DISTINCT ON ("leaderId") "leaderId", "snapshotAt"
-              FROM "LeaderPositionSnapshot"
-              WHERE "leaderId" IN (${Prisma.join(leaderIds)})
-              ORDER BY "leaderId", "snapshotAt" DESC
-            `
-          ),
-      leaderIds.length === 0
-        ? Promise.resolve([])
-        : prisma.copyProfileLeader.findMany({
-            where: {
-              leaderId: {
-                in: leaderIds
-              },
-              status: 'ACTIVE'
-            },
-            orderBy: {
-              createdAt: 'asc'
-            },
-            select: {
-              leaderId: true,
-              copyProfileId: true,
-              ratio: true,
-              settings: true
-            }
-          }),
-      leaderIds.length === 0
-        ? Promise.resolve([])
-        : prisma.pendingDelta.groupBy({
-            by: ['leaderId'],
-            where: {
-              leaderId: {
-                in: leaderIds
-              },
-              status: {
-                in: ['PENDING', 'BLOCKED', 'ELIGIBLE']
-              }
-            },
-            _sum: {
-              pendingDeltaNotionalUsd: true
-            }
-          }),
-      leaderIds.length === 0
-        ? Promise.resolve([])
-        : prisma.copyAttempt.groupBy({
-            by: ['leaderId', 'decision'],
-            where: {
-              leaderId: {
-                in: leaderIds
-              }
-            },
-            _count: {
-              _all: true
-            }
-          }),
-      leaderIds.length === 0
-        ? Promise.resolve([])
-        : prisma.$queryRaw<Array<{ leaderId: string; copyProfileId: string; realizedPnlUsd: Prisma.Decimal }>>(
-            Prisma.sql`
-              SELECT "leaderId", "copyProfileId", "realizedPnlUsd"
-              FROM "LeaderPnlSummary"
-              WHERE "leaderId" IN (${Prisma.join(leaderIds)})
-            `
-          )
-    ])
-
-    const exposureRows =
-      latestSnapshots.length === 0
-        ? []
-        : await prisma.leaderPositionSnapshot.findMany({
-            where: {
-              OR: latestSnapshots.map((row) => ({
-                leaderId: row.leaderId,
-                snapshotAt: row.snapshotAt
-              }))
-            },
-            select: {
-              leaderId: true,
-              snapshotAt: true,
-              currentValueUsd: true
-            }
-          })
-
-    const exposureByLeader = new Map<string, number>()
-    const lastSyncByLeader = new Map<string, Date>()
-    for (const row of exposureRows) {
-      const previous = exposureByLeader.get(row.leaderId) ?? 0
-      exposureByLeader.set(row.leaderId, previous + Math.abs(toNumber(row.currentValueUsd)))
-
-      const knownLastSync = lastSyncByLeader.get(row.leaderId)
-      if (!knownLastSync || row.snapshotAt.getTime() > knownLastSync.getTime()) {
-        lastSyncByLeader.set(row.leaderId, row.snapshotAt)
-      }
-    }
-
-    const profileLinkByLeader = new Map<
-      string,
+    return jsonContract(
+      LeaderListDataSchema,
+      data,
       {
-        copyProfileId: string
-        ratio: number
-        allowDenyConfigured: boolean
-        capsConfigured: boolean
+        cacheSeconds: 5
       }
-    >()
-    for (const link of profileLinks) {
-      if (profileLinkByLeader.has(link.leaderId)) {
-        continue
+    )
+  } catch (error) {
+    return jsonError(500, 'LEADERS_LIST_FAILED', toErrorMessage(error))
+  }
+}
+
+async function buildLeaderListData(url: URL): Promise<z.input<typeof LeaderListDataSchema>> {
+  const pagination = parsePagination(url)
+  const search = url.searchParams.get('search')?.trim() ?? ''
+  const statusFilter = url.searchParams.get('status')
+
+  const where: Prisma.LeaderWhereInput = {}
+  if (statusFilter && LeaderStatusSchema.safeParse(statusFilter).success) {
+    where.status = statusFilter as z.infer<typeof LeaderStatusSchema>
+  }
+  if (search.length > 0) {
+    where.OR = [
+      {
+        name: {
+          contains: search,
+          mode: 'insensitive'
+        }
+      },
+      {
+        profileAddress: {
+          contains: search,
+          mode: 'insensitive'
+        }
+      },
+      {
+        wallets: {
+          some: {
+            walletAddress: {
+              contains: search.toLowerCase(),
+              mode: 'insensitive'
+            }
+          }
+        }
       }
+    ]
+  }
 
-      const settings = normalizeLeaderSettings(link.settings)
-      const allowDenyConfigured = (settings.allowList?.length ?? 0) > 0 || (settings.denyList?.length ?? 0) > 0
-      const capsConfigured =
-        (settings.maxExposurePerLeaderUsd ?? 0) > 0 ||
-        (settings.maxExposurePerMarketOutcomeUsd ?? 0) > 0 ||
-        (settings.maxDailyNotionalTurnoverUsd ?? 0) > 0 ||
-        (settings.maxPricePerShareUsd ?? 0) > 0
+  const [total, leaders] = await Promise.all([
+    prisma.leader.count({ where }),
+    prisma.leader.findMany({
+      where,
+      orderBy: {
+        createdAt: 'asc'
+      },
+      skip: pagination.skip,
+      take: pagination.pageSize,
+      select: {
+        id: true,
+        name: true,
+        profileAddress: true,
+        status: true,
+        createdAt: true,
+        metadata: true,
+        wallets: {
+          where: {
+            isActive: true
+          },
+          orderBy: [
+            {
+              isPrimary: 'desc'
+            },
+            {
+              createdAt: 'asc'
+            }
+          ],
+          select: {
+            walletAddress: true,
+            isPrimary: true
+          }
+        }
+      }
+    })
+  ])
 
-      profileLinkByLeader.set(link.leaderId, {
-        copyProfileId: link.copyProfileId,
-        ratio: toNumber(link.ratio),
-        allowDenyConfigured,
-        capsConfigured
-      })
+  const leaderIds = leaders.map((leader) => leader.id)
+
+  const [currentPositions, profileLinks, pendingByLeader, attemptByLeaderDecision, pnlSummaries] = await Promise.all([
+    leaderIds.length === 0
+      ? Promise.resolve([])
+      : prisma.$queryRaw<Array<{ leaderId: string; snapshotAt: Date; currentValueUsd: Prisma.Decimal | null }>>(
+          Prisma.sql`
+            SELECT "leaderId", "snapshotAt", "currentValueUsd"
+            FROM "LeaderCurrentPosition"
+            WHERE "leaderId" IN (${Prisma.join(leaderIds)})
+          `
+        ),
+    leaderIds.length === 0
+      ? Promise.resolve([])
+      : prisma.copyProfileLeader.findMany({
+          where: {
+            leaderId: {
+              in: leaderIds
+            },
+            status: 'ACTIVE'
+          },
+          orderBy: {
+            createdAt: 'asc'
+          },
+          select: {
+            leaderId: true,
+            copyProfileId: true,
+            ratio: true,
+            settings: true
+          }
+        }),
+    leaderIds.length === 0
+      ? Promise.resolve([])
+      : prisma.pendingDelta.groupBy({
+          by: ['leaderId'],
+          where: {
+            leaderId: {
+              in: leaderIds
+            },
+            status: {
+              in: ['PENDING', 'BLOCKED', 'ELIGIBLE']
+            }
+          },
+          _sum: {
+            pendingDeltaNotionalUsd: true
+          }
+        }),
+    leaderIds.length === 0
+      ? Promise.resolve([])
+      : prisma.copyAttempt.groupBy({
+          by: ['leaderId', 'decision'],
+          where: {
+            leaderId: {
+              in: leaderIds
+            }
+          },
+          _count: {
+            _all: true
+          }
+        }),
+    leaderIds.length === 0
+      ? Promise.resolve([])
+      : prisma.$queryRaw<Array<{ leaderId: string; copyProfileId: string; realizedPnlUsd: Prisma.Decimal }>>(
+          Prisma.sql`
+            SELECT "leaderId", "copyProfileId", "realizedPnlUsd"
+            FROM "LeaderPnlSummary"
+            WHERE "leaderId" IN (${Prisma.join(leaderIds)})
+          `
+        )
+  ])
+
+  const exposureByLeader = new Map<string, number>()
+  const lastSyncByLeader = new Map<string, Date>()
+  for (const row of currentPositions) {
+    const previous = exposureByLeader.get(row.leaderId) ?? 0
+    exposureByLeader.set(row.leaderId, previous + Math.abs(toNumber(row.currentValueUsd)))
+
+    const knownLastSync = lastSyncByLeader.get(row.leaderId)
+    if (!knownLastSync || row.snapshotAt.getTime() > knownLastSync.getTime()) {
+      lastSyncByLeader.set(row.leaderId, row.snapshotAt)
+    }
+  }
+
+  const profileLinkByLeader = new Map<
+    string,
+    {
+      copyProfileId: string
+      ratio: number
+      allowDenyConfigured: boolean
+      capsConfigured: boolean
+    }
+  >()
+  for (const link of profileLinks) {
+    if (profileLinkByLeader.has(link.leaderId)) {
+      continue
     }
 
-    const trackingErrorByLeader = new Map<string, number>()
-    for (const row of pendingByLeader) {
-      if (!row.leaderId) {
-        continue
-      }
-      trackingErrorByLeader.set(row.leaderId, Math.abs(toNumber(row._sum.pendingDeltaNotionalUsd)))
-    }
+    const settings = normalizeLeaderSettings(link.settings)
+    const allowDenyConfigured = (settings.allowList?.length ?? 0) > 0 || (settings.denyList?.length ?? 0) > 0
+    const capsConfigured =
+      (settings.maxExposurePerLeaderUsd ?? 0) > 0 ||
+      (settings.maxExposurePerMarketOutcomeUsd ?? 0) > 0 ||
+      (settings.maxDailyNotionalTurnoverUsd ?? 0) > 0 ||
+      (settings.maxPricePerShareUsd ?? 0) > 0
 
-    const executedCountByLeader = new Map<string, number>()
-    const skippedCountByLeader = new Map<string, number>()
-    for (const row of attemptByLeaderDecision) {
-      if (!row.leaderId) {
-        continue
-      }
-      if (row.decision === 'EXECUTED') {
-        executedCountByLeader.set(row.leaderId, row._count._all)
-      }
-      if (row.decision === 'SKIPPED') {
-        skippedCountByLeader.set(row.leaderId, row._count._all)
-      }
-    }
+    profileLinkByLeader.set(link.leaderId, {
+      copyProfileId: link.copyProfileId,
+      ratio: toNumber(link.ratio),
+      allowDenyConfigured,
+      capsConfigured
+    })
+  }
 
-    const pnlByLeaderProfile = new Map<string, number>()
-    for (const row of pnlSummaries) {
-      pnlByLeaderProfile.set(`${row.leaderId}|${row.copyProfileId}`, toNumber(row.realizedPnlUsd))
+  const trackingErrorByLeader = new Map<string, number>()
+  for (const row of pendingByLeader) {
+    if (!row.leaderId) {
+      continue
     }
+    trackingErrorByLeader.set(row.leaderId, Math.abs(toNumber(row._sum.pendingDeltaNotionalUsd)))
+  }
 
-    const items = leaders.map((leader) => {
+  const executedCountByLeader = new Map<string, number>()
+  const skippedCountByLeader = new Map<string, number>()
+  for (const row of attemptByLeaderDecision) {
+    if (!row.leaderId) {
+      continue
+    }
+    if (row.decision === 'EXECUTED') {
+      executedCountByLeader.set(row.leaderId, row._count._all)
+    }
+    if (row.decision === 'SKIPPED') {
+      skippedCountByLeader.set(row.leaderId, row._count._all)
+    }
+  }
+
+  const pnlByLeaderProfile = new Map<string, number>()
+  for (const row of pnlSummaries) {
+    pnlByLeaderProfile.set(`${row.leaderId}|${row.copyProfileId}`, toNumber(row.realizedPnlUsd))
+  }
+
+  return {
+    items: leaders.map((leader) => {
       const link = profileLinkByLeader.get(leader.id)
       const primaryWallet = leader.wallets.find((wallet) => wallet.isPrimary)?.walletAddress ?? leader.wallets[0]?.walletAddress ?? null
+      const fallbackLastSyncAt = readLeaderLastSnapshotAt(leader.metadata)
 
       return {
         id: leader.id,
@@ -318,7 +319,7 @@ export async function GET(request: NextRequest) {
         createdAt: leader.createdAt.toISOString(),
         tradeWallets: leader.wallets.map((wallet) => wallet.walletAddress),
         primaryTradeWallet: primaryWallet,
-        lastSyncAt: toIso(lastSyncByLeader.get(leader.id)),
+        lastSyncAt: toIso(lastSyncByLeader.get(leader.id) ?? fallbackLastSyncAt),
         copyConfig: {
           copyProfileId: link?.copyProfileId ?? null,
           ratio: link?.ratio ?? null,
@@ -333,20 +334,8 @@ export async function GET(request: NextRequest) {
           skippedCount: skippedCountByLeader.get(leader.id) ?? 0
         }
       }
-    })
-
-    return jsonContract(
-      LeaderListDataSchema,
-      {
-        items,
-        pagination: paginationMeta(pagination, total)
-      },
-      {
-        cacheSeconds: 5
-      }
-    )
-  } catch (error) {
-    return jsonError(500, 'LEADERS_LIST_FAILED', toErrorMessage(error))
+    }),
+    pagination: paginationMeta(pagination, total)
   }
 }
 
@@ -557,6 +546,13 @@ function normalizeAddress(value: string | null | undefined): string | null {
   return normalized
 }
 
+function asObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {}
+  }
+  return value as Record<string, unknown>
+}
+
 function isUniqueConstraintError(error: unknown): boolean {
   if (!error || typeof error !== 'object') {
     return false
@@ -566,6 +562,18 @@ function isUniqueConstraintError(error: unknown): boolean {
 
 function toJsonValue(value: Record<string, unknown>): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue
+}
+
+function readLeaderLastSnapshotAt(value: unknown): Date | null {
+  const metadata = asObject(value)
+  const ingestion = asObject(metadata.ingestion)
+  const positions = asObject(ingestion.positions)
+  const raw = positions.lastSnapshotAt
+  if (typeof raw !== 'string') {
+    return null
+  }
+  const parsed = new Date(raw)
+  return Number.isFinite(parsed.getTime()) ? parsed : null
 }
 
 function toErrorMessage(error: unknown): string {

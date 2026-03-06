@@ -9,9 +9,13 @@
     "typecheck": "tsc --noEmit",
     "lint": "echo \"no lint config yet\"",
     "test": "node --import tsx --test test/**/*.test.ts",
+    "backfill:leader-current-positions": "node --import tsx src/scripts/backfill-leader-current-positions.ts",
+    "backfill:follower-current-positions": "node --import tsx src/scripts/backfill-follower-current-positions.ts",
+    "backfill:leader-latest-trade-prices": "node --import tsx src/scripts/backfill-leader-latest-trade-prices.ts",
     "backfill:token-metadata": "node --import tsx src/scripts/backfill-token-metadata.ts",
     "fills:backfill": "node --import tsx src/scripts/fills-backfill.ts",
-    "ledger:rebuild": "node --import tsx src/scripts/rebuild-leader-ledger.ts"
+    "ledger:rebuild": "node --import tsx src/scripts/rebuild-leader-ledger.ts",
+    "prune:history": "node --import tsx src/scripts/prune-history.ts"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.2.4",

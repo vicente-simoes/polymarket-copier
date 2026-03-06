@@ -14,62 +14,45 @@ import { useApiQuery } from '@/components/dashboard/use-api-query'
 import { formatCurrency, formatDateTime, formatNumber, formatSignedCurrency } from '@/lib/format'
 
 interface PortfolioPositionPayload {
-  positions: {
-    items: Array<{
-      tokenId: string
-      marketId: string | null
-      marketName: string | null
-      outcome: string | null
-      shares: number
-      currentPrice: number
-      costBasisUsd: number
-      currentValueUsd: number
-      unrealizedPnlUsd: number
-    }>
-  }
-}
-
-interface CopyExecutionsPayload {
-  executions: {
-    items: Array<{
-      id: string
-      attemptedAt: string
-      leaderName: string | null
-      side: 'BUY' | 'SELL'
-      status: 'PLACED' | 'PARTIALLY_FILLED' | 'FILLED' | 'FAILED' | 'CANCELLED' | 'RETRYING'
-      intendedNotionalUsd: number
-      reason: string | null
-      errorMessage: string | null
-      accumulatedDeltaNotionalUsd: number | null
-    }>
+  position: {
+    tokenId: string
+    marketId: string | null
+    marketName: string | null
+    outcome: string | null
+    shares: number
+    currentPrice: number
+    costBasisUsd: number
+    currentValueUsd: number
+    unrealizedPnlUsd: number
   } | null
-}
-
-interface CopyOpenPayload {
-  open: {
-    items: Array<{
-      id: string
-      createdAt: string
-      leaderName: string | null
-      side: 'BUY' | 'SELL'
-      status: 'PENDING' | 'ELIGIBLE' | 'BLOCKED' | 'EXPIRED' | 'CONVERTED'
-      blockReason: string | null
-      pendingNotionalUsd: number
-    }>
-  } | null
-}
-
-interface CopySkippedPayload {
-  skipped: {
-    details: Array<{
-      id: string
-      createdAt: string
-      leaderName: string | null
-      side: 'BUY' | 'SELL'
-      reason: string | null
-      accumulatedDeltaNotionalUsd: number
-    }> | null
-  } | null
+  executions: Array<{
+    id: string
+    attemptedAt: string
+    leaderName: string | null
+    side: 'BUY' | 'SELL'
+    status: 'PLACED' | 'PARTIALLY_FILLED' | 'FILLED' | 'FAILED' | 'CANCELLED' | 'RETRYING'
+    intendedNotionalUsd: number
+    reason: string | null
+    errorMessage: string | null
+    accumulatedDeltaNotionalUsd: number | null
+  }>
+  openAttempts: Array<{
+    id: string
+    createdAt: string
+    leaderName: string | null
+    side: 'BUY' | 'SELL'
+    status: 'PENDING' | 'ELIGIBLE' | 'BLOCKED' | 'EXPIRED' | 'CONVERTED'
+    blockReason: string | null
+    pendingNotionalUsd: number
+  }>
+  skippedAttempts: Array<{
+    id: string
+    createdAt: string
+    leaderName: string | null
+    side: 'BUY' | 'SELL'
+    reason: string | null
+    accumulatedDeltaNotionalUsd: number
+  }>
 }
 
 interface CombinedAttempt {
@@ -92,67 +75,42 @@ export default function PositionDetailPage() {
   const params = useParams<{ tokenId: string }>()
   const tokenId = useMemo(() => params?.tokenId ?? '', [params])
 
-  const positionQuery = tokenId
-    ? `/api/v1/portfolio?range=24h&tokenId=${encodeURIComponent(tokenId)}&page=1&pageSize=1`
-    : '/api/v1/portfolio?range=24h&page=1&pageSize=1'
-  const executionsQuery = tokenId
-    ? `/api/v1/copies?section=executions&tokenId=${encodeURIComponent(tokenId)}&page=1&pageSize=50`
-    : '/api/v1/copies?section=executions&page=1&pageSize=50'
-  const openQuery = tokenId
-    ? `/api/v1/copies?section=open&tokenId=${encodeURIComponent(tokenId)}&page=1&pageSize=50`
-    : '/api/v1/copies?section=open&page=1&pageSize=50'
-  const skippedQuery = tokenId
-    ? `/api/v1/copies?section=skipped&tokenId=${encodeURIComponent(tokenId)}&page=1&pageSize=50`
-    : '/api/v1/copies?section=skipped&page=1&pageSize=50'
+  const detailQuery = tokenId
+    ? `/api/v1/portfolio/positions/${encodeURIComponent(tokenId)}/detail`
+    : '/api/v1/portfolio'
 
-  const positionState = useApiQuery<PortfolioPositionPayload>(positionQuery, {
+  const detailState = useApiQuery<PortfolioPositionPayload>(detailQuery, {
     enabled: Boolean(tokenId),
     refreshIntervalMs: 20_000
   })
-  const executionsState = useApiQuery<CopyExecutionsPayload>(executionsQuery, {
-    enabled: Boolean(tokenId),
-    refreshIntervalMs: 20_000
-  })
-  const openState = useApiQuery<CopyOpenPayload>(openQuery, {
-    enabled: Boolean(tokenId),
-    refreshIntervalMs: 20_000
-  })
-  const skippedState = useApiQuery<CopySkippedPayload>(skippedQuery, {
-    enabled: Boolean(tokenId),
-    refreshIntervalMs: 20_000
-  })
-
-  const isLoading = positionState.isLoading || executionsState.isLoading || openState.isLoading || skippedState.isLoading
-  const hasError = positionState.error || executionsState.error || openState.error || skippedState.error
+  const isLoading = detailState.isLoading
+  const hasError = detailState.error
 
   if (!tokenId) {
     return <EmptyState title="Missing token id" description="Open this page from the portfolio positions list." />
   }
 
-  if (isLoading && !positionState.data) {
+  if (isLoading && !detailState.data) {
     return <LoadingState title="Loading position detail" description="Fetching position and copy attempt history." />
   }
 
-  if (hasError && !positionState.data) {
+  if (hasError && !detailState.data) {
     return (
       <ErrorState
         title="Position detail unavailable"
         description={hasError ?? 'Unknown error'}
         actionLabel="Retry"
         onAction={() => {
-          void positionState.refresh()
-          void executionsState.refresh()
-          void openState.refresh()
-          void skippedState.refresh()
+          void detailState.refresh()
         }}
       />
     )
   }
 
-  const position = positionState.data?.positions.items[0] ?? null
+  const position = detailState.data?.position ?? null
 
   const attempts: CombinedAttempt[] = [
-    ...((openState.data?.open?.items ?? []).map((row) => ({
+    ...((detailState.data?.openAttempts ?? []).map((row) => ({
       id: row.id,
       timestamp: row.createdAt,
       side: row.side,
@@ -161,7 +119,7 @@ export default function PositionDetailPage() {
       accumulatedDeltaNotionalUsd: row.pendingNotionalUsd,
       reason: row.blockReason ?? row.status
     })) as CombinedAttempt[]),
-    ...((executionsState.data?.executions?.items ?? []).map((row) => ({
+    ...((detailState.data?.executions ?? []).map((row) => ({
       id: row.id,
       timestamp: row.attemptedAt,
       side: row.side,
@@ -170,7 +128,7 @@ export default function PositionDetailPage() {
       accumulatedDeltaNotionalUsd: row.accumulatedDeltaNotionalUsd,
       reason: row.status === 'FAILED' ? row.errorMessage ?? row.reason : row.reason
     })) as CombinedAttempt[]),
-    ...((skippedState.data?.skipped?.details ?? []).map((row) => ({
+    ...((detailState.data?.skippedAttempts ?? []).map((row) => ({
       id: row.id,
       timestamp: row.createdAt,
       side: row.side,
@@ -204,7 +162,7 @@ export default function PositionDetailPage() {
               </Link>
             </Button>
             <TimestampBadge
-              value={positionState.generatedAt ?? executionsState.generatedAt ?? openState.generatedAt ?? skippedState.generatedAt}
+              value={detailState.generatedAt}
             />
           </div>
         </div>

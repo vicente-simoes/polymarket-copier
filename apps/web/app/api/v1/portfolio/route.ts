@@ -11,6 +11,7 @@ import {
   toNumber
 } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
+import { memoizeAsync } from '@/lib/server/memo'
 import { resolveTokenDisplayMetadata } from '@/lib/server/token-display-metadata'
 
 export const runtime = 'nodejs'
@@ -89,299 +90,27 @@ const PortfolioDataSchema = z.object({
   })
 })
 
+type PortfolioData = z.input<typeof PortfolioDataSchema>
+
+interface FollowerCurrentPositionRow {
+  tokenId: string
+  marketId: string | null
+  outcome: string | null
+  shares: Prisma.Decimal
+  currentPrice: Prisma.Decimal | null
+  costBasisUsd: Prisma.Decimal | null
+  currentValueUsd: Prisma.Decimal | null
+  snapshotAt: Date
+}
+
 export async function GET(request: NextRequest) {
   try {
     const url = new URL(request.url)
-    const requestedProfileId = url.searchParams.get('copyProfileId')
-    const tokenIdFilter = url.searchParams.get('tokenId')?.trim()
-    const range = RangeSchema.safeParse(url.searchParams.get('range')).success
-      ? (url.searchParams.get('range') as z.infer<typeof RangeSchema>)
-      : '24h'
-    const pagination = parsePagination(url)
+    const data = await memoizeAsync(`route:portfolio:${url.searchParams.toString()}`, 3_000, () => buildPortfolioData(url))
 
-    const copyProfile =
-      requestedProfileId
-        ? await prisma.copyProfile.findUnique({
-            where: {
-              id: requestedProfileId
-            },
-            select: {
-              id: true
-            }
-          })
-        : await prisma.copyProfile.findFirst({
-            where: {
-              status: {
-                in: ['ACTIVE', 'PAUSED']
-              }
-            },
-            orderBy: {
-              createdAt: 'asc'
-            },
-            select: {
-              id: true
-            }
-          })
-
-    if (!copyProfile) {
-      return jsonContract(PortfolioDataSchema, {
-        copyProfileId: null,
-        range,
-        summary: {
-          exposureUsd: 0,
-          totalValueUsd: 0,
-          realizedPnlUsd: 0,
-          unrealizedPnlUsd: 0,
-          totalPnlUsd: 0,
-          window1hPnlUsd: 0,
-          window24hPnlUsd: 0,
-          window1wPnlUsd: 0,
-          window1mPnlUsd: 0,
-          lastUpdatedAt: null
-        },
-        chart: {
-          points: [],
-          pointCount: 0,
-          maxPoints: rangeToConfig(range).maxPoints
-        },
-        exposureBreakdown: {
-          byLeaderTop: [],
-          byOutcomeTop: []
-        },
-        positions: {
-          items: [],
-          pagination: paginationMeta(pagination, 0)
-        }
-      })
-    }
-
-    const latestSnapshot = await prisma.followerPositionSnapshot.findFirst({
-      where: {
-        copyProfileId: copyProfile.id
-      },
-      orderBy: {
-        snapshotAt: 'desc'
-      },
-      select: {
-        snapshotAt: true
-      }
+    return jsonContract(PortfolioDataSchema, data, {
+      cacheSeconds: 15
     })
-
-    const positions =
-      latestSnapshot
-        ? await prisma.followerPositionSnapshot.findMany({
-            where: {
-              copyProfileId: copyProfile.id,
-              snapshotAt: latestSnapshot.snapshotAt
-            },
-            select: {
-              tokenId: true,
-              marketId: true,
-              payload: true,
-              outcome: true,
-              shares: true,
-              currentPrice: true,
-              costBasisUsd: true,
-              currentValueUsd: true
-            }
-          })
-        : []
-
-    const tokenMetadata = await resolveTokenDisplayMetadata(positions.map((row) => row.tokenId))
-
-    const basePositions = positions
-      .map((row) => {
-        const shares = toNumber(row.shares)
-        const currentPrice = toNumber(row.currentPrice)
-        const currentValueUsd = toNumber(row.currentValueUsd) || shares * currentPrice
-        const costBasisUsd = toNumber(row.costBasisUsd)
-        const unrealizedPnlUsd = currentValueUsd - costBasisUsd
-
-        return {
-          tokenId: row.tokenId,
-          marketId: row.marketId,
-          marketName: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
-          outcome: row.outcome,
-          shares,
-          currentPrice,
-          costBasisUsd,
-          currentValueUsd,
-          unrealizedPnlUsd
-        }
-      })
-
-    const sortedPositions = basePositions
-      .sort((a, b) => Math.abs(b.currentValueUsd) - Math.abs(a.currentValueUsd))
-
-    const filteredPositions = tokenIdFilter
-      ? sortedPositions.filter((row) => row.tokenId === tokenIdFilter)
-      : sortedPositions
-    const totalPositions = filteredPositions.length
-    const pagedPositions = filteredPositions.slice(pagination.skip, pagination.skip + pagination.pageSize)
-
-    const realizedPnlRows = await prisma.$queryRaw<Array<{ realizedPnlUsd: Prisma.Decimal | null }>>(
-      Prisma.sql`
-        SELECT SUM("realizedPnlUsd") AS "realizedPnlUsd"
-        FROM "LeaderPnlSummary"
-        WHERE "copyProfileId" = ${copyProfile.id}
-      `
-    )
-    const realizedPnlUsd = realizedPnlRows[0]?.realizedPnlUsd ?? null
-
-    const realizedTotal = toNumber(realizedPnlUsd)
-    const unrealizedTotal = sortedPositions.reduce((sum, row) => sum + row.unrealizedPnlUsd, 0)
-    const exposureTotal = sortedPositions.reduce((sum, row) => sum + Math.abs(row.currentValueUsd), 0)
-    const totalValueUsd = sortedPositions.reduce((sum, row) => sum + row.currentValueUsd, 0)
-    const totalPnlUsd = realizedTotal + unrealizedTotal
-
-    const rangeConfig = rangeToConfig(range)
-    const since = new Date(Date.now() - rangeConfig.windowMs)
-
-    const snapshots = await prisma.portfolioSnapshot.findMany({
-      where: {
-        copyProfileId: copyProfile.id,
-        snapshotAt: {
-          gte: since
-        }
-      },
-      orderBy: {
-        snapshotAt: 'desc'
-      },
-      take: rangeConfig.maxPoints,
-      select: {
-        snapshotAt: true,
-        exposureUsd: true,
-        totalValueUsd: true,
-        realizedPnlUsd: true,
-        unrealizedPnlUsd: true,
-        totalPnlUsd: true,
-        window1hPnlUsd: true,
-        window24hPnlUsd: true,
-        window7dPnlUsd: true,
-        window30dPnlUsd: true
-      }
-    })
-
-    const points = [...snapshots]
-      .reverse()
-      .map((row) => ({
-        timestamp: row.snapshotAt.toISOString(),
-        exposureUsd: toNumber(row.exposureUsd),
-        totalValueUsd: toNumber(row.totalValueUsd),
-        totalPnlUsd: toNumber(row.totalPnlUsd),
-        realizedPnlUsd: toNumber(row.realizedPnlUsd),
-        unrealizedPnlUsd: toNumber(row.unrealizedPnlUsd)
-      }))
-
-    const summaryFromSnapshots = snapshots[0]
-    const summary = {
-      exposureUsd: points.length > 0 ? points[points.length - 1]?.exposureUsd ?? exposureTotal : exposureTotal,
-      totalValueUsd: points.length > 0 ? points[points.length - 1]?.totalValueUsd ?? totalValueUsd : totalValueUsd,
-      realizedPnlUsd: realizedTotal,
-      unrealizedPnlUsd: unrealizedTotal,
-      totalPnlUsd,
-      window1hPnlUsd: toNumber(summaryFromSnapshots?.window1hPnlUsd),
-      window24hPnlUsd: toNumber(summaryFromSnapshots?.window24hPnlUsd),
-      window1wPnlUsd: toNumber(summaryFromSnapshots?.window7dPnlUsd),
-      window1mPnlUsd: toNumber(summaryFromSnapshots?.window30dPnlUsd),
-      lastUpdatedAt: toIso(latestSnapshot?.snapshotAt ?? null)
-    }
-
-    if (points.length === 0 && latestSnapshot) {
-      points.push({
-        timestamp: latestSnapshot.snapshotAt.toISOString(),
-        exposureUsd: exposureTotal,
-        totalValueUsd,
-        totalPnlUsd,
-        realizedPnlUsd: realizedTotal,
-        unrealizedPnlUsd: unrealizedTotal
-      })
-    }
-
-    const priceByToken = new Map(sortedPositions.map((position) => [position.tokenId, position.currentPrice]))
-    const leaderLedgers = await prisma.$queryRaw<Array<{ leaderId: string; tokenId: string; shares: Prisma.Decimal; leaderName: string }>>(
-      Prisma.sql`
-        SELECT
-          ltl."leaderId",
-          ltl."tokenId",
-          ltl."shares",
-          l."name" AS "leaderName"
-        FROM "LeaderTokenLedger" ltl
-        INNER JOIN "Leader" l ON l."id" = ltl."leaderId"
-        WHERE ltl."copyProfileId" = ${copyProfile.id}
-      `
-    )
-
-    const leaderExposureMap = new Map<string, { leaderName: string; exposureUsd: number }>()
-    for (const row of leaderLedgers) {
-      const current = leaderExposureMap.get(row.leaderId) ?? {
-        leaderName: row.leaderName,
-        exposureUsd: 0
-      }
-      const markPrice = priceByToken.get(row.tokenId) ?? 0
-      current.exposureUsd += Math.abs(toNumber(row.shares) * markPrice)
-      leaderExposureMap.set(row.leaderId, current)
-    }
-
-    const byLeaderTop = [...leaderExposureMap.entries()]
-      .map(([leaderId, row]) => ({
-        leaderId,
-        leaderName: row.leaderName,
-        exposureUsd: round(row.exposureUsd, 6)
-      }))
-      .sort((a, b) => b.exposureUsd - a.exposureUsd)
-      .slice(0, 4)
-
-    const byOutcomeSorted = [...sortedPositions]
-      .map((row) => ({
-        tokenId: row.tokenId,
-        marketId: row.marketId,
-        marketName: row.marketName,
-        outcome: row.outcome,
-        exposureUsd: Math.abs(row.currentValueUsd)
-      }))
-      .sort((a, b) => b.exposureUsd - a.exposureUsd)
-
-    const topOutcomes = byOutcomeSorted.slice(0, 10).map((row) => ({
-      ...row,
-      isOther: false
-    }))
-    const otherExposure = byOutcomeSorted.slice(10).reduce((sum, row) => sum + row.exposureUsd, 0)
-    if (otherExposure > 0) {
-      topOutcomes.push({
-        tokenId: 'OTHER',
-        marketId: null,
-        marketName: 'Other',
-        outcome: 'Other',
-        exposureUsd: otherExposure,
-        isOther: true
-      })
-    }
-
-    return jsonContract(
-      PortfolioDataSchema,
-      {
-        copyProfileId: copyProfile.id,
-        range,
-        summary,
-        chart: {
-          points,
-          pointCount: points.length,
-          maxPoints: rangeConfig.maxPoints
-        },
-        exposureBreakdown: {
-          byLeaderTop,
-          byOutcomeTop: topOutcomes
-        },
-        positions: {
-          items: pagedPositions,
-          pagination: paginationMeta(pagination, totalPositions)
-        }
-      },
-      {
-        cacheSeconds: 15
-      }
-    )
   } catch (error) {
     if (error instanceof z.ZodError) {
       return jsonError(500, 'PORTFOLIO_CONTRACT_FAILED', 'Portfolio response failed contract validation.', {
@@ -389,6 +118,276 @@ export async function GET(request: NextRequest) {
       })
     }
     return jsonError(500, 'PORTFOLIO_FAILED', toErrorMessage(error))
+  }
+}
+
+async function buildPortfolioData(url: URL): Promise<PortfolioData> {
+  const requestedProfileId = url.searchParams.get('copyProfileId')
+  const tokenIdFilter = url.searchParams.get('tokenId')?.trim()
+  const range = RangeSchema.safeParse(url.searchParams.get('range')).success
+    ? (url.searchParams.get('range') as z.infer<typeof RangeSchema>)
+    : '24h'
+  const pagination = parsePagination(url)
+
+  const copyProfile =
+    requestedProfileId
+      ? await prisma.copyProfile.findUnique({
+          where: {
+            id: requestedProfileId
+          },
+          select: {
+            id: true
+          }
+        })
+      : await prisma.copyProfile.findFirst({
+          where: {
+            status: {
+              in: ['ACTIVE', 'PAUSED']
+            }
+          },
+          orderBy: {
+            createdAt: 'asc'
+          },
+          select: {
+            id: true
+          }
+        })
+
+  if (!copyProfile) {
+    return {
+      copyProfileId: null,
+      range,
+      summary: {
+        exposureUsd: 0,
+        totalValueUsd: 0,
+        realizedPnlUsd: 0,
+        unrealizedPnlUsd: 0,
+        totalPnlUsd: 0,
+        window1hPnlUsd: 0,
+        window24hPnlUsd: 0,
+        window1wPnlUsd: 0,
+        window1mPnlUsd: 0,
+        lastUpdatedAt: null
+      },
+      chart: {
+        points: [],
+        pointCount: 0,
+        maxPoints: rangeToConfig(range).maxPoints
+      },
+      exposureBreakdown: {
+        byLeaderTop: [],
+        byOutcomeTop: []
+      },
+      positions: {
+        items: [],
+        pagination: paginationMeta(pagination, 0)
+      }
+    }
+  }
+
+  const positions = await prisma.$queryRaw<FollowerCurrentPositionRow[]>(
+    Prisma.sql`
+      SELECT
+        "tokenId",
+        "marketId",
+        "outcome",
+        "shares",
+        "currentPrice",
+        "costBasisUsd",
+        "currentValueUsd",
+        "snapshotAt"
+      FROM "FollowerCurrentPosition"
+      WHERE "copyProfileId" = ${copyProfile.id}
+    `
+  )
+
+  const latestSnapshotAt = positions.reduce<Date | null>((latest: Date | null, row: FollowerCurrentPositionRow) => {
+    if (!latest || row.snapshotAt.getTime() > latest.getTime()) {
+      return row.snapshotAt
+    }
+    return latest
+  }, null)
+
+  const tokenMetadata = await resolveTokenDisplayMetadata(positions.map((row: FollowerCurrentPositionRow) => row.tokenId))
+
+  const basePositions = positions.map((row: FollowerCurrentPositionRow) => {
+    const shares = toNumber(row.shares)
+    const currentPrice = toNumber(row.currentPrice)
+    const currentValueUsd = toNumber(row.currentValueUsd) || shares * currentPrice
+    const costBasisUsd = toNumber(row.costBasisUsd)
+    const unrealizedPnlUsd = currentValueUsd - costBasisUsd
+
+    return {
+      tokenId: row.tokenId,
+      marketId: row.marketId,
+      marketName: tokenMetadata.get(row.tokenId)?.marketLabel ?? null,
+      outcome: row.outcome,
+      shares,
+      currentPrice,
+      costBasisUsd,
+      currentValueUsd,
+      unrealizedPnlUsd
+    }
+  })
+
+  const sortedPositions = basePositions.sort((a, b) => Math.abs(b.currentValueUsd) - Math.abs(a.currentValueUsd))
+  const filteredPositions = tokenIdFilter ? sortedPositions.filter((row) => row.tokenId === tokenIdFilter) : sortedPositions
+  const totalPositions = filteredPositions.length
+  const pagedPositions = filteredPositions.slice(pagination.skip, pagination.skip + pagination.pageSize)
+
+  const realizedPnlRows = await prisma.$queryRaw<Array<{ realizedPnlUsd: Prisma.Decimal | null }>>(
+    Prisma.sql`
+      SELECT SUM("realizedPnlUsd") AS "realizedPnlUsd"
+      FROM "LeaderPnlSummary"
+      WHERE "copyProfileId" = ${copyProfile.id}
+    `
+  )
+  const realizedPnlUsd = realizedPnlRows[0]?.realizedPnlUsd ?? null
+
+  const realizedTotal = toNumber(realizedPnlUsd)
+  const unrealizedTotal = sortedPositions.reduce((sum: number, row) => sum + row.unrealizedPnlUsd, 0)
+  const exposureTotal = sortedPositions.reduce((sum: number, row) => sum + Math.abs(row.currentValueUsd), 0)
+  const totalValueUsd = sortedPositions.reduce((sum: number, row) => sum + row.currentValueUsd, 0)
+  const totalPnlUsd = realizedTotal + unrealizedTotal
+
+  const rangeConfig = rangeToConfig(range)
+  const since = new Date(Date.now() - rangeConfig.windowMs)
+  const snapshots = await prisma.portfolioSnapshot.findMany({
+    where: {
+      copyProfileId: copyProfile.id,
+      snapshotAt: {
+        gte: since
+      }
+    },
+    orderBy: {
+      snapshotAt: 'desc'
+    },
+    take: rangeConfig.maxPoints,
+    select: {
+      snapshotAt: true,
+      exposureUsd: true,
+      totalValueUsd: true,
+      realizedPnlUsd: true,
+      unrealizedPnlUsd: true,
+      totalPnlUsd: true,
+      window1hPnlUsd: true,
+      window24hPnlUsd: true,
+      window7dPnlUsd: true,
+      window30dPnlUsd: true
+    }
+  })
+
+  const points = [...snapshots].reverse().map((row) => ({
+    timestamp: row.snapshotAt.toISOString(),
+    exposureUsd: toNumber(row.exposureUsd),
+    totalValueUsd: toNumber(row.totalValueUsd),
+    totalPnlUsd: toNumber(row.totalPnlUsd),
+    realizedPnlUsd: toNumber(row.realizedPnlUsd),
+    unrealizedPnlUsd: toNumber(row.unrealizedPnlUsd)
+  }))
+
+  const summaryFromSnapshots = snapshots[0]
+  const summary = {
+    exposureUsd: points.length > 0 ? points[points.length - 1]?.exposureUsd ?? exposureTotal : exposureTotal,
+    totalValueUsd: points.length > 0 ? points[points.length - 1]?.totalValueUsd ?? totalValueUsd : totalValueUsd,
+    realizedPnlUsd: realizedTotal,
+    unrealizedPnlUsd: unrealizedTotal,
+    totalPnlUsd,
+    window1hPnlUsd: toNumber(summaryFromSnapshots?.window1hPnlUsd),
+    window24hPnlUsd: toNumber(summaryFromSnapshots?.window24hPnlUsd),
+    window1wPnlUsd: toNumber(summaryFromSnapshots?.window7dPnlUsd),
+    window1mPnlUsd: toNumber(summaryFromSnapshots?.window30dPnlUsd),
+    lastUpdatedAt: toIso(latestSnapshotAt)
+  }
+
+  if (points.length === 0 && latestSnapshotAt) {
+    points.push({
+      timestamp: latestSnapshotAt.toISOString(),
+      exposureUsd: exposureTotal,
+      totalValueUsd,
+      totalPnlUsd,
+      realizedPnlUsd: realizedTotal,
+      unrealizedPnlUsd: unrealizedTotal
+    })
+  }
+
+  const priceByToken = new Map(sortedPositions.map((position) => [position.tokenId, position.currentPrice] as const))
+  const leaderLedgers = await prisma.$queryRaw<Array<{ leaderId: string; tokenId: string; shares: Prisma.Decimal; leaderName: string }>>(
+    Prisma.sql`
+      SELECT
+        ltl."leaderId",
+        ltl."tokenId",
+        ltl."shares",
+        l."name" AS "leaderName"
+      FROM "LeaderTokenLedger" ltl
+      INNER JOIN "Leader" l ON l."id" = ltl."leaderId"
+      WHERE ltl."copyProfileId" = ${copyProfile.id}
+    `
+  )
+
+  const leaderExposureMap = new Map<string, { leaderName: string; exposureUsd: number }>()
+  for (const row of leaderLedgers) {
+    const current = leaderExposureMap.get(row.leaderId) ?? {
+      leaderName: row.leaderName,
+      exposureUsd: 0
+    }
+    const markPrice = priceByToken.get(row.tokenId) ?? 0
+      current.exposureUsd += Math.abs(toNumber(row.shares) * markPrice)
+    leaderExposureMap.set(row.leaderId, current)
+  }
+
+  const byLeaderTop = [...leaderExposureMap.entries()]
+      .map(([leaderId, row]) => ({
+        leaderId,
+        leaderName: row.leaderName,
+        exposureUsd: round(row.exposureUsd, 6)
+    }))
+    .sort((a, b) => b.exposureUsd - a.exposureUsd)
+    .slice(0, 4)
+
+  const byOutcomeSorted = [...sortedPositions]
+    .map((row) => ({
+      tokenId: row.tokenId,
+      marketId: row.marketId,
+      marketName: row.marketName,
+      outcome: row.outcome,
+      exposureUsd: Math.abs(row.currentValueUsd)
+    }))
+    .sort((a, b) => b.exposureUsd - a.exposureUsd)
+
+  const topOutcomes = byOutcomeSorted.slice(0, 10).map((row) => ({
+    ...row,
+    isOther: false
+  }))
+  const otherExposure = byOutcomeSorted.slice(10).reduce((sum, row) => sum + row.exposureUsd, 0)
+  if (otherExposure > 0) {
+    topOutcomes.push({
+      tokenId: 'OTHER',
+      marketId: null,
+      marketName: 'Other',
+      outcome: 'Other',
+      exposureUsd: otherExposure,
+      isOther: true
+    })
+  }
+
+  return {
+    copyProfileId: copyProfile.id,
+    range,
+    summary,
+    chart: {
+      points,
+      pointCount: points.length,
+      maxPoints: rangeConfig.maxPoints
+    },
+    exposureBreakdown: {
+      byLeaderTop,
+      byOutcomeTop: topOutcomes
+    },
+    positions: {
+      items: pagedPositions,
+      pagination: paginationMeta(pagination, totalPositions)
+    }
   }
 }
 

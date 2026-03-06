@@ -50,6 +50,12 @@ export class MarketDataService {
     });
   }
 
+  async getBookStates(tokenIds: Iterable<string>): Promise<Map<string, MarketBookState>> {
+    return this.cache.getBookStates(tokenIds, {
+      wsConnected: this.wsClient.getMetrics().connected
+    });
+  }
+
   async getWatchedBookStates(): Promise<MarketBookState[]> {
     const wsConnected = this.wsClient.getMetrics().connected;
     return this.cache.getWatchedBookStates({ wsConnected });

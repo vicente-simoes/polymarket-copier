@@ -3,6 +3,7 @@ import { NextRequest } from 'next/server'
 import { z } from 'zod'
 import { jsonContract, jsonError, toNumber } from '@/lib/server/api'
 import { prisma } from '@/lib/server/db'
+import { memoizeAsync } from '@/lib/server/memo'
 import { fetchWorkerHealth } from '@/lib/server/worker-health'
 
 export const runtime = 'nodejs'
@@ -122,46 +123,69 @@ const StatusDataSchema = z.object({
   })
 })
 
+interface DashboardStatusSummaryDetails {
+  errorCounts: {
+    last15m: number
+    last1h: number
+    last24h: number
+  }
+  orderAttemptOutcomes1h: Record<string, number>
+  orderAttemptOutcomes24h: Record<string, number>
+  skipReasons1h: Record<string, number>
+  skipReasons24h: Record<string, number>
+  latestMigration: {
+    migrationName: string | null
+    finishedAt: string | null
+  }
+  estimatedSnapshotCounts: {
+    leaderPositionSnapshots: number
+    followerPositionSnapshots: number
+  }
+  databaseSizeBytes: number | null
+  retryBackoff: {
+    retryingAttempts: number
+    retryDueNow: number
+    nextRetryAt: string | null
+    nextRetryInSeconds: number | null
+    retryingByTokenTop: Array<{ tokenId: string; count: number }>
+  }
+}
+
+type StatusData = z.input<typeof StatusDataSchema>
+
 export async function GET(_request: NextRequest) {
   try {
-    const nowMs = Date.now()
-    const last15mAt = new Date(nowMs - 15 * 60_000)
-    const last1hAt = new Date(nowMs - 3_600_000)
-    const last24hAt = new Date(nowMs - 24 * 3_600_000)
+    const data = await memoizeAsync('route:status', 5_000, () => buildStatusData())
 
-    const startedDbPingAt = nowMs
-    let databaseLatencyMs: number | null = null
-    let databaseReachable = false
-    try {
-      await prisma.$queryRaw`SELECT 1`
-      databaseReachable = true
-      databaseLatencyMs = Date.now() - startedDbPingAt
-    } catch {
-      databaseReachable = false
-      databaseLatencyMs = null
+    return jsonContract(StatusDataSchema, data, {
+      cacheSeconds: 5
+    })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return jsonError(500, 'STATUS_CONTRACT_FAILED', 'Status response failed contract validation.', {
+        issues: error.issues
+      })
     }
+    return jsonError(500, 'STATUS_FAILED', toErrorMessage(error))
+  }
+}
 
-    const [
-      workerHealth,
-      workerSystemStatus,
-      redisSystemStatus,
-      lastError,
-      errorCount15m,
-      errorCount1h,
-      errorCount24h,
-      exactCounts,
-      estimatedSnapshotCounts,
-      fallbackUsage1h,
-      fallbackUsage24h,
-      latestMigration,
-      databaseSizeBytes,
-      retryingAttempts,
-      orderOutcomes1hRows,
-      orderOutcomes24hRows,
-      skipReasons1hRows,
-      skipReasons24hRows,
-      activeCopyProfile
-    ] = await Promise.all([
+async function buildStatusData(): Promise<StatusData> {
+  const nowMs = Date.now()
+  const startedDbPingAt = nowMs
+  let databaseLatencyMs: number | null = null
+  let databaseReachable = false
+  try {
+    await prisma.$queryRaw`SELECT 1`
+    databaseReachable = true
+    databaseLatencyMs = Date.now() - startedDbPingAt
+  } catch {
+    databaseReachable = false
+    databaseLatencyMs = null
+  }
+
+  const [workerHealth, workerSystemStatus, redisSystemStatus, dashboardStatusRow, lastError, exactCounts, fallbackUsage1h, fallbackUsage24h, activeCopyProfile] =
+    await Promise.all([
       fetchWorkerHealth(),
       prisma.systemStatus.findUnique({
         where: {
@@ -183,6 +207,16 @@ export async function GET(_request: NextRequest) {
           details: true
         }
       }),
+      prisma
+        .$queryRaw<Array<{ lastUpdatedAt: Date; details: Prisma.JsonValue | null }>>(
+          Prisma.sql`
+            SELECT "lastUpdatedAt", "details"
+            FROM "SystemStatus"
+            WHERE "component" = 'DASHBOARD_STATUS'
+            LIMIT 1
+          `
+        )
+        .then((rows) => rows[0] ?? null),
       prisma.errorEvent.findFirst({
         orderBy: {
           occurredAt: 'desc'
@@ -196,6 +230,204 @@ export async function GET(_request: NextRequest) {
           stack: true
         }
       }),
+      Promise.all([
+        prisma.leader.count(),
+        prisma.copyOrder.count(),
+        prisma.copyAttempt.count(),
+        prisma.errorEvent.count()
+      ]),
+      prisma.leaderTradeEvent.count({
+        where: {
+          source: 'DATA_API',
+          detectedAtMs: {
+            gte: BigInt(nowMs - 3_600_000)
+          }
+        }
+      }),
+      prisma.leaderTradeEvent.count({
+        where: {
+          source: 'DATA_API',
+          detectedAtMs: {
+            gte: BigInt(nowMs - 24 * 3_600_000)
+          }
+        }
+      }),
+      prisma.copyProfile.findFirst({
+        where: {
+          status: {
+            in: ['ACTIVE', 'PAUSED']
+          }
+        },
+        orderBy: {
+          createdAt: 'asc'
+        },
+        select: {
+          config: true
+        }
+      })
+    ])
+
+  const summary =
+    isFreshDashboardStatusRow(dashboardStatusRow, nowMs)
+      ? readDashboardStatusSummary(dashboardStatusRow?.details) ?? (await fetchLiveDashboardStatusSummary(nowMs))
+      : await fetchLiveDashboardStatusSummary(nowMs)
+
+  const workerDetails = asObject(workerHealth ?? workerSystemStatus?.details)
+  const reconcileDetails = asObject(workerDetails.reconcile)
+  const chainDetails = asObject(workerDetails.chainTriggers)
+  const executionDetails = asObject(workerDetails.execution)
+  const marketDataDetails = asObject(workerDetails.marketData)
+  const marketFreshness = asObject(marketDataDetails.freshness)
+  const redisDetails = asObject(redisSystemStatus?.details)
+  const profileCopySystemEnabled = readCopySystemEnabled(activeCopyProfile?.config)
+
+  const reconcileIntervalSeconds = toPositiveInt(process.env.RECONCILE_INTERVAL_SECONDS, 60)
+  const lastReconcileRunAtMs = toNumber(reconcileDetails.lastRunAtMs)
+  const nextReconcileInSeconds =
+    lastReconcileRunAtMs > 0
+      ? Math.max(0, Math.trunc((lastReconcileRunAtMs + reconcileIntervalSeconds * 1_000 - nowMs) / 1_000))
+      : null
+
+  const workerStatus = workerHealth ? 'OK' : mapSystemStatus(workerSystemStatus?.status)
+  const redisStatus = mapSystemStatus(redisSystemStatus?.status)
+  const websocketConnected = asBoolean(chainDetails.connected)
+
+  const messageRatePerMin = (() => {
+    const receivedMessages = toNumber(chainDetails.receivedMessages)
+    const connectedAtMs = toNumber(chainDetails.connectedAtMs)
+    if (receivedMessages <= 0 || connectedAtMs <= 0) {
+      return null
+    }
+    const uptimeMinutes = Math.max((nowMs - connectedAtMs) / 60_000, 1)
+    return receivedMessages / uptimeMinutes
+  })()
+  const connectionUptimeSeconds = (() => {
+    const connectedAtMs = toNumber(chainDetails.connectedAtMs)
+    if (connectedAtMs <= 0) {
+      return null
+    }
+    return Math.max(0, Math.trunc((nowMs - connectedAtMs) / 1_000))
+  })()
+
+  const queueCounts = asNumberRecord(redisDetails.queueCounts)
+  const oldestPendingJobAgeSeconds = asNullableNumber(redisDetails.oldestPendingJobAgeSeconds ?? redisDetails.oldestJobAgeSeconds)
+  const memoryUsedBytes = asNullableNumber(redisDetails.memoryUsedBytes ?? redisDetails.memoryUsageBytes)
+  const evictionWarnings = asNullableNumber(redisDetails.evictionWarnings ?? redisDetails.evictions)
+
+  return {
+    cards: {
+      worker: {
+        status: workerStatus,
+        lastUpdatedAt: workerHealth?.now ?? workerSystemStatus?.lastUpdatedAt.toISOString() ?? null,
+        lastEventAt: workerHealth?.lastHeartbeatAt ?? null
+      },
+      database: {
+        status: databaseReachable ? 'OK' : 'DOWN',
+        lastUpdatedAt: new Date().toISOString(),
+        latencyMs: databaseLatencyMs,
+        sizeBytes: summary.databaseSizeBytes
+      },
+      redis: {
+        status: redisStatus,
+        lastUpdatedAt: redisSystemStatus?.lastUpdatedAt.toISOString() ?? null
+      },
+      websocket: {
+        status: workerHealth ? (websocketConnected ? 'OK' : 'DOWN') : 'UNKNOWN',
+        lastUpdatedAt:
+          typeof chainDetails.lastMessageAtMs === 'number'
+            ? new Date(chainDetails.lastMessageAtMs).toISOString()
+            : workerHealth?.now ?? null,
+        connected: websocketConnected
+      }
+    },
+    details: {
+      worker: {
+        loops: {
+          tradeDetectionRunning: asBoolean(chainDetails.connected),
+          reconcileRunning: asBoolean(reconcileDetails.running),
+          executionRunning: asBoolean(executionDetails.running)
+        },
+        controls: {
+          envCopySystemEnabled: parseEnvBoolean(process.env.COPY_SYSTEM_ENABLED, false),
+          profileCopySystemEnabled,
+          panicModeEnabled: parseEnvBoolean(process.env.PANIC_MODE, false),
+          dryRunModeEnabled: parseEnvBoolean(process.env.DRY_RUN_MODE, false)
+        },
+        reconcileIntervalSeconds,
+        nextReconcileInSeconds,
+        lastReconcileSummary: reconcileDetails,
+        errorCounts: summary.errorCounts,
+        lastError: lastError
+          ? {
+              message: lastError.message,
+              code: lastError.code ?? null,
+              component: lastError.component,
+              severity: lastError.severity,
+              occurredAt: lastError.occurredAt.toISOString(),
+              stack: lastError.stack ? truncate(lastError.stack, 2_000) : null
+            }
+          : null,
+        retryBackoff: {
+          totalBackoffSkips: toNumber(executionDetails.totalBackoffSkips),
+          retryingAttempts: summary.retryBackoff.retryingAttempts,
+          retryDueNow: summary.retryBackoff.retryDueNow,
+          nextRetryAt: summary.retryBackoff.nextRetryAt,
+          nextRetryInSeconds: summary.retryBackoff.nextRetryInSeconds,
+          retryingByTokenTop: summary.retryBackoff.retryingByTokenTop
+        },
+        orderAttemptOutcomes1h: summary.orderAttemptOutcomes1h,
+        orderAttemptOutcomes24h: summary.orderAttemptOutcomes24h,
+        skipReasons1h: summary.skipReasons1h,
+        skipReasons24h: summary.skipReasons24h
+      },
+      database: {
+        latencyMs: databaseLatencyMs,
+        sizeBytes: summary.databaseSizeBytes,
+        migration: {
+          latestMigration: summary.latestMigration.migrationName,
+          latestAppliedAt: summary.latestMigration.finishedAt
+        },
+        tableCounts: {
+          leaders: exactCounts[0],
+          leaderPositionSnapshots: summary.estimatedSnapshotCounts.leaderPositionSnapshots,
+          followerPositionSnapshots: summary.estimatedSnapshotCounts.followerPositionSnapshots,
+          copyOrders: exactCounts[1],
+          copyAttempts: exactCounts[2],
+          errors: exactCounts[3]
+        }
+      },
+      redis: {
+        details: redisDetails,
+        queueCounts,
+        oldestPendingJobAgeSeconds,
+        memoryUsedBytes,
+        evictionWarnings
+      },
+      websocket: {
+        activeSubscriptionCount: asNullableInt(chainDetails.activeSubscriptionCount),
+        messageRatePerMin,
+        connectionUptimeSeconds,
+        reconnectCount: asNullableInt(chainDetails.reconnectCount),
+        lastDisconnectReason: asNullableString(chainDetails.lastError),
+        lastTriggerLagMs: asNullableNumber(chainDetails.lastTriggerLagMs),
+        lastWsLagMs: asNullableNumber(chainDetails.lastWsLagMs),
+        lastDetectLagMs: asNullableNumber(chainDetails.lastDetectLagMs),
+        wsBackedTokenCount: asNullableInt(marketFreshness.wsBackedTokenCount),
+        restBackedTokenCount: asNullableInt(marketFreshness.restBackedTokenCount),
+        fallbackUsage1h,
+        fallbackUsage24h
+      }
+    }
+  }
+}
+
+async function fetchLiveDashboardStatusSummary(nowMs: number): Promise<DashboardStatusSummaryDetails> {
+  const last15mAt = new Date(nowMs - 15 * 60_000)
+  const last1hAt = new Date(nowMs - 3_600_000)
+  const last24hAt = new Date(nowMs - 24 * 3_600_000)
+
+  const [errorCount15m, errorCount1h, errorCount24h, latestMigration, estimatedSnapshotCounts, databaseSizeBytes, retryingAttempts, orderOutcomes1hRows, orderOutcomes24hRows, skipReasons1hRows, skipReasons24hRows] =
+    await Promise.all([
       prisma.errorEvent.count({
         where: {
           occurredAt: {
@@ -226,30 +458,8 @@ export async function GET(_request: NextRequest) {
           }
         }
       }),
-      Promise.all([
-        prisma.leader.count(),
-        prisma.copyOrder.count(),
-        prisma.copyAttempt.count(),
-        prisma.errorEvent.count()
-      ]),
-      fetchEstimatedSnapshotCounts(),
-      prisma.leaderTradeEvent.count({
-        where: {
-          source: 'DATA_API',
-          detectedAtMs: {
-            gte: BigInt(nowMs - 3_600_000)
-          }
-        }
-      }),
-      prisma.leaderTradeEvent.count({
-        where: {
-          source: 'DATA_API',
-          detectedAtMs: {
-            gte: BigInt(nowMs - 24 * 3_600_000)
-          }
-        }
-      }),
       fetchLatestMigration(),
+      fetchEstimatedSnapshotCounts(),
       fetchDatabaseSizeBytes(),
       prisma.copyAttempt.findMany({
         where: {
@@ -311,192 +521,87 @@ export async function GET(_request: NextRequest) {
         _count: {
           _all: true
         }
-      }),
-      prisma.copyProfile.findFirst({
-        where: {
-          status: {
-            in: ['ACTIVE', 'PAUSED']
-          }
-        },
-        orderBy: {
-          createdAt: 'asc'
-        },
-        select: {
-          config: true
-        }
       })
     ])
 
-    const workerDetails = asObject(workerHealth ?? workerSystemStatus?.details)
-    const reconcileDetails = asObject(workerDetails.reconcile)
-    const chainDetails = asObject(workerDetails.chainTriggers)
-    const executionDetails = asObject(workerDetails.execution)
-    const marketDataDetails = asObject(workerDetails.marketData)
-    const marketFreshness = asObject(marketDataDetails.freshness)
-    const redisDetails = asObject(redisSystemStatus?.details)
-    const profileCopySystemEnabled = readCopySystemEnabled(activeCopyProfile?.config)
+  const retryBackoffBaseMs = toPositiveInt(process.env.EXECUTION_RETRY_BACKOFF_BASE_MS, 5_000)
+  const retryBackoffMaxMs = toPositiveInt(process.env.EXECUTION_RETRY_BACKOFF_MAX_MS, 300_000)
 
-    const reconcileIntervalSeconds = toPositiveInt(process.env.RECONCILE_INTERVAL_SECONDS, 60)
-    const lastReconcileRunAtMs = toNumber(reconcileDetails.lastRunAtMs)
-    const nextReconcileInSeconds =
-      lastReconcileRunAtMs > 0
-        ? Math.max(0, Math.trunc((lastReconcileRunAtMs + reconcileIntervalSeconds * 1_000 - nowMs) / 1_000))
-        : null
+  return {
+    errorCounts: {
+      last15m: errorCount15m,
+      last1h: errorCount1h,
+      last24h: errorCount24h
+    },
+    orderAttemptOutcomes1h: toCountRecord(orderOutcomes1hRows, 'status'),
+    orderAttemptOutcomes24h: toCountRecord(orderOutcomes24hRows, 'status'),
+    skipReasons1h: toCountRecord(skipReasons1hRows, 'reason'),
+    skipReasons24h: toCountRecord(skipReasons24hRows, 'reason'),
+    latestMigration: {
+      migrationName: latestMigration?.migrationName ?? null,
+      finishedAt: latestMigration?.finishedAt?.toISOString() ?? null
+    },
+    estimatedSnapshotCounts,
+    databaseSizeBytes,
+    retryBackoff: computeRetryState(retryingAttempts, nowMs, retryBackoffBaseMs, retryBackoffMaxMs)
+  }
+}
 
-    const workerStatus = workerHealth ? 'OK' : mapSystemStatus(workerSystemStatus?.status)
-    const redisStatus = mapSystemStatus(redisSystemStatus?.status)
-    const websocketConnected = asBoolean(chainDetails.connected)
+function isFreshDashboardStatusRow(
+  row: {
+    lastUpdatedAt: Date
+    details: unknown
+  } | null,
+  nowMs: number
+): boolean {
+  if (!row) {
+    return false
+  }
+  return nowMs - row.lastUpdatedAt.getTime() <= 90_000
+}
 
-    const messageRatePerMin = (() => {
-      const receivedMessages = toNumber(chainDetails.receivedMessages)
-      const connectedAtMs = toNumber(chainDetails.connectedAtMs)
-      if (receivedMessages <= 0 || connectedAtMs <= 0) {
-        return null
-      }
-      const uptimeMinutes = Math.max((nowMs - connectedAtMs) / 60_000, 1)
-      return receivedMessages / uptimeMinutes
-    })()
-    const connectionUptimeSeconds = (() => {
-      const connectedAtMs = toNumber(chainDetails.connectedAtMs)
-      if (connectedAtMs <= 0) {
-        return null
-      }
-      return Math.max(0, Math.trunc((nowMs - connectedAtMs) / 1_000))
-    })()
+function readDashboardStatusSummary(value: unknown): DashboardStatusSummaryDetails | null {
+  const root = asObject(value)
+  const errorCounts = asObject(root.errorCounts)
+  const latestMigration = asObject(root.latestMigration)
+  const estimatedSnapshotCounts = asObject(root.estimatedSnapshotCounts)
+  const retryBackoff = asObject(root.retryBackoff)
+  const retryingByTokenTop = Array.isArray(retryBackoff.retryingByTokenTop)
+    ? retryBackoff.retryingByTokenTop
+        .map((entry) => asObject(entry))
+        .map((entry) => ({
+          tokenId: asNullableString(entry.tokenId) ?? '',
+          count: asNullableInt(entry.count) ?? 0
+        }))
+        .filter((entry) => entry.tokenId.length > 0 && entry.count > 0)
+    : []
 
-    const queueCounts = asNumberRecord(redisDetails.queueCounts)
-    const oldestPendingJobAgeSeconds = asNullableNumber(
-      redisDetails.oldestPendingJobAgeSeconds ?? redisDetails.oldestJobAgeSeconds
-    )
-    const memoryUsedBytes = asNullableNumber(redisDetails.memoryUsedBytes ?? redisDetails.memoryUsageBytes)
-    const evictionWarnings = asNullableNumber(redisDetails.evictionWarnings ?? redisDetails.evictions)
-
-    const retryBackoffBaseMs = toPositiveInt(process.env.EXECUTION_RETRY_BACKOFF_BASE_MS, 5_000)
-    const retryBackoffMaxMs = toPositiveInt(process.env.EXECUTION_RETRY_BACKOFF_MAX_MS, 300_000)
-    const retryState = computeRetryState(retryingAttempts, nowMs, retryBackoffBaseMs, retryBackoffMaxMs)
-
-    return jsonContract(
-      StatusDataSchema,
-      {
-        cards: {
-          worker: {
-            status: workerStatus,
-            lastUpdatedAt: workerHealth?.now ?? workerSystemStatus?.lastUpdatedAt.toISOString() ?? null,
-            lastEventAt: workerHealth?.lastHeartbeatAt ?? null
-          },
-          database: {
-            status: databaseReachable ? 'OK' : 'DOWN',
-            lastUpdatedAt: new Date().toISOString(),
-            latencyMs: databaseLatencyMs,
-            sizeBytes: databaseSizeBytes
-          },
-          redis: {
-            status: redisStatus,
-            lastUpdatedAt: redisSystemStatus?.lastUpdatedAt.toISOString() ?? null
-          },
-          websocket: {
-            status: workerHealth ? (websocketConnected ? 'OK' : 'DOWN') : 'UNKNOWN',
-            lastUpdatedAt:
-              typeof chainDetails.lastMessageAtMs === 'number'
-                ? new Date(chainDetails.lastMessageAtMs).toISOString()
-                : workerHealth?.now ?? null,
-            connected: websocketConnected
-          }
-        },
-        details: {
-          worker: {
-            loops: {
-              tradeDetectionRunning: asBoolean(chainDetails.connected),
-              reconcileRunning: asBoolean(reconcileDetails.running),
-              executionRunning: asBoolean(executionDetails.running)
-            },
-            controls: {
-              envCopySystemEnabled: parseEnvBoolean(process.env.COPY_SYSTEM_ENABLED, false),
-              profileCopySystemEnabled,
-              panicModeEnabled: parseEnvBoolean(process.env.PANIC_MODE, false),
-              dryRunModeEnabled: parseEnvBoolean(process.env.DRY_RUN_MODE, false)
-            },
-            reconcileIntervalSeconds,
-            nextReconcileInSeconds,
-            lastReconcileSummary: reconcileDetails,
-            errorCounts: {
-              last15m: errorCount15m,
-              last1h: errorCount1h,
-              last24h: errorCount24h
-            },
-            lastError: lastError
-              ? {
-                  message: lastError.message,
-                  code: lastError.code ?? null,
-                  component: lastError.component,
-                  severity: lastError.severity,
-                  occurredAt: lastError.occurredAt.toISOString(),
-                  stack: lastError.stack ? truncate(lastError.stack, 2_000) : null
-                }
-              : null,
-            retryBackoff: {
-              totalBackoffSkips: toNumber(executionDetails.totalBackoffSkips),
-              retryingAttempts: retryState.retryingAttempts,
-              retryDueNow: retryState.retryDueNow,
-              nextRetryAt: retryState.nextRetryAt,
-              nextRetryInSeconds: retryState.nextRetryInSeconds,
-              retryingByTokenTop: retryState.retryingByTokenTop
-            },
-            orderAttemptOutcomes1h: toCountRecord(orderOutcomes1hRows, 'status'),
-            orderAttemptOutcomes24h: toCountRecord(orderOutcomes24hRows, 'status'),
-            skipReasons1h: toCountRecord(skipReasons1hRows, 'reason'),
-            skipReasons24h: toCountRecord(skipReasons24hRows, 'reason')
-          },
-          database: {
-            latencyMs: databaseLatencyMs,
-            sizeBytes: databaseSizeBytes,
-            migration: {
-              latestMigration: latestMigration?.migrationName ?? null,
-              latestAppliedAt: latestMigration?.finishedAt?.toISOString() ?? null
-            },
-            tableCounts: {
-              leaders: exactCounts[0],
-              leaderPositionSnapshots: estimatedSnapshotCounts.leaderPositionSnapshots,
-              followerPositionSnapshots: estimatedSnapshotCounts.followerPositionSnapshots,
-              copyOrders: exactCounts[1],
-              copyAttempts: exactCounts[2],
-              errors: exactCounts[3]
-            }
-          },
-          redis: {
-            details: redisDetails,
-            queueCounts,
-            oldestPendingJobAgeSeconds,
-            memoryUsedBytes,
-            evictionWarnings
-          },
-          websocket: {
-            activeSubscriptionCount: asNullableInt(chainDetails.activeSubscriptionCount),
-            messageRatePerMin,
-            connectionUptimeSeconds,
-            reconnectCount: asNullableInt(chainDetails.reconnectCount),
-            lastDisconnectReason: asNullableString(chainDetails.lastError),
-            lastTriggerLagMs: asNullableNumber(chainDetails.lastTriggerLagMs),
-            lastWsLagMs: asNullableNumber(chainDetails.lastWsLagMs),
-            lastDetectLagMs: asNullableNumber(chainDetails.lastDetectLagMs),
-            wsBackedTokenCount: asNullableInt(marketFreshness.wsBackedTokenCount),
-            restBackedTokenCount: asNullableInt(marketFreshness.restBackedTokenCount),
-            fallbackUsage1h,
-            fallbackUsage24h
-          }
-        }
-      },
-      {
-        cacheSeconds: 5
-      }
-    )
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return jsonError(500, 'STATUS_CONTRACT_FAILED', 'Status response failed contract validation.', {
-        issues: error.issues
-      })
+  return {
+    errorCounts: {
+      last15m: asNullableInt(errorCounts.last15m) ?? 0,
+      last1h: asNullableInt(errorCounts.last1h) ?? 0,
+      last24h: asNullableInt(errorCounts.last24h) ?? 0
+    },
+    orderAttemptOutcomes1h: asNumberRecord(root.orderAttemptOutcomes1h),
+    orderAttemptOutcomes24h: asNumberRecord(root.orderAttemptOutcomes24h),
+    skipReasons1h: asNumberRecord(root.skipReasons1h),
+    skipReasons24h: asNumberRecord(root.skipReasons24h),
+    latestMigration: {
+      migrationName: asNullableString(latestMigration.migrationName),
+      finishedAt: asNullableString(latestMigration.finishedAt)
+    },
+    estimatedSnapshotCounts: {
+      leaderPositionSnapshots: asNullableInt(estimatedSnapshotCounts.leaderPositionSnapshots) ?? 0,
+      followerPositionSnapshots: asNullableInt(estimatedSnapshotCounts.followerPositionSnapshots) ?? 0
+    },
+    databaseSizeBytes: asNullableNumber(root.databaseSizeBytes),
+    retryBackoff: {
+      retryingAttempts: asNullableInt(retryBackoff.retryingAttempts) ?? 0,
+      retryDueNow: asNullableInt(retryBackoff.retryDueNow) ?? 0,
+      nextRetryAt: asNullableString(retryBackoff.nextRetryAt),
+      nextRetryInSeconds: asNullableInt(retryBackoff.nextRetryInSeconds),
+      retryingByTokenTop
     }
-    return jsonError(500, 'STATUS_FAILED', toErrorMessage(error))
   }
 }
 
@@ -532,7 +637,6 @@ async function fetchEstimatedSnapshotCounts(): Promise<{
     )
 
     const counts = new Map(rows.map((row) => [row.relname, Number(row.estimated_rows)]))
-
     return {
       leaderPositionSnapshots: counts.get('LeaderPositionSnapshot') ?? 0,
       followerPositionSnapshots: counts.get('FollowerPositionSnapshot') ?? 0

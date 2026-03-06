@@ -168,9 +168,17 @@ export class MarketCache {
     return this.withSpreadFields(state, entry, now, wsConnected);
   }
 
+  async getBookStates(tokenIds: Iterable<string>, options?: { wsConnected?: boolean }): Promise<Map<string, MarketBookState>> {
+    const uniqueTokenIds = [...new Set([...tokenIds].filter((tokenId) => tokenId.trim().length > 0))];
+    const states = await Promise.all(
+      uniqueTokenIds.map(async (tokenId) => [tokenId, await this.getBookState(tokenId, options)] as const)
+    );
+    return new Map(states);
+  }
+
   async getWatchedBookStates(options?: { wsConnected?: boolean }): Promise<MarketBookState[]> {
     const tokenIds = this.getWatchedTokenIds();
-    return Promise.all(tokenIds.map((tokenId) => this.getBookState(tokenId, options)));
+    return [...(await this.getBookStates(tokenIds, options)).values()];
   }
 
   getFreshnessMetrics(snapshotAtMs = this.now()): MarketFreshnessMetrics {

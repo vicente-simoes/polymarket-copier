@@ -1,6 +1,11 @@
 import { Prisma, PrismaClient } from "@copybot/db";
 import type { DataApiPosition } from "@copybot/shared";
 import type { LeaderDataApiClient } from "../leader/types.js";
+import {
+  mapFollowerSnapshotRowsToCurrentPositions,
+  PrismaCurrentStateStore,
+  type CurrentPositionSource
+} from "../current-state/store.js";
 import type { ReconcileAuditRecord, ReconcileStore } from "./types.js";
 import { PrismaTokenMetadataStore } from "../token-metadata/store.js";
 
@@ -19,6 +24,7 @@ export class PrismaReconcileStore implements ReconcileStore {
   private readonly dataApiMaxPages: number;
   private readonly followerAddressFallback?: string;
   private readonly tokenMetadataStore: PrismaTokenMetadataStore;
+  private readonly currentStateStore: PrismaCurrentStateStore;
 
   constructor(prismaOrOptions: PrismaClient | PrismaReconcileStoreOptions) {
     if ("$connect" in prismaOrOptions) {
@@ -28,6 +34,7 @@ export class PrismaReconcileStore implements ReconcileStore {
       this.dataApiMaxPages = 20;
       this.followerAddressFallback = undefined;
       this.tokenMetadataStore = new PrismaTokenMetadataStore(prismaOrOptions);
+      this.currentStateStore = new PrismaCurrentStateStore(prismaOrOptions);
       return;
     }
 
@@ -37,6 +44,7 @@ export class PrismaReconcileStore implements ReconcileStore {
     this.dataApiMaxPages = Math.max(1, prismaOrOptions.dataApiMaxPages ?? 20);
     this.followerAddressFallback = normalizeAddress(prismaOrOptions.followerAddressFallback ?? undefined) ?? undefined;
     this.tokenMetadataStore = new PrismaTokenMetadataStore(prismaOrOptions.prisma);
+    this.currentStateStore = new PrismaCurrentStateStore(prismaOrOptions.prisma);
   }
 
   async listActiveCopyProfileIds(): Promise<string[]> {
@@ -154,6 +162,12 @@ export class PrismaReconcileStore implements ReconcileStore {
       }
     });
     await this.tokenMetadataStore.upsertFromDataApiPositions(positions, args.snapshotAt);
+    await this.currentStateStore.replaceFollowerCurrentPositions(
+      args.copyProfileId,
+      args.snapshotAt,
+      "DATA_API",
+      mapFollowerSnapshotRowsToCurrentPositions(rows)
+    );
 
     return {
       tokensSnapshotted: rows.length,
@@ -218,6 +232,12 @@ export class PrismaReconcileStore implements ReconcileStore {
         rebuiltAtMs: snapshotAtMs
       }
     });
+    await this.currentStateStore.replaceFollowerCurrentPositions(
+      copyProfileId,
+      snapshotAt,
+      "RECONCILE_FILLS",
+      mapFollowerSnapshotRowsToCurrentPositions(rows)
+    );
 
     return {
       tokensSnapshotted: rows.length,

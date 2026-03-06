@@ -6,6 +6,11 @@ import type {
   NormalizedTradeEvent
 } from "./types.js";
 import type { DataApiPosition } from "@copybot/shared";
+import {
+  buildLeaderCurrentPositionsFromDataApiPositions,
+  buildLeaderLatestTradePriceInputs,
+  PrismaCurrentStateStore
+} from "../current-state/store.js";
 import { PrismaTokenMetadataStore } from "../token-metadata/store.js";
 
 const DATA_API_SOURCE = "DATA_API";
@@ -13,10 +18,12 @@ const DATA_API_SOURCE = "DATA_API";
 export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
   private readonly prisma: PrismaClient;
   private readonly tokenMetadataStore: PrismaTokenMetadataStore;
+  private readonly currentStateStore: PrismaCurrentStateStore;
 
   constructor(prisma: PrismaClient) {
     this.prisma = prisma;
     this.tokenMetadataStore = new PrismaTokenMetadataStore(prisma);
+    this.currentStateStore = new PrismaCurrentStateStore(prisma);
   }
 
   async listActiveLeaders(): Promise<LeaderRecord[]> {
@@ -111,16 +118,20 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
     snapshotAtMs: number;
     positions: DataApiPosition[];
   }): Promise<number> {
-    if (args.positions.length === 0) {
-      return 0;
+    const currentPositions = buildLeaderCurrentPositionsFromDataApiPositions(args.positions);
+    let inserted = 0;
+
+    if (args.positions.length > 0) {
+      const result = await this.prisma.leaderPositionSnapshot.createMany({
+        data: args.positions.map((position) => this.toLeaderPositionRow(args.leaderId, args.snapshotAt, args.snapshotAtMs, position))
+      });
+      inserted = result.count;
+      await this.tokenMetadataStore.upsertFromDataApiPositions(args.positions, args.snapshotAt);
     }
 
-    const result = await this.prisma.leaderPositionSnapshot.createMany({
-      data: args.positions.map((position) => this.toLeaderPositionRow(args.leaderId, args.snapshotAt, args.snapshotAtMs, position))
-    });
-    await this.tokenMetadataStore.upsertFromDataApiPositions(args.positions, args.snapshotAt);
+    await this.currentStateStore.replaceLeaderCurrentPositions(args.leaderId, args.snapshotAt, currentPositions);
 
-    return result.count;
+    return inserted;
   }
 
   async saveLeaderTradeEvents(args: { leaderId: string; events: NormalizedTradeEvent[] }): Promise<number> {
@@ -157,6 +168,9 @@ export class PrismaLeaderIngestionStore implements LeaderIngestionStore {
       }
     }
     await this.tokenMetadataStore.upsertFromTradeEvents(args.events);
+    await this.currentStateStore.upsertLeaderLatestTradePrices(
+      buildLeaderLatestTradePriceInputs(args.leaderId, args.events)
+    );
 
     return result.count;
   }

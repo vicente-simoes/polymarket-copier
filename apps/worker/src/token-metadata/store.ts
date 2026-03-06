@@ -139,7 +139,7 @@ export function buildTokenMetadataObservationsFromDataApiPositions(
           lastSeenAt: observedAt
         } satisfies TokenDisplayMetadataObservation;
       })
-      .filter((value): value is TokenDisplayMetadataObservation => value !== null)
+      .filter(isDefined)
   );
 }
 
@@ -167,7 +167,7 @@ export function buildTokenMetadataObservationsFromTradeEvents(
           lastSeenAt: observedAt
         } satisfies TokenDisplayMetadataObservation;
       })
-      .filter((value): value is TokenDisplayMetadataObservation => value !== null)
+      .filter(isDefined)
   );
 }
 
@@ -236,4 +236,8 @@ function recordsEqual(left: TokenDisplayMetadataRecord, right: TokenDisplayMetad
     left.firstSeenAt.getTime() === right.firstSeenAt.getTime() &&
     left.lastSeenAt.getTime() === right.lastSeenAt.getTime()
   );
+}
+
+function isDefined<T>(value: T | null): value is T {
+  return value !== null;
 }

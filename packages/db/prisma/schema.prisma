@@ -121,6 +121,7 @@ enum ComponentType {
   DATABASE
   REDIS
   ALCHEMY_WS
+  DASHBOARD_STATUS
   WEB
   NGINX
 }
@@ -158,6 +159,8 @@ model Leader {
   profileLinks      CopyProfileLeader[]
   tradeEvents       LeaderTradeEvent[]
   positionSnapshots LeaderPositionSnapshot[]
+  currentPositions  LeaderCurrentPosition[]
+  latestTradePrices LeaderLatestTradePrice[]
   pendingDeltas     PendingDelta[]
   copyAttempts      CopyAttempt[]
   tokenLedgers      LeaderTokenLedger[]
@@ -201,6 +204,7 @@ model CopyProfile {
 
   leaders                 CopyProfileLeader[]
   followerPositionSnapshots FollowerPositionSnapshot[]
+  currentPositions        FollowerCurrentPosition[]
   pendingDeltas           PendingDelta[]
   copyAttempts            CopyAttempt[]
   copyOrders              CopyOrder[]
@@ -309,6 +313,63 @@ model FollowerPositionSnapshot {
   @@index([tokenId, snapshotAt])
 }
 
+model LeaderCurrentPosition {
+  leaderId         String
+  tokenId          String
+  marketId         String?
+  shares           Decimal  @db.Decimal(38, 18)
+  avgPrice         Decimal? @db.Decimal(20, 10)
+  currentPrice     Decimal? @db.Decimal(20, 10)
+  currentValueUsd  Decimal? @db.Decimal(20, 8)
+  snapshotAt       DateTime
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@id([leaderId, tokenId])
+  @@index([leaderId, snapshotAt])
+  @@index([tokenId])
+}
+
+model FollowerCurrentPosition {
+  copyProfileId    String
+  tokenId          String
+  marketId         String?
+  outcome          String?
+  shares           Decimal  @db.Decimal(38, 18)
+  costBasisUsd     Decimal? @db.Decimal(20, 8)
+  currentPrice     Decimal? @db.Decimal(20, 10)
+  currentValueUsd  Decimal? @db.Decimal(20, 8)
+  source           String
+  snapshotAt       DateTime
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  copyProfile CopyProfile @relation(fields: [copyProfileId], references: [id], onDelete: Cascade)
+
+  @@id([copyProfileId, tokenId])
+  @@index([copyProfileId, snapshotAt])
+  @@index([tokenId])
+}
+
+model LeaderLatestTradePrice {
+  leaderId        String
+  tokenId         String
+  side            DeltaSide
+  price           Decimal           @db.Decimal(20, 10)
+  leaderFillAtMs  BigInt
+  source          LeaderTradeSource
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  leader Leader @relation(fields: [leaderId], references: [id], onDelete: Cascade)
+
+  @@id([leaderId, tokenId, side])
+  @@index([tokenId])
+  @@index([leaderId, leaderFillAtMs])
+}
+
 model TokenMetadata {
   tokenId     String   @id
   marketId    String?
@@ -346,6 +407,7 @@ model PendingDelta {
   copyAttempts CopyAttempt[]
 
   @@unique([copyProfileId, tokenId, side])
+  @@index([copyProfileId, status, tokenId])
   @@index([status, createdAt])
   @@index([tokenId, createdAt])
   @@index([leaderId, createdAt])
@@ -379,6 +441,7 @@ model CopyAttempt {
   copyOrders   CopyOrder[]
 
   @@unique([idempotencyKey])
+  @@index([decision, status, createdAt])
   @@index([status, createdAt])
   @@index([tokenId, createdAt])
   @@index([leaderId, createdAt])
@@ -416,6 +479,8 @@ model CopyOrder {
 
   @@unique([idempotencyKey])
   @@unique([externalOrderId])
+  @@index([copyProfileId, status, attemptedAt])
+  @@index([copyProfileId, tokenId, attemptedAt])
   @@index([status, createdAt])
   @@index([tokenId, createdAt])
   @@index([copyAttemptId, createdAt])

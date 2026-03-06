@@ -426,12 +426,14 @@ Options:
 - Responsible for:
   - polling Data API for leader positions/trades,
   - maintaining cached market metadata/prices,
+  - maintaining canonical token display metadata for dashboard reads,
   - computing target portfolios,
   - placing follower orders,
   - writing state to Postgres and Redis.
 
 4) **PostgreSQL**
 - Durable store for configuration, audit logs, historical snapshots, and reconciliation results.
+- Also stores a small canonical `TokenMetadata` table keyed by `tokenId` for dashboard display fields (`marketId`, title, slugs, outcome) so web reads do not repeatedly scan growing snapshot history.
 
 5) **Redis**
 - Fast ephemeral state + coordination:
@@ -458,7 +460,7 @@ Options:
 
 ### 5.2 Data flow (conceptual)
 
-Leaders (public) → Data API polling → worker updates target → netting layer → pricing cache + order constraints → execute orders → record audit state → dashboard shows status.
+Leaders (public) → Data API polling → worker updates target + token metadata → netting layer → pricing cache + order constraints → execute orders → record audit state → dashboard reads current status + token metadata.
 
 Pricing path:
 - Market WS (best bid/ask) and/or REST `/book(s)` (tick/min size) → in-memory cache → used by rebalance decisions.
@@ -492,6 +494,7 @@ Pricing path:
   - leader snapshot history
   - follower position history
   - audit events (rebalance decisions, orders placed, rejects)
+  - canonical token display metadata for dashboard/API enrichment (`TokenMetadata`)
 - **Redis**
   - locks
   - job queue (optional)
@@ -708,6 +711,14 @@ Access to dashboard pages and dashboard data APIs is restricted behind GitHub lo
   - *incremental*: fetch “since last timestamp” for live updates when possible
   - *cached*: reuse market metadata + token mapping aggressively
   - *bounded*: hard cap on points returned per chart range
+- Token display metadata (`marketId`, market label, market path slug, outcome) must be read from a compact canonical table first, not reconstructed from `LeaderPositionSnapshot` / `FollowerPositionSnapshot` / `LeaderTradeEvent` on every request.
+- Historical snapshots/trades remain a **miss-only fallback** for token metadata during rollout or rare coverage gaps; they are not the steady-state dashboard hot path.
+- The worker is the authoritative writer for token display metadata:
+  - leader position ingestion,
+  - leader trade ingestion (Data API-backed),
+  - follower Data API reconcile.
+- When introducing this metadata table on an existing deployment, run a one-time worker backfill after deploy:
+  - `pnpm --filter @copybot/worker backfill:token-metadata`
 
 **Exposure breakdown charts**
 - **Exposure by leader (bar chart)**: top **4 leaders** by exposure.

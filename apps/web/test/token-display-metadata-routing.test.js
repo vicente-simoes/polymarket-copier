@@ -41,3 +41,37 @@ test('centralized token metadata resolver uses TokenMetadata table with fallback
   assert.match(source, /SELECT DISTINCT ON \("tokenId"\)/)
   assert.match(source, /token_metadata\.fallback_used/)
 })
+
+test('dashboard api routes memoize computed payloads', () => {
+  const memoizedRoutes = [
+    'app/api/v1/copies/route.ts',
+    'app/api/v1/trades/route.ts',
+    'app/api/v1/overview/route.ts',
+    'app/api/v1/portfolio/route.ts',
+    'app/api/v1/leaders/route.ts',
+    'app/api/v1/leaders/[leaderId]/route.ts',
+    'app/api/v1/status/route.ts'
+  ]
+
+  for (const relativePath of memoizedRoutes) {
+    const source = fs.readFileSync(path.join(repoRoot, relativePath), 'utf8')
+    assert.match(source, /memoizeAsync/)
+  }
+})
+
+test('portfolio position detail page uses the combined detail endpoint', () => {
+  const routeSource = fs.readFileSync(
+    path.join(repoRoot, 'app/api/v1/portfolio/positions/[tokenId]/detail/route.ts'),
+    'utf8'
+  )
+  const pageSource = fs.readFileSync(
+    path.join(repoRoot, 'app/portfolio/positions/[tokenId]/page.tsx'),
+    'utf8'
+  )
+
+  assert.match(routeSource, /position:\s*z/)
+  assert.match(routeSource, /openAttempts/)
+  assert.match(routeSource, /skippedAttempts/)
+  assert.match(pageSource, /\/api\/v1\/portfolio\/positions\/\$\{encodeURIComponent\(tokenId\)\}\/detail/)
+  assert.doesNotMatch(pageSource, /\/api\/v1\/copies\?section=/)
+})

@@ -26,9 +26,11 @@ import {
   PrismaExecutionStore,
   resolvePolymarketSigningConfig
 } from "./execution/index.js";
-import { PrismaTargetNettingStore, TargetNettingEngine } from "./target/index.js";
+import { PrismaTargetNettingStore, TargetNettingEngine, type PriceSnapshot } from "./target/index.js";
 import { PrismaReconcileStore, ReconcileEngine } from "./reconcile/index.js";
 import { workerLogger } from "./logger.js";
+import { runHistoryPruneSafely } from "./current-state/prune.js";
+import { writeDashboardStatusSummary } from "./dashboard-status/store.js";
 import {
   readGlobalRuntimeConfigOverrides,
   resolveEffectiveChainTriggerEnabled,
@@ -255,6 +257,27 @@ async function bootstrap(): Promise<void> {
         stale: book.isStale,
         source: toTargetPriceSource(book.priceSource)
       };
+    },
+    resolvePriceSnapshots: async (requests) => {
+      const bookStates = await marketData.getBookStates(requests.map((request) => request.tokenId));
+      const snapshots = new Map<string, PriceSnapshot>();
+      for (const request of requests) {
+        const book = bookStates.get(request.tokenId);
+        if (!book) {
+          continue;
+        }
+        const topOfBookPrice = book.bestAsk ?? book.bestBid;
+        snapshots.set(request.tokenId, {
+          tokenId: request.tokenId,
+          marketId: book.marketId ?? request.marketId,
+          midPrice: book.midPrice,
+          topOfBookPrice,
+          minOrderSize: book.minOrderSize,
+          stale: book.isStale,
+          source: toTargetPriceSource(book.priceSource)
+        });
+      }
+      return snapshots;
     }
   });
   targetNetting.start();
@@ -653,6 +676,56 @@ async function bootstrap(): Promise<void> {
     void refreshRuntimeConfig("refresh");
   }, env.WORKER_RUNTIME_CONFIG_REFRESH_INTERVAL_MS);
 
+  async function refreshDashboardStatusSummary(source: "bootstrap" | "interval"): Promise<void> {
+    try {
+      const details = await writeDashboardStatusSummary(prisma, {
+        retryBackoffBaseMs: env.EXECUTION_RETRY_BACKOFF_BASE_MS,
+        retryBackoffMaxMs: env.EXECUTION_RETRY_BACKOFF_MAX_MS
+      });
+
+      if (source === "bootstrap") {
+        workerLogger.info("dashboard_status.refreshed", {
+          source,
+          errorCounts: details.errorCounts,
+          databaseSizeBytes: details.databaseSizeBytes
+        });
+      }
+    } catch (error) {
+      workerLogger.warn("dashboard_status.refresh_failed", {
+        source,
+        error: toErrorDetails(error)
+      });
+    }
+  }
+
+  await refreshDashboardStatusSummary("bootstrap");
+  const dashboardStatusSummaryInterval = setInterval(() => {
+    void refreshDashboardStatusSummary("interval");
+  }, 60_000);
+
+  async function runHistoryPruneJob(): Promise<void> {
+    try {
+      const result = await runHistoryPruneSafely(prisma);
+      workerLogger.info("history_prune.completed", {
+        ranAt: result.ranAt,
+        batchSize: result.batchSize,
+        tables: result.tables
+      });
+    } catch (error) {
+      workerLogger.warn("history_prune.failed", {
+        error: toErrorDetails(error)
+      });
+    }
+  }
+
+  let historyPruneInterval: NodeJS.Timeout | undefined;
+  const historyPruneTimeout = setTimeout(() => {
+    void runHistoryPruneJob();
+    historyPruneInterval = setInterval(() => {
+      void runHistoryPruneJob();
+    }, 24 * 60 * 60 * 1_000);
+  }, computeMsUntilNextUtcRun(3, 30));
+
   const heartbeat = setInterval(() => {
     lastHeartbeatAtMs = Date.now();
   }, env.WORKER_HEARTBEAT_INTERVAL_MS);
@@ -783,7 +856,7 @@ async function bootstrap(): Promise<void> {
       const tokenIds = parseTokenList(url.searchParams.get("token_ids") ?? "");
       const books =
         tokenIds.length > 0
-          ? await Promise.all(tokenIds.map((tokenId) => marketData.getBookState(tokenId)))
+          ? [...(await marketData.getBookStates(tokenIds)).values()]
           : await marketData.getWatchedBookStates();
 
       res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
@@ -879,6 +952,11 @@ async function bootstrap(): Promise<void> {
 
   const shutdown = async () => {
     clearInterval(runtimeConfigRefresh);
+    clearInterval(dashboardStatusSummaryInterval);
+    clearTimeout(historyPruneTimeout);
+    if (historyPruneInterval) {
+      clearInterval(historyPruneInterval);
+    }
     clearInterval(heartbeat);
     await writeRedisSystemStatus(
       prisma,
@@ -926,6 +1004,27 @@ function toSupportedChainId(value: number): 137 | 80002 {
     return value;
   }
   return 137;
+}
+
+function computeMsUntilNextUtcRun(hourUtc: number, minuteUtc: number): number {
+  const now = new Date();
+  const next = new Date(
+    Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate(),
+      hourUtc,
+      minuteUtc,
+      0,
+      0
+    )
+  );
+
+  if (next.getTime() <= now.getTime()) {
+    next.setUTCDate(next.getUTCDate() + 1);
+  }
+
+  return Math.max(1_000, next.getTime() - now.getTime());
 }
 
 function deriveSignerAddress(privateKey: string | undefined): string | null {

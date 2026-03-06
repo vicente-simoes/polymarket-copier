@@ -106,7 +106,7 @@ function resolveLeaderParticipant(
   if (makerLeaderId) {
     return {
       leaderId: makerLeaderId,
-      leaderWallet: makerWallet,
+      leaderWallet: makerWallet!,
       leaderRole: "maker"
     };
   }
@@ -115,7 +115,7 @@ function resolveLeaderParticipant(
   if (takerLeaderId) {
     return {
       leaderId: takerLeaderId,
-      leaderWallet: takerWallet,
+      leaderWallet: takerWallet!,
       leaderRole: "taker"
     };
   }

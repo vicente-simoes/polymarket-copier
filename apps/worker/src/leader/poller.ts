@@ -287,6 +287,7 @@ export class LeaderPoller {
       pollKind: "positions",
       meta: {
         lastSuccessAtMs: this.now(),
+        lastSnapshotAt: snapshotAt.toISOString(),
         pagesFetched,
         recordsSeen: allPositions.length,
         recordsInserted,
