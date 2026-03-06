@@ -7,7 +7,7 @@ import { DEFAULT_SYSTEM_CONFIG } from '@/lib/server/config'
 import { prisma } from '@/lib/server/db'
 import { memoizeAsync } from '@/lib/server/memo'
 import { resolveTokenDisplayMetadata } from '@/lib/server/token-display-metadata'
-import { fetchWorkerHealth, fetchWorkerMarketBooks } from '@/lib/server/worker-health'
+import { fetchWorkerHealth, fetchWorkerMarketBooks, type WorkerMarketBookSnapshot } from '@/lib/server/worker-health'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -460,18 +460,23 @@ export async function GET(request: NextRequest) {
         })
       ])
 
-      const tokenMetadata = await resolveTokenDisplayMetadata(rows.map((row) => row.tokenId))
-      const books = await fetchWorkerMarketBooks(rows.map((row) => row.tokenId), 1_500, { includeDepth: true })
-      const spreadByToken = resolveCurrentSpreadsByToken(books)
-      const bookByToken = new Map((books ?? []).map((book) => [book.tokenId, book]))
-      const leaderNamesByRow = await resolveOpenLeaderNames(
-        rows.map((row) => ({
-          id: row.id,
-          leaderId: row.leaderId,
-          leader: row.leader,
-          metadata: row.pendingDelta?.metadata
-        }))
-      )
+      const attemptTokenIds = rows.map((row) => row.tokenId)
+      const [tokenMetadata, spreadBooks, depthBooks, leaderNamesByRow] = await Promise.all([
+        resolveTokenDisplayMetadata(attemptTokenIds),
+        fetchWorkerMarketBooks(attemptTokenIds, 1_500),
+        fetchWorkerMarketBooks(attemptTokenIds, 3_000, { includeDepth: true }),
+        resolveOpenLeaderNames(
+          rows.map((row) => ({
+            id: row.id,
+            leaderId: row.leaderId,
+            leader: row.leader,
+            metadata: row.pendingDelta?.metadata
+          }))
+        )
+      ])
+      const spreadByToken = resolveCurrentSpreadsByToken(spreadBooks ?? depthBooks)
+      const spreadBookByToken = new Map((spreadBooks ?? []).map((book) => [book.tokenId, book]))
+      const depthBookByToken = new Map((depthBooks ?? []).map((book) => [book.tokenId, book]))
 
         return {
           section,
@@ -499,7 +504,7 @@ export async function GET(request: NextRequest) {
                   : null
               const attemptShares =
                 row.accumulatedDeltaShares !== null && row.accumulatedDeltaShares !== undefined ? toNumber(row.accumulatedDeltaShares) : null
-              const book = bookByToken.get(row.tokenId)
+              const book = mergeWorkerMarketBooks(spreadBookByToken.get(row.tokenId), depthBookByToken.get(row.tokenId))
               const liveDiagnostics = computeAttemptLiveDiagnostics({
                 side: row.side,
                 pendingMetadata: row.pendingDelta?.metadata,
@@ -963,6 +968,22 @@ function resolveCurrentSpreadsByToken(
   }
 
   return spreads
+}
+
+function mergeWorkerMarketBooks(
+  spreadBook: WorkerMarketBookSnapshot | undefined,
+  depthBook: WorkerMarketBookSnapshot | undefined
+): WorkerMarketBookSnapshot | undefined {
+  if (!spreadBook && !depthBook) {
+    return undefined
+  }
+
+  return {
+    ...(spreadBook ?? {}),
+    ...(depthBook ?? {}),
+    bids: depthBook?.bids ?? spreadBook?.bids,
+    asks: depthBook?.asks ?? spreadBook?.asks
+  }
 }
 
 function computeAttemptLiveDiagnostics(args: {
