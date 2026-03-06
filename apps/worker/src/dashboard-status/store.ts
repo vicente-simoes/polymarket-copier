@@ -1,4 +1,4 @@
-import { Prisma, PrismaClient } from "@copybot/db";
+import { ComponentType, HealthStatus, Prisma, PrismaClient } from "@copybot/db";
 
 export interface DashboardStatusSummaryInput {
   nowMs?: number;
@@ -178,18 +178,25 @@ export async function writeDashboardStatusSummary(
 ): Promise<DashboardStatusSummaryDetails> {
   const details = await computeDashboardStatusSummary(prisma, input);
   const lastEventAt = new Date(input.nowMs ?? Date.now());
-  const detailsJson = JSON.stringify(toJsonValue(details));
+  const detailsJson = toJsonValue(details);
+  const dashboardComponent = "DASHBOARD_STATUS" as unknown as ComponentType;
 
-  await prisma.$executeRaw(Prisma.sql`
-    INSERT INTO "SystemStatus" ("component", "status", "lastEventAt", "details", "lastUpdatedAt")
-    VALUES ('DASHBOARD_STATUS'::"ComponentType", 'OK'::"HealthStatus", ${lastEventAt}, ${detailsJson}::jsonb, ${lastEventAt})
-    ON CONFLICT ("component")
-    DO UPDATE SET
-      "status" = 'OK'::"HealthStatus",
-      "lastEventAt" = EXCLUDED."lastEventAt",
-      "details" = EXCLUDED."details",
-      "lastUpdatedAt" = EXCLUDED."lastUpdatedAt"
-  `);
+  await prisma.systemStatus.upsert({
+    where: {
+      component: dashboardComponent
+    },
+    create: {
+      component: dashboardComponent,
+      status: HealthStatus.OK,
+      lastEventAt,
+      details: detailsJson
+    },
+    update: {
+      status: HealthStatus.OK,
+      lastEventAt,
+      details: detailsJson
+    }
+  });
 
   return details;
 }
