@@ -17,8 +17,13 @@ export interface WorkerHealthSnapshot {
 
 export interface WorkerMarketBookSnapshot {
   tokenId: string
+  marketId?: string
   bestBid?: number
   bestAsk?: number
+  midPrice?: number
+  tickSize?: number
+  minOrderSize?: number
+  negRisk?: boolean
   isStale?: boolean
   priceSource?: string
   quoteUpdatedAtMs?: number
@@ -77,7 +82,7 @@ export async function fetchWorkerMarketBooks(
   }
 
   return memoizeAsync(
-    `worker-books:${timeoutMs}:${process.env.WORKER_HEALTH_BASE_URL ?? ''}:${uniqueTokenIds.join(',')}`,
+    `worker-books:${timeoutMs}:${process.env.WORKER_HEALTH_BASE_URL ?? ''}:${options?.includeDepth ? 'depth' : 'top'}:${uniqueTokenIds.join(',')}`,
     1_000,
     async () => {
       const configured = parseHealthBaseUrls(process.env.WORKER_HEALTH_BASE_URL)
@@ -114,8 +119,13 @@ export async function fetchWorkerMarketBooks(
 
             books.push({
               tokenId,
+              marketId: readString(record, 'marketId'),
               bestBid: readNumber(record, 'bestBid'),
               bestAsk: readNumber(record, 'bestAsk'),
+              midPrice: readNumber(record, 'midPrice'),
+              tickSize: readNumber(record, 'tickSize'),
+              minOrderSize: readNumber(record, 'minOrderSize'),
+              negRisk: readBoolean(record, 'negRisk'),
               isStale: readBoolean(record, 'isStale'),
               priceSource: readString(record, 'priceSource'),
               quoteUpdatedAtMs: readNumber(record, 'quoteUpdatedAtMs'),

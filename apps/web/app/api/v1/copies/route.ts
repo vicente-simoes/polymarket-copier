@@ -987,11 +987,11 @@ function computeAttemptLiveDiagnostics(args: {
   const bestBid = pickBestBid(args.book)
   const bestAsk = pickBestAsk(args.book)
   const midPrice =
-    bestBid !== undefined && bestAsk !== undefined ? (bestBid + bestAsk) / 2 : positiveNumber(args.book.bestBid) && positiveNumber(args.book.bestAsk)
-      ? ((args.book.bestBid as number) + (args.book.bestAsk as number)) / 2
-      : undefined
+    bestBid !== undefined && bestAsk !== undefined
+      ? (bestBid + bestAsk) / 2
+      : positiveNumber(args.book.midPrice)
 
-  const tickSize = positiveNumber(readNumber(metadata, 'tickSize'))
+  const tickSize = positiveNumber(args.book.tickSize)
   if (!midPrice || midPrice <= 0 || !tickSize || tickSize <= 0 || args.currentShares <= 0 || args.currentNotionalUsd <= 0) {
     return null
   }
