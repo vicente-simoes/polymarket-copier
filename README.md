@@ -45,6 +45,10 @@ Dashboard preview:
    - `pnpm dev:web`
    - `pnpm dev:worker`
 
+For production Docker deploys:
+- the `web` service runs the built app with `next start`
+- the `worker` service runs the compiled output with `pnpm --filter @copybot/worker start`
+
 ## Quick Start (Full Docker Stack)
 
 1. Create local env file:

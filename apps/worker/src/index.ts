@@ -1114,6 +1114,14 @@ function toErrorDetails(error: unknown): { message: string; stack?: string } {
   };
 }
 
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
 async function writeRedisSystemStatus(
   prisma: PrismaClient,
   details: {

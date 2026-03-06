@@ -1,1 +1,3 @@
 1. i think web is running as dev instead of built rn
+
+2. how to not end up with an infinitely large database? I'm thinking one problem we may have in the is that I don't think there currently is a way for getting rid of unnecessary database rows. but by definition our application will, overtime, develop lots of them as rows that were related to the tracking of old trades and positions or of old executions of skips we did become useless short of maybe to be used as data for statistics. i dont want my database to grow infinitely so im thinking if we can come up with a safe way of cleaning it up without interferring with the current system we got going on.
