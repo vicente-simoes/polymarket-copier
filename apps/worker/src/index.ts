@@ -139,7 +139,7 @@ async function bootstrap(): Promise<void> {
   let lastWatchedTokenKey = "";
 
   async function refreshWatchedTokenUniverse(): Promise<void> {
-    const [attemptTokens, pendingTokens] = await Promise.all([
+    const [attemptTokens, eligiblePendingTokens, followerPositionTokens] = await Promise.all([
       prisma.copyAttempt.findMany({
         where: {
           status: {
@@ -154,15 +154,17 @@ async function bootstrap(): Promise<void> {
       }),
       prisma.pendingDelta.findMany({
         where: {
-          status: {
-            in: ["PENDING", "ELIGIBLE", "BLOCKED"]
-          }
+          status: "ELIGIBLE"
         },
         select: {
           tokenId: true
         },
         distinct: ["tokenId"]
-      })
+      }),
+      prisma.$queryRaw<Array<{ tokenId: string }>>(Prisma.sql`
+        SELECT DISTINCT "tokenId"
+        FROM "FollowerCurrentPosition"
+      `)
     ]);
 
     const tokenSet = new Set<string>(staticWatchedTokenIds);
@@ -171,7 +173,12 @@ async function bootstrap(): Promise<void> {
         tokenSet.add(row.tokenId);
       }
     }
-    for (const row of pendingTokens) {
+    for (const row of eligiblePendingTokens) {
+      if (row.tokenId) {
+        tokenSet.add(row.tokenId);
+      }
+    }
+    for (const row of followerPositionTokens) {
       if (row.tokenId) {
         tokenSet.add(row.tokenId);
       }
