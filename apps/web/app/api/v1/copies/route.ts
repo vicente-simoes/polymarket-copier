@@ -978,7 +978,13 @@ function mergeWorkerMarketBooks(
     return undefined
   }
 
+  const tokenId = spreadBook?.tokenId ?? depthBook?.tokenId
+  if (!tokenId) {
+    return undefined
+  }
+
   return {
+    tokenId,
     ...(spreadBook ?? {}),
     ...(depthBook ?? {}),
     bids: depthBook?.bids ?? spreadBook?.bids,
@@ -1005,6 +1011,12 @@ function computeAttemptLiveDiagnostics(args: {
   }
 
   const profileGuardrails = readProfileGuardrails(args.copyProfileConfig)
+  const effectiveBuyImprovementGuardEnabled =
+    profileGuardrails.buyImprovementGuardEnabled ?? DEFAULT_SYSTEM_CONFIG.guardrails.buyImprovementGuardEnabled
+  const effectiveMaxBuyImprovementBps =
+    profileGuardrails.maxBuyImprovementBps !== undefined
+      ? profileGuardrails.maxBuyImprovementBps
+      : DEFAULT_SYSTEM_CONFIG.guardrails.maxBuyImprovementBps
   const bestBid = pickBestBid(args.book)
   const bestAsk = pickBestAsk(args.book)
   const midPrice =
@@ -1033,6 +1045,10 @@ function computeAttemptLiveDiagnostics(args: {
       profileGuardrails.maxWorseningBuyUsd ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxWorseningBuyUsd,
     maxWorseningSellUsd:
       profileGuardrails.maxWorseningSellUsd ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxWorseningSellUsd,
+    buyImprovementGuardEnabled:
+      effectiveBuyImprovementGuardEnabled && effectiveMaxBuyImprovementBps !== null && effectiveMaxBuyImprovementBps !== undefined,
+    maxBuyImprovementBps:
+      effectiveMaxBuyImprovementBps ?? undefined,
     maxSlippageBps: profileGuardrails.maxSlippageBps ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxSlippageBps,
     maxSpreadUsd: profileGuardrails.maxSpreadUsd ?? DEFAULT_SYSTEM_CONFIG.guardrails.maxSpreadUsd,
     maxPricePerShare:
@@ -1079,6 +1095,8 @@ function resolveAttemptLeaderPrice(
 function readProfileGuardrails(configValue: unknown): {
   maxWorseningBuyUsd?: number
   maxWorseningSellUsd?: number
+  buyImprovementGuardEnabled?: boolean
+  maxBuyImprovementBps?: number | null
   maxSlippageBps?: number
   maxSpreadUsd?: number
   maxPricePerShareUsd?: number | null
@@ -1090,6 +1108,9 @@ function readProfileGuardrails(configValue: unknown): {
   return {
     maxWorseningBuyUsd: positiveNumber(readNumber(guardrails, 'maxWorseningBuyUsd')),
     maxWorseningSellUsd: positiveNumber(readNumber(guardrails, 'maxWorseningSellUsd')),
+    buyImprovementGuardEnabled:
+      typeof guardrails.buyImprovementGuardEnabled === 'boolean' ? guardrails.buyImprovementGuardEnabled : undefined,
+    maxBuyImprovementBps: readNullablePositiveInteger(guardrails.maxBuyImprovementBps),
     maxSlippageBps: nonNegativeNumber(readNumber(guardrails, 'maxSlippageBps')),
     maxSpreadUsd: nonNegativeNumber(readNumber(guardrails, 'maxSpreadUsd')),
     maxPricePerShareUsd: readNullablePositiveNumber(guardrails.maxPricePerShareUsd),
@@ -1103,6 +1124,18 @@ function readNullablePositiveNumber(value: unknown): number | null | undefined {
   }
   const parsed = toNumber(value)
   if (parsed > 0) {
+    return parsed
+  }
+  return undefined
+}
+
+function readNullablePositiveInteger(value: unknown): number | null | undefined {
+  if (value === null) {
+    return null
+  }
+
+  const parsed = toNumber(value)
+  if (Number.isInteger(parsed) && parsed > 0) {
     return parsed
   }
   return undefined
@@ -1228,6 +1261,10 @@ function normalizeGuardrailBlockedMessage(text: string): string | null {
 
   if (reasons.includes('PRICE_CAP_EXCEEDED')) {
     return 'price exceeds max price/share cap'
+  }
+
+  if (reasons.includes('IMPROVEMENT_EXCEEDED')) {
+    return 'price is too far below leader baseline'
   }
 
   if (reasons.includes('WORSENING_EXCEEDED')) {

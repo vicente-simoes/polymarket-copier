@@ -88,7 +88,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
-    command: ["pnpm", "--filter", "@copybot/worker", "dev"]
+    command: ["pnpm", "--filter", "@copybot/worker", "start"]
     depends_on:
       postgres:
         condition: service_healthy

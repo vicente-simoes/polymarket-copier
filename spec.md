@@ -1221,6 +1221,7 @@ These items were previously “open questions” and are now decided:
   - Slippage/spread/price movement constraints are implemented as **guardrails in the Config page** (global defaults + per-leader overrides).
   - Default policy is the combination of:
     - max worsening vs leader baseline (**3¢** BUY, **6¢** SELL),
+    - optional max BUY improvement vs leader baseline (**disabled by default**; use when you want to avoid catching collapsing contracts simply because they are much cheaper than the leader paid),
     - max spread (**3¢**),
     - max slippage vs mid (**200 bps**),
     - and a thin-book rule that checks VWAP for our intended size before placing the order.

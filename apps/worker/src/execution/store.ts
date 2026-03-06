@@ -602,6 +602,8 @@ function toExecutionGuardrailOverrides(
     minNotionalPerOrderUsd?: number;
     maxWorseningBuyUsd?: number;
     maxWorseningSellUsd?: number;
+    buyImprovementGuardEnabled?: boolean;
+    maxBuyImprovementBps?: number | null;
     maxSlippageBps?: number;
     maxSpreadUsd?: number;
     minBookDepthForSizeEnabled?: boolean;
@@ -621,6 +623,8 @@ function toExecutionGuardrailOverrides(
     minNotionalUsd: strictestContributorMinNotional ?? input.minNotionalPerOrderUsd,
     maxWorseningBuyUsd: input.maxWorseningBuyUsd,
     maxWorseningSellUsd: input.maxWorseningSellUsd,
+    buyImprovementGuardEnabled: input.buyImprovementGuardEnabled,
+    maxBuyImprovementBps: input.maxBuyImprovementBps,
     maxSlippageBps: strictestContributorSlippage ?? input.maxSlippageBps,
     maxSpreadUsd: input.maxSpreadUsd,
     minBookDepthForSizeEnabled: input.minBookDepthForSizeEnabled,

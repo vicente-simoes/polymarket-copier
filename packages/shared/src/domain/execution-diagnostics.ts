@@ -23,6 +23,8 @@ export interface LiveExecutionDiagnosticsInput {
   tickSize: number;
   maxWorseningBuyUsd: number;
   maxWorseningSellUsd: number;
+  buyImprovementGuardEnabled?: boolean;
+  maxBuyImprovementBps?: number;
   maxSlippageBps: number;
   maxSpreadUsd: number;
   maxPricePerShare?: number;
@@ -154,6 +156,8 @@ export function computeLiveExecutionDiagnostics(
       config: {
         maxWorseningBuyUsd: input.maxWorseningBuyUsd,
         maxWorseningSellUsd: input.maxWorseningSellUsd,
+        buyImprovementGuardEnabled: input.buyImprovementGuardEnabled,
+        maxBuyImprovementBps: input.maxBuyImprovementBps,
         maxSlippageBps: input.maxSlippageBps,
         maxSpreadUsd: input.maxSpreadUsd,
         maxPricePerShare: input.maxPricePerShare
@@ -220,6 +224,8 @@ export function computeLiveExecutionDiagnostics(
     config: {
       maxWorseningBuyUsd: input.maxWorseningBuyUsd,
       maxWorseningSellUsd: input.maxWorseningSellUsd,
+      buyImprovementGuardEnabled: input.buyImprovementGuardEnabled,
+      maxBuyImprovementBps: input.maxBuyImprovementBps,
       maxSlippageBps: input.maxSlippageBps,
       maxSpreadUsd: input.maxSpreadUsd,
       maxPricePerShare: input.maxPricePerShare

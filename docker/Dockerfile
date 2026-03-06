@@ -24,6 +24,7 @@ COPY . .
 # Prisma client must exist for runtime imports in worker/web.
 RUN pnpm --filter @copybot/db generate
 RUN pnpm --filter @copybot/shared build
+RUN pnpm --filter @copybot/worker build
 
 # Build Next.js for production runtime (web service uses `next start`).
 RUN AUTH_SECRET=build-secret \

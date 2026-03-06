@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --import tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "lint": "echo \"no lint config yet\"",
     "test": "node --import tsx --test test/**/*.test.ts",
