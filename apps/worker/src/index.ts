@@ -132,6 +132,10 @@ async function bootstrap(): Promise<void> {
 
   const staticWatchedTokenIds = parseTokenList(env.MARKET_WATCH_TOKEN_IDS);
   const dynamicMarketWatchRefreshIntervalMs = 5_000;
+  const watchedBookRefreshIntervalMs = Math.max(
+    15_000,
+    Math.min(env.MARKET_CACHE_REST_PRICE_TTL_MS, env.MARKET_CACHE_METADATA_TTL_MS)
+  );
   let lastWatchedTokenKey = "";
 
   async function refreshWatchedTokenUniverse(): Promise<void> {
@@ -198,6 +202,14 @@ async function bootstrap(): Promise<void> {
       });
     });
   }, dynamicMarketWatchRefreshIntervalMs);
+
+  setInterval(() => {
+    void marketData.refreshWatchedBooks().catch((error) => {
+      workerLogger.warn("market.book_refresh_failed", {
+        error: toErrorDetails(error)
+      });
+    });
+  }, watchedBookRefreshIntervalMs);
 
   const dataApiClient = new DataApiClient({
     baseUrl: env.DATA_API_BASE_URL
