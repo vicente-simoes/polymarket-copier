@@ -120,7 +120,7 @@ Compose and Docker assets live under `docker/`:
 - `worker`: `GET /health`
 - `worker user channel`: `GET /user-channel/status`
 - `postgres`: `pg_isready`
-- `redis`: `redis-cli ping`
+- `redis`: `redis-cli -a "$REDIS_PASSWORD" ping`
 
 ## DB Commands
 
